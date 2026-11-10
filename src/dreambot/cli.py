@@ -557,6 +557,8 @@ def run(
     )
     for noisy in ("httpx", "httpcore", "telegram", "discord.gateway", "discord.client", "discord.http"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
+    # Dreambot has no voice features; discord.py warns at every start that it lacks the libraries for them.
+    logging.getLogger("discord.client").addFilter(lambda record: "voice will NOT" not in record.getMessage())
     config = _config()
     want = {
         "telegram": config.telegram.enabled if telegram is None else telegram,

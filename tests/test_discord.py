@@ -469,3 +469,67 @@ async def test_a_dead_gateway_connection_is_logged(server: Server, caplog: pytes
     with caplog.at_level("ERROR"):
         server.front._connection_ended(task)
     assert "the connection ended: PrivilegedIntentsRequired" in caplog.text
+
+
+def forbidden() -> discord.Forbidden:
+    return discord.Forbidden(
+        SimpleNamespace(status=403, reason="Forbidden"), {"code": 50001, "message": "Missing Access"}
+    )
+
+
+async def test_as_a_personal_app_results_follow_the_command_where_the_bot_may_not_post(server: Server):
+    """Added to someone's account rather than a server, the bot is not a member of the channel."""
+
+    async def not_a_member(conversation: str):
+        raise forbidden()
+
+    server.front._channel = not_a_member  # type: ignore[method-assign]
+    asked = await server.slash("imagine", prompt="a fox")
+    job = server.service.store.recent_jobs(limit=1)[0]
+    assert job.status is JobStatus.DONE
+    assert asked.original is not None and asked.original.content.startswith("⏳"), (
+        "the command is still answered"
+    )
+    (result,) = asked.followups
+    assert result.files == [Path(job.grid).name] and "U1" in result.labels(), "and its result follows it"
+
+    # Buttons on that result work the same way: the press is answered, and its result follows the press.
+    picked = await server.press(result, "U2")
+    assert picked.followups[-1].files == [Path(job.image(2).path).name]
+    varied = await server.press(result, "V1")
+    latest = server.service.store.recent_jobs(limit=1)[0]
+    assert latest.kind is JobKind.VARIATION and latest.status is JobStatus.DONE
+    assert varied.followups[-1].files == [Path(latest.grid).name], (
+        "status first, then the grid, both as follow-ups"
+    )
+
+
+async def test_an_interaction_is_only_reused_while_it_can_still_be_answered(server: Server):
+    import time
+
+    from dreambot.frontends.discord_bot import INTERACTION_LIFETIME
+
+    interaction = FakeInteraction(server.log)
+    server.front._remember(interaction)
+    assert server.front._recent_interaction(str(CHANNEL)) is interaction
+    server.front._recent[str(CHANNEL)] = (interaction, time.monotonic() - INTERACTION_LIFETIME - 1)
+    assert server.front._recent_interaction(str(CHANNEL)) is None, "its 15 minutes are over"
+    assert server.front._recent_interaction("123") is None
+
+    # With nothing to follow up on, the failure is the caller's to report; it is not swallowed.
+    async def not_a_member(conversation: str):
+        raise forbidden()
+
+    server.front._channel = not_a_member  # type: ignore[method-assign]
+    with pytest.raises(discord.Forbidden):
+        await server.front.send(str(CHANNEL), "hello")
+
+
+async def test_the_log_names_what_was_used_but_never_what_was_typed(
+    server: Server, caplog: pytest.LogCaptureFixture
+):
+    with caplog.at_level("INFO", logger="dreambot.frontends.discord_bot"):
+        await server.slash("imagine", prompt="a very private prompt about a fox")
+        await server.press(server.visible[-1], "U1")
+    assert "discord: /imagine" in caplog.text and "discord: button" in caplog.text
+    assert "private prompt" not in caplog.text and "fox" not in caplog.text

@@ -4,6 +4,12 @@ The bot connects out to Discord's gateway, so it runs from a Mac behind a home r
 public address. It needs no privileged intents: slash commands and buttons work everywhere,
 plain-text prompts work in direct messages, and in servers you can also @mention it.
 
+The bot can be added to a server, or to one person's account as a personal app ("Add to My
+Apps"), which needs no server at all: its commands then work in a direct message with it and
+anywhere else that person types them. In places where the bot is not a member it may not post
+messages of its own, so a result that cannot be posted is sent as a follow-up to the command
+that asked for it.
+
 As with the other platforms, behaviour lives in
 :class:`~dreambot.frontends.base.ChatFrontend`; this file maps Discord's interaction model
 onto it. The one Discord-specific trick: while a slash command or button is being handled, the
@@ -72,6 +78,9 @@ class _Client(discord.Client):
     async def on_ready(self) -> None:
         log.info("discord: connected as %s (in %d server(s))", self.user, len(self.guilds))
 
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        log.info("discord: added to a server (now in %d)", len(self.guilds))
+
     async def on_message(self, message: discord.Message) -> None:
         await self.frontend._on_message(message)
 
@@ -121,6 +130,9 @@ class DiscordFrontend(ChatFrontend):
         self.client = _Client(self, intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self.client)
         self._sent: dict[str, Any] = {}
+        #: The latest command or button press in each conversation: a way to answer there for
+        #: the next quarter of an hour even where the bot may not post.
+        self._recent: dict[str, tuple[discord.Interaction, float]] = {}
         self._downloads = service.config.scratch_dir / "discord"
         self._register_commands()
 
@@ -211,13 +223,16 @@ class DiscordFrontend(ChatFrontend):
         ask_reply: bool = False,
     ) -> list[str]:
         content = text[:MESSAGE_LIMIT] if text else None
-        files = [self._file(path) for path in images[:10]]
         view = self._view(buttons)
-        extras: dict[str, Any] = {}
-        if files:
-            extras["files"] = files
-        if view is not None:
-            extras["view"] = view
+
+        def extras() -> dict[str, Any]:
+            # Built afresh for each attempt: a file that has been sent once is closed.
+            built: dict[str, Any] = {}
+            if images:
+                built["files"] = [self._file(path) for path in images[:10]]
+            if view is not None:
+                built["view"] = view
+            return built
 
         interaction = _interaction.get()
         if (
@@ -228,25 +243,51 @@ class DiscordFrontend(ChatFrontend):
             # Private replies for information and errors; job status and results are public.
             ephemeral = _ephemeral.get() or (text.startswith("⚠️") and not images)
             if not interaction.response.is_done():
-                await interaction.response.send_message(content=content, ephemeral=ephemeral, **extras)
+                await interaction.response.send_message(content=content, ephemeral=ephemeral, **extras())
                 message = await interaction.original_response()
             else:
                 message = await interaction.followup.send(
-                    content=content or "​", ephemeral=ephemeral, wait=True, **extras
+                    content=content or "​", ephemeral=ephemeral, wait=True, **extras()
                 )
             interaction.extras["answered"] = True
         else:
-            channel = await self._channel(conversation)
-            if reply_to:
-                extras["reference"] = discord.MessageReference(
-                    message_id=int(reply_to), channel_id=int(conversation), fail_if_not_exists=False
-                )
-            message = await channel.send(content=content, **extras)
+            try:
+                channel = await self._channel(conversation)
+                reference = {}
+                if reply_to:
+                    reference["reference"] = discord.MessageReference(
+                        message_id=int(reply_to), channel_id=int(conversation), fail_if_not_exists=False
+                    )
+                message = await channel.send(content=content, **extras(), **reference)
+            except (discord.Forbidden, discord.NotFound):
+                # The bot is not a member here (it is being used as someone's personal app in a
+                # server or chat of theirs): it may not post, but it may still answer the command.
+                recent = self._recent_interaction(conversation)
+                if recent is None:
+                    raise
+                message = await recent.followup.send(content=content or "​", wait=True, **extras())
         self._sent[str(message.id)] = (message, time.monotonic())
         if len(self._sent) > 500:
             for key in list(self._sent)[:250]:
                 del self._sent[key]
         return [str(message.id)]
+
+    def _remember(self, interaction: discord.Interaction) -> None:
+        self._recent[str(interaction.channel_id)] = (interaction, time.monotonic())
+        if len(self._recent) > 200:
+            for key in sorted(self._recent, key=lambda k: self._recent[k][1])[:100]:
+                del self._recent[key]
+
+    def _recent_interaction(self, conversation: str) -> discord.Interaction | None:
+        """A command or button press from this conversation that can still be answered."""
+        found = self._recent.get(conversation)
+        if found is None:
+            return None
+        interaction, at = found
+        if time.monotonic() - at >= INTERACTION_LIFETIME or interaction.is_expired():
+            del self._recent[conversation]
+            return None
+        return interaction
 
     async def _message(self, conversation: str, ref: str) -> Any:
         cached = self._sent.get(ref)
@@ -308,6 +349,7 @@ class DiscordFrontend(ChatFrontend):
         mentioned = self.client.user in message.mentions
         if not direct and not mentioned:
             return
+        log.info("discord: a %s", "direct message" if direct else "mention")
         text = message.content or ""
         for form in (f"<@{self.client.user.id}>", f"<@!{self.client.user.id}>"):
             text = text.replace(form, "")
@@ -339,6 +381,9 @@ class DiscordFrontend(ChatFrontend):
         """Handle a slash command by feeding its text form through the shared command router."""
         # People who are not allowed in are told so privately, whatever the command.
         private = private or not self.service.access.is_allowed(self.user_id(str(interaction.user.id)))
+        # The log says which command was used, never what was typed into it.
+        log.info("discord: %s", text.split(maxsplit=1)[0] if text else "a command")
+        self._remember(interaction)
         outer = _interaction.set(interaction)
         flag = _ephemeral.set(private)
         try:
@@ -383,6 +428,8 @@ class DiscordFrontend(ChatFrontend):
             await self._on_settings(interaction, payload)
             return
         action = decode_action(payload)
+        log.info("discord: button %s", action.kind.value if action is not None else payload.split(":")[0])
+        self._remember(interaction)
         full_user = self.user_id(user)
         if action is not None and self.service.access.is_allowed(full_user):
             modal = self._modal_for(full_user, action)
@@ -451,6 +498,7 @@ class DiscordFrontend(ChatFrontend):
             text = f"{values[0]} {values[1]}".strip()
         else:
             text = values[0]
+        self._remember(interaction)
         outer = _interaction.set(interaction)
         try:
             message = Incoming(user=str(interaction.user.id), conversation=str(interaction.channel_id))
