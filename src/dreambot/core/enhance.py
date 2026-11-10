@@ -315,7 +315,7 @@ def _clean(line: str, brief: Brief) -> str:
 #: Words that turn a painting into a photograph.
 _PHOTOGRAPHIC = re.compile(
     r"\b(?:\d+\s?mm|lens\w*|film|photo\w*|depth of field|bokeh|exposure|darkroom|dslr|telephoto|"
-    r"shutter|aperture)\b",
+    r"shutter|aperture|(?:shallow|sharp|selective|crisp) focus|out of focus|blurred background)\b",
     re.IGNORECASE,
 )
 

@@ -206,6 +206,11 @@ def test_a_painting_is_not_given_a_lens():
     assert enhance.parse(mixed, brief) == [
         "low angle with the tower dominating, deep reds and purples, thick impasto strokes"
     ]
+    # Seen on the first live job: a camera's focus has no place in a painting either.
+    focus = "1. medium shot in profile, soft morning light through trees, cool greens and blues, shallow focus on her face"
+    assert enhance.parse(focus, Brief("an oil painting of a woman reading on a bench", 1)) == [
+        "medium shot in profile, soft morning light through trees, cool greens and blues"
+    ]
     # Someone who asks for both gets both.
     both = Brief("a photograph of an oil painting in a gallery", 1)
     assert "35mm film" in enhance.parse(mixed, both)[0] and "impasto" in enhance.parse(mixed, both)[0]
