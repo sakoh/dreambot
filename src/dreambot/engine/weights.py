@@ -1,0 +1,324 @@
+"""Finding model weights that are already on disk.
+
+Dreambot shares the standard Hugging Face cache with mflux and every other HF-based tool, so
+weights are never stored twice and models a user already downloaded just work.
+
+Generation runs with the network disabled, so a model is only usable if a *complete* snapshot
+is present locally. This module finds those snapshots without importing ``huggingface_hub``,
+``mflux`` or ``mlx`` — it is plain filesystem inspection, cheap enough to run on every request.
+
+Three kinds of weights are recognised for a model, in order of preference:
+
+1. pre-quantized exports published by the mflux community
+   (``mflux-community/<slug>-mflux-<quant>``),
+2. third-party mflux exports of the same upstream model (``<anyone>/<Upstream-Name>-mflux-...``),
+3. the original upstream repository (quantized on the fly when requested).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+from dreambot.engine.registry import ModelSpec
+
+COMMUNITY_ORG = "mflux-community"
+QUANTS = ("q8", "q6", "q5", "q4", "q3", "bf16", "fp8")
+_QUANT_RE = re.compile(r"-mflux-(q\d|bf16|fp8)\b", re.IGNORECASE)
+
+
+def hf_cache_dir() -> Path:
+    """The Hugging Face hub cache directory, honouring the standard environment overrides."""
+    if cache := os.environ.get("HF_HUB_CACHE"):
+        return Path(cache).expanduser()
+    if home := os.environ.get("HF_HOME"):
+        return Path(home).expanduser() / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def physical_memory_gb() -> float:
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 1000**3
+    except (ValueError, OSError):
+        return 16.0
+
+
+def quant_preference(memory_gb: float | None = None) -> tuple[str, ...]:
+    """Quantization levels from most to least preferred for a machine with this much memory."""
+    memory = physical_memory_gb() if memory_gb is None else memory_gb
+    if memory >= 48:
+        return ("q8", "q6", "q5", "q4", "bf16", "q3", "fp8")
+    if memory >= 24:
+        return ("q6", "q5", "q4", "q8", "q3", "bf16", "fp8")
+    return ("q4", "q3", "q5", "q6", "q8", "bf16", "fp8")
+
+
+@dataclass(frozen=True)
+class Weights:
+    """One usable set of weights for a model."""
+
+    #: Hugging Face repo id the files belong to.
+    repo: str
+    #: Quantization of the stored files (``q8`` ... ``bf16``), or ``None`` for original upstream weights.
+    quant: str | None
+    #: Local snapshot directory.
+    path: Path
+    size_bytes: int
+    #: True for the model's original upstream repository.
+    upstream: bool = False
+
+    @property
+    def location(self) -> str | None:
+        """What to hand the worker as ``GenerateRequest.weights``.
+
+        Exports are addressed by local path, which keeps loading fully offline. Upstream
+        weights are addressed by leaving this unset: mflux then loads its pinned revision of
+        the model's own repository from the cache.
+        """
+        return None if self.upstream else str(self.path)
+
+    @property
+    def size_gb(self) -> float:
+        return self.size_bytes / 1000**3
+
+    @property
+    def label(self) -> str:
+        return self.quant or "original"
+
+
+def community_repo(spec: ModelSpec, quant: str) -> str | None:
+    """Repo id of the community pre-quantized export of a model, if one is published."""
+    return f"{COMMUNITY_ORG}/{spec.slug}-mflux-{quant}" if spec.slug else None
+
+
+def _repo_dir(cache: Path, repo_id: str) -> Path:
+    return cache / f"models--{repo_id.replace('/', '--')}"
+
+
+def _snapshots(cache: Path, repo_id: str) -> list[Path]:
+    root = _repo_dir(cache, repo_id) / "snapshots"
+    try:
+        found = [path for path in root.iterdir() if path.is_dir()]
+    except OSError:
+        return []
+    return sorted(found, key=lambda path: path.stat().st_mtime, reverse=True)
+
+
+def snapshot_is_complete(snapshot: Path) -> bool:
+    """Whether a cached snapshot can be loaded without downloading anything.
+
+    A snapshot counts as complete when it holds weight files, none of its entries is a dangling
+    symlink (an interrupted download), every shard named by a shard index is present, and the
+    repo has no partially downloaded blobs.
+    """
+    weight_files = 0
+    try:
+        for path in snapshot.rglob("*"):
+            if path.is_dir():
+                continue
+            if not path.exists():  # dangling symlink into blobs/
+                return False
+            if path.suffix == ".safetensors":
+                weight_files += 1
+            elif path.name.endswith(".safetensors.index.json") and not _index_satisfied(path):
+                return False
+    except OSError:
+        return False
+    if weight_files == 0:
+        return False
+    blobs = snapshot.parent.parent / "blobs"
+    return not (blobs.is_dir() and any(blobs.glob("*.incomplete")))
+
+
+def _index_satisfied(index_path: Path) -> bool:
+    try:
+        weight_map = json.loads(index_path.read_text(encoding="utf-8")).get("weight_map")
+    except (OSError, ValueError, AttributeError):
+        return False
+    if not isinstance(weight_map, dict) or not weight_map:
+        return False
+    return all(
+        isinstance(name, str) and (index_path.parent / name).is_file() for name in set(weight_map.values())
+    )
+
+
+def _size(snapshot: Path) -> int:
+    total = 0
+    for path in snapshot.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _first_complete(cache: Path, repo_id: str) -> Path | None:
+    for snapshot in _snapshots(cache, repo_id):
+        if snapshot_is_complete(snapshot):
+            return snapshot
+    return None
+
+
+def _third_party_exports(cache: Path, spec: ModelSpec) -> list[tuple[str, str | None]]:
+    """Cached mflux exports of this model published outside the community org.
+
+    They are recognised by the upstream repo's name followed by ``-mflux-``, e.g.
+    ``someone/Ming-Image-0.1-Design-mflux-q8`` for ``inclusionAI/Ming-Image-0.1-Design``.
+    """
+    upstream_name = spec.repo.rsplit("/", 1)[-1].lower()
+    prefix = f"{upstream_name}-mflux-"
+    found: list[tuple[str, str | None]] = []
+    try:
+        entries = sorted(cache.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.startswith("models--"):
+            continue
+        org, _, name = entry.name[len("models--") :].partition("--")
+        if not name or org == COMMUNITY_ORG or not name.lower().startswith(prefix):
+            continue
+        match = _QUANT_RE.search(name)
+        found.append((f"{org}/{name}", match.group(1).lower() if match else None))
+    return found
+
+
+def installed(spec: ModelSpec, cache: Path | None = None) -> list[Weights]:
+    """Every complete set of weights for ``spec`` found in the cache (unordered)."""
+    cache = cache or hf_cache_dir()
+    found: list[Weights] = []
+    if not all(_first_complete(cache, repo) for repo in spec.helper_repos):
+        return found  # e.g. FIBO without its prompt-writing model cannot run at all
+    for quant in QUANTS:
+        repo = community_repo(spec, quant)
+        if repo and (snapshot := _first_complete(cache, repo)):
+            found.append(Weights(repo=repo, quant=quant, path=snapshot, size_bytes=_size(snapshot)))
+    for repo, quant in _third_party_exports(cache, spec):
+        if snapshot := _first_complete(cache, repo):
+            found.append(Weights(repo=repo, quant=quant, path=snapshot, size_bytes=_size(snapshot)))
+    # Original weights only count when every extra repository the model needs (a ControlNet,
+    # an adapter) is present too; community exports already bundle those.
+    extras = [_first_complete(cache, repo) for repo in spec.extra_repos]
+    if all(extras) and (snapshot := _first_complete(cache, spec.repo)):
+        size = _size(snapshot) + sum(_size(extra) for extra in extras if extra)
+        found.append(Weights(repo=spec.repo, quant=None, path=snapshot, size_bytes=size, upstream=True))
+    return found
+
+
+def resolve(
+    spec: ModelSpec,
+    *,
+    prefer: Sequence[str] | None = None,
+    override: str | None = None,
+    cache: Path | None = None,
+) -> Weights | None:
+    """Pick the weights to use for ``spec``, or ``None`` if the model is not installed.
+
+    ``override`` forces a specific location: a local directory or a repo id that must already
+    be in the cache. ``prefer`` orders quantization levels (default: by this Mac's memory).
+    """
+    cache = cache or hf_cache_dir()
+    if override:
+        local = Path(override).expanduser()
+        if local.is_dir():
+            match = _QUANT_RE.search(local.name)
+            return Weights(
+                repo=override,
+                quant=match.group(1).lower() if match else None,
+                path=local,
+                size_bytes=_size(local),
+            )
+        snapshot = _first_complete(cache, override)
+        if snapshot is None:
+            return None
+        match = _QUANT_RE.search(override)
+        return Weights(
+            repo=override,
+            quant=match.group(1).lower() if match else None,
+            path=snapshot,
+            size_bytes=_size(snapshot),
+        )
+
+    candidates = installed(spec, cache)
+    if not candidates:
+        return None
+    order = list(prefer if prefer is not None else quant_preference())
+
+    def rank(weights: Weights) -> tuple[int, int, int]:
+        # Quantized exports before original weights (they load faster and need less memory);
+        # then by preferred quantization; community exports before third-party ones.
+        quant_rank = order.index(weights.quant) if weights.quant in order else len(order)
+        return (1 if weights.upstream else 0, quant_rank, 0 if weights.repo.startswith(COMMUNITY_ORG) else 1)
+
+    return min(candidates, key=rank)
+
+
+def recommended_repo(spec: ModelSpec, prefer: Sequence[str] | None = None) -> tuple[str, str | None]:
+    """The repo (and quantization) ``dreambot models pull`` should download for ``spec``."""
+    order = prefer if prefer is not None else quant_preference()
+    for quant in order:
+        if repo := community_repo(spec, quant):
+            return repo, quant
+    return spec.repo, None
+
+
+# --------------------------------------------------------------------------------------
+# Vision-language models (for /describe and prompt help)
+# --------------------------------------------------------------------------------------
+
+#: Downloaded by ``dreambot models pull describe``: small, fast and good at captioning.
+DEFAULT_VISION_MODEL = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
+#: Name fragments that identify an MLX vision-language model in the cache, best first.
+_VISION_HINTS = (
+    "qwen3-vl",
+    "qwen2.5-vl",
+    "qwen3.5",
+    "gemma-4",
+    "gemma-3",
+    "internvl",
+    "pixtral",
+    "llava",
+    "lfm2-vl",
+    "smolvlm",
+    "fastvlm",
+    "qwen2-vl",
+)
+
+
+def find_vision_model(override: str | None = None, cache: Path | None = None) -> Path | None:
+    """A locally installed MLX vision-language model, or ``None``.
+
+    ``override`` names a specific one (a folder, or a repo id that is in the cache). Otherwise
+    the cache is searched for MLX conversions of well-known vision models.
+    """
+    cache = cache or hf_cache_dir()
+    if override:
+        local = Path(override).expanduser()
+        if local.is_dir():
+            return local
+        return _first_complete(cache, override)
+    try:
+        entries = sorted(entry.name for entry in cache.iterdir() if entry.name.startswith("models--"))
+    except OSError:
+        return None
+    candidates: list[tuple[int, str]] = []
+    for entry in entries:
+        org, _, name = entry[len("models--") :].partition("--")
+        lowered = name.lower()
+        # MLX conversions live in mlx-community or say so in their name.
+        if org != "mlx-community" and "mlx" not in lowered:
+            continue
+        for rank, hint in enumerate(_VISION_HINTS):
+            if hint in lowered:
+                candidates.append((rank, f"{org}/{name}"))
+                break
+    for _, repo in sorted(candidates):
+        snapshot = _first_complete(cache, repo)
+        if snapshot is not None and (snapshot / "config.json").exists():
+            return snapshot
+    return None
