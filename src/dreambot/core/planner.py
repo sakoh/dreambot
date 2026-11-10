@@ -22,7 +22,7 @@ from typing import Any
 from PIL import Image
 
 from dreambot.config import Config
-from dreambot.core import styles
+from dreambot.core import enhance, styles
 from dreambot.core.imaging import Canvas, Tile
 from dreambot.core.params import MAX_SEED, LoraRef, Params
 from dreambot.core.prompt import ParsedPrompt
@@ -192,6 +192,9 @@ class Plan:
     tiles: list[Tile] | None = None
     tile_base: str | None = None
     source: str | None = None
+    #: Set when a language model should write art direction for each image before rendering
+    #: (see :mod:`dreambot.core.enhance`). The renders above already work without it.
+    brief: enhance.Brief | None = None
     notes: list[str] = field(default_factory=list)
     detail: dict[str, Any] = field(default_factory=dict)
 
@@ -297,6 +300,14 @@ def reference_instruction(text: str, refs: ResolvedRefs, params: Params) -> str:
     return " ".join([base, *clauses]).strip()
 
 
+def _closing(text: str, sentence: str) -> str:
+    """``text`` ending with ``sentence`` (how a model without a negative prompt is told what to avoid)."""
+    if not sentence:
+        return text
+    base = text.rstrip().rstrip(".")
+    return f"{base}. {sentence}" if base else sentence
+
+
 # --------------------------------------------------------------------------------------
 # The planner
 # --------------------------------------------------------------------------------------
@@ -349,30 +360,32 @@ class Planner:
         override = self.config.models.get(spec.id)
         return override.guidance if override and override.guidance is not None else None
 
-    def _negative(
+    def _avoid(
         self,
         spec: ModelSpec,
-        text: str,
         terms: list[str],
         free_text: str | None,
         guidance: float | None,
         notes: list[str],
-    ) -> tuple[str, str | None, float | None]:
-        """Apply things-to-avoid. Returns (text, negative prompt, guidance)."""
+    ) -> tuple[str | None, float | None, str]:
+        """Apply things-to-avoid. Returns (negative prompt, guidance, closing sentence).
+
+        A model with classifier-free guidance takes a real negative prompt. Any other model is
+        told in the prompt itself, in a sentence that closes it, which is best-effort.
+        """
         wanted = [*terms, *([free_text] if free_text else [])]
         if not wanted:
-            return text, None, guidance
+            return None, guidance, ""
         if spec.cfg:
             effective = guidance if guidance is not None else spec.guidance
             if effective is None or effective <= 1.0:
                 # Classifier-free guidance only runs (and only then reads the negative prompt) above 1.
                 guidance = 3.0
-            return text, ", ".join(wanted), guidance
+            return ", ".join(wanted), guidance, ""
         notes.append(
             f"{spec.title} has no negative prompt, so `--no` is best-effort. A model with guidance honours it fully."
         )
-        base = text.rstrip().rstrip(".")
-        return f"{base}. Without {', '.join(terms or wanted)}.", None, guidance
+        return None, guidance, f"Without {', '.join(terms or wanted)}."
 
     def _loras(self, spec: ModelSpec, requested: list[LoraRef]) -> list[Lora]:
         resolved: list[Lora] = []
@@ -422,8 +435,21 @@ class Planner:
     # ----------------------------------------------------------------- imagine ----
 
     def imagine(
-        self, parsed: ParsedPrompt, settings: ResolvedSettings, refs: ResolvedRefs | None = None
+        self,
+        parsed: ParsedPrompt,
+        settings: ResolvedSettings,
+        refs: ResolvedRefs | None = None,
+        *,
+        directions: Sequence[str] | None = None,
+        seeds: Sequence[int] | None = None,
     ) -> Plan:
+        """Plan a prompt.
+
+        The result can be rendered as it is. When it carries a ``brief``, a language model may
+        first write a line of art direction for each image; planning again with those
+        ``directions`` (and the same ``seeds``) then builds the prompts from them. An empty
+        direction leaves that image with the rule-based emulation in :mod:`dreambot.core.styles`.
+        """
         refs = refs or ResolvedRefs()
         typed = parsed.params
         params = typed.merged_over(settings.as_params())
@@ -450,29 +476,67 @@ class Planner:
         else:
             width, height = dimensions(params.aspect, multiple=spec.multiple, scale=scale, native=spec.native)
 
-        seeds = self._seeds(params, count)
+        seeds = list(seeds) if seeds else self._seeds(params, count)
         guidance = self._guidance(spec, params)
-        text, negative, guidance = self._negative(
-            spec, text, parsed.negative_terms, params.negative, guidance, notes
+        negative, guidance, without = self._avoid(
+            spec, parsed.negative_terms, params.negative, guidance, notes
         )
         location, quantize = self._weights(spec)
 
         style_weight = 100 if params.sw is None else params.sw
-        directed = [
-            styles.direct(
-                text,
-                seed=seeds[0],
-                index=index,
+        style_codes = [(code, style_weight) for code in refs.style_codes]
+        stylize = params.stylize if params.stylize is not None else settings.stylize
+        raw = bool(params.raw)
+        chaos, weird, exp = params.chaos or 0, params.weird or 0, params.exp or 0
+
+        brief: enhance.Brief | None = None
+        if settings.enhance and op is Op.TXT2IMG and not refs.images:
+            # Only a plain text prompt is art-directed. With images attached the text is an
+            # instruction, or a description that has to agree with a picture the model cannot see.
+            candidate = enhance.Brief(
+                text=text,
                 count=count,
-                chaos=params.chaos or 0,
-                weird=params.weird or 0,
-                exp=params.exp or 0,
-                stylize=params.stylize if params.stylize is not None else settings.stylize,
-                raw=bool(params.raw),
-                style_codes=[(code, style_weight) for code in refs.style_codes],
+                stylize=0 if raw else stylize,
+                chaos=chaos,
+                weird=weird,
+                exp=exp,
+                style=tuple(
+                    phrase for code, weight in style_codes for phrase in styles.style_recipe(code, weight)
+                ),
+                avoid=tuple(parsed.negative_terms),
             )
-            for index in range(count)
-        ]
+            if enhance.wanted(candidate):
+                brief = candidate
+
+        directed: list[str] = []
+        for index in range(count):
+            direction = directions[index] if directions and index < len(directions) else ""
+            if direction:
+                # The language model has covered stylize, chaos, weird and exp; a style code's
+                # recipe is still added by rule, so that a code always means the same look.
+                prompt = styles.direct(
+                    enhance.compose(text, direction),
+                    seed=seeds[0],
+                    index=index,
+                    count=count,
+                    raw=True,
+                    style_codes=style_codes,
+                )
+            else:
+                prompt = styles.direct(
+                    text,
+                    seed=seeds[0],
+                    index=index,
+                    count=count,
+                    chaos=chaos,
+                    weird=weird,
+                    exp=exp,
+                    stylize=stylize,
+                    raw=raw,
+                    style_codes=style_codes,
+                )
+            directed.append(_closing(prompt, without))
+        text = _closing(text, without)
 
         base = Render(
             op=op,
@@ -517,6 +581,7 @@ class Planner:
             height=height,
             seeds=seeds,
             renders=self._grouped(base, directed, seeds),
+            brief=None if directions else brief,
             notes=notes,
         )
         if params.hd:

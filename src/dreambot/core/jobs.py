@@ -57,6 +57,9 @@ class JobImage:
     width: int
     height: int
     favorite: bool = False
+    #: The full prompt this image was rendered from, when it says more than the job's text
+    #: (per-image art direction). Variations and upscales of the image start from it.
+    prompt: str | None = None
 
 
 @dataclass
@@ -130,6 +133,8 @@ class EventType(StrEnum):
     STARTED = "started"
     #: The model is being loaded into memory (can take a while the first time).
     LOADING = "loading"
+    #: The language model is writing art direction for the job's images.
+    THINKING = "thinking"
     PROGRESS = "progress"
     PREVIEW = "preview"
     FINISHED = "finished"

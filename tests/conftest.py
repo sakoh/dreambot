@@ -10,6 +10,16 @@ from PIL import Image
 from dreambot.engine.client import Engine
 
 
+@pytest.fixture(autouse=True)
+def enhancer_off_unless_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prompt enhancer defaults to on or off by how much memory the Mac has.
+
+    Tests must not depend on the machine they run on, so the default is pinned to off here;
+    tests about the enhancer switch it on through the config or a person's settings.
+    """
+    monkeypatch.setattr("dreambot.core.settings.auto_enhance", lambda: False)
+
+
 @pytest.fixture
 async def engine() -> AsyncIterator[Engine]:
     """An engine backed by the fake (Pillow) backend: fast and weight-free."""

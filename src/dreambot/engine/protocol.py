@@ -121,6 +121,11 @@ class TextRequest(_Message):
     prompt: str
     max_tokens: int = 400
     temperature: float = 0.7
+    #: Nucleus sampling: keep the most likely tokens adding up to this probability. Without it a
+    #: small quantized model at a high temperature wanders off into nonsense.
+    top_p: float | None = None
+    #: Above 1, discourages repeating recent tokens (stops a small model looping on a phrase).
+    repetition_penalty: float | None = None
     seed: int | None = None
 
 

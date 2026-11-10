@@ -84,6 +84,7 @@ class IMessageFrontend(ChatFrontend):
     grid_as_one_image = False
     acknowledge = True
     max_caption = 3000
+    max_text = 6000
 
     def __init__(
         self,

@@ -40,6 +40,8 @@ FRAMINGS = (
     "fisheye perspective",
     "side profile view",
 )
+# Light is described by its quality, never by its source: "candlelight" and "softbox lighting"
+# put a candle and a softbox in the picture.
 LIGHTS = (
     "soft morning light",
     "golden hour light",
@@ -49,9 +51,9 @@ LIGHTS = (
     "blue hour twilight",
     "moonlight",
     "neon glow",
-    "candlelight",
+    "warm low amber light",
     "volumetric light through haze",
-    "studio softbox lighting",
+    "soft even studio light",
     "stormy low light",
 )
 PALETTES = (

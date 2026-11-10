@@ -41,8 +41,9 @@ def hf_cache_dir() -> Path:
 
 
 def physical_memory_gb() -> float:
+    """This Mac's memory, in the units Apple sells it in (a "96 GB" Mac reports 96)."""
     try:
-        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 1000**3
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 1024**3
     except (ValueError, OSError):
         return 16.0
 
@@ -204,10 +205,32 @@ def installed(spec: ModelSpec, cache: Path | None = None) -> list[Weights]:
     # Original weights only count when every extra repository the model needs (a ControlNet,
     # an adapter) is present too; community exports already bundle those.
     extras = [_first_complete(cache, repo) for repo in spec.extra_repos]
-    if all(extras) and (snapshot := _first_complete(cache, spec.repo)):
-        size = _size(snapshot) + sum(_size(extra) for extra in extras if extra)
+    if all(extras) and (snapshot := _upstream(cache, spec)):
+        own = sum(_file_size(snapshot / name) for name in spec.files) if spec.files else _size(snapshot)
+        size = own + sum(_size(extra) for extra in extras if extra)
         found.append(Weights(repo=spec.repo, quant=None, path=snapshot, size_bytes=size, upstream=True))
     return found
+
+
+def _upstream(cache: Path, spec: ModelSpec) -> Path | None:
+    """The snapshot of the original repo holding this model's weights, if they are all there.
+
+    Some repos hold several models (SeedVR2 3B and 7B share one): having the repo is then not
+    the same as having the model, and the files the model reads are checked by name.
+    """
+    for snapshot in _snapshots(cache, spec.repo):
+        if not snapshot_is_complete(snapshot):
+            continue
+        if all((snapshot / name).is_file() for name in spec.files):
+            return snapshot
+    return None
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def resolve(

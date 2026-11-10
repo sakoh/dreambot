@@ -187,7 +187,10 @@ class MlxBackend:
         ram = _physical_memory_gb()
         #: Loaded models are evicted (least recently used first) once MLX holds more than this.
         self.budget_gb = float(os.environ.get("DREAMBOT_MEMORY_BUDGET_GB", ram * 0.5))
-        self.max_models = int(os.environ.get("DREAMBOT_MAX_MODELS", 3 if ram >= 64 else 1))
+        # How many models may stay loaded (the memory budget still applies). Two lets the small
+        # language model that art-directs prompts sit next to the image model.
+        default_models = 3 if ram >= 64 else 2 if ram >= 24 else 1
+        self.max_models = int(os.environ.get("DREAMBOT_MAX_MODELS", default_models))
         # MLX keeps freed buffers in a cache that otherwise grows without bound across jobs.
         cache_gb = float(os.environ.get("DREAMBOT_MLX_CACHE_GB", min(8.0, ram * 0.1)))
         mx.set_cache_limit(int(cache_gb * GB))
@@ -569,6 +572,8 @@ class MlxBackend:
         max_tokens: int,
         temperature: float,
         seed: int | None,
+        top_p: float | None = None,
+        repetition_penalty: float | None = None,
     ) -> str:
         from mlx_vlm import generate
         from mlx_vlm.prompt_utils import apply_chat_template
@@ -581,6 +586,10 @@ class MlxBackend:
         options: dict[str, Any] = {"max_tokens": max_tokens, "temperature": temperature, "verbose": False}
         if seed is not None:
             options["seed"] = seed
+        if top_p is not None:
+            options["top_p"] = top_p
+        if repetition_penalty is not None:
+            options["repetition_penalty"] = repetition_penalty
         result = generate(model, processor, formatted, image=[image] if image else None, **options)
         return str(getattr(result, "text", result)).strip()
 
@@ -618,6 +627,8 @@ class MlxBackend:
             max_tokens=req.max_tokens,
             temperature=req.temperature,
             seed=req.seed,
+            top_p=req.top_p,
+            repetition_penalty=req.repetition_penalty,
         )
         return [answer]
 

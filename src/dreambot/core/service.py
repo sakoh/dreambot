@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import re
 import shutil
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from dreambot.config import Config
-from dreambot.core import imaging, styles
+from dreambot.core import enhance, imaging, styles
 from dreambot.core.access import Access
 from dreambot.core.actions import GENERATIVE, PAN_DIRECTIONS, Action, ActionKind
 from dreambot.core.fetch import FetchError, fetch_image
@@ -42,6 +43,7 @@ from dreambot.engine.protocol import (
     ErrorKind,
     Event,
     Loading,
+    Op,
     Preview,
     Progress,
     TextRequest,
@@ -53,6 +55,14 @@ Listener = Callable[[JobEvent], Awaitable[None] | None]
 #: Seconds between progress events for one job (frontends edit a chat message for each).
 PROGRESS_INTERVAL = 1.0
 MAX_JOBS_PER_MESSAGE = MAX_PERMUTATIONS
+#: Shown once per person, on the first job a language model art-directed.
+ENHANCE_HINT = (
+    "A language model on this Mac added art direction to your prompt (`info` shows what it wrote). "
+    "`--raw` skips that for one prompt and `/settings enhance off` turns it off. "
+    "This note appears only once."
+)
+#: Operations whose prompt describes the picture (rather than instructing a change to one).
+_SCENE_OPS = (Op.TXT2IMG, Op.IMG2IMG, Op.REDUX)
 
 
 class DreambotError(Exception):
@@ -325,7 +335,7 @@ class Dreambot:
         except ImageError as exc:
             raise DreambotError(str(exc)) from exc
 
-        planned: list[tuple[Job, Plan]] = []
+        planned: list[tuple[Job, Plan, Callable[..., Plan]]] = []
         for parsed in parsed_prompts:
             refs, ref_notes = await self._resolve_refs(parsed, prepared, scratch, allow_paths=allow_paths)
             for _ in range(parsed.params.repeat or 1):
@@ -333,6 +343,11 @@ class Dreambot:
                     plan = self.planner.imagine(parsed, settings, refs)
                 except (PlanError, PromptError) as exc:
                     raise DreambotError(str(exc)) from exc
+                # The same request planned again, with the seeds already drawn, once the
+                # language model has written its direction.
+                replan = functools.partial(
+                    self.planner.imagine, parsed, settings, refs, seeds=list(plan.seeds)
+                )
                 plan.notes[:0] = ref_notes
                 if refs.edit:
                     plan.detail["instruction"] = True  # `--edit`: the text says what to change
@@ -345,10 +360,10 @@ class Dreambot:
                     params=parsed.params,
                 )
                 job.inputs = {"attachments": prepared}
-                planned.append((job, plan))
-        for job, plan in planned:
-            await self._enqueue(job, self._runner(plan))
-        return [job for job, _ in planned]
+                planned.append((job, plan, replan))
+        for job, plan, replan in planned:
+            await self._enqueue(job, self._runner(plan, replan))
+        return [job for job, _, _ in planned]
 
     def _display_prompt(self, parsed: ParsedPrompt, refs: ResolvedRefs) -> str:
         """The prompt as it should be shown and re-run: `--sref random` pinned to the code drawn."""
@@ -506,6 +521,16 @@ class Dreambot:
         kind = action.kind
         scratch = self._scratch()
         text, negative, params = self._scene_text(job), job.negative, Params()
+        if image.prompt and action.kind in (
+            ActionKind.VARY,
+            ActionKind.VARY_SUBTLE,
+            ActionKind.VARY_STRONG,
+            ActionKind.UPSCALE_SUBTLE,
+            ActionKind.UPSCALE_CREATIVE,
+        ):
+            # This image was art-directed on its own: a variation of the wide shot should stay
+            # a wide shot. (Zooming and panning change the framing, so they use the plain text.)
+            text = image.prompt
         # A derived job gets fresh seeds, so the parent's --seed must not appear in its prompt.
         prompt = re.sub(r"\s--(?:seed|sameseed)\s+\d+", "", f" {job.prompt}").strip()
         if action.prompt and kind in (
@@ -651,7 +676,8 @@ class Dreambot:
     async def _reroll(self, job: Job, *, user: str, channel: str) -> list[Job]:
         """Run a job again with fresh seeds."""
         if job.kind is JobKind.IMAGINE:
-            prompt = re.sub(r"\s--(?:seed|sameseed)\s+\d+", "", f" {job.prompt}").strip()
+            # Fresh seeds, and one job: rerolling one result of a `--repeat 4` runs it once, as in Midjourney.
+            prompt = re.sub(r"\s--(?:seed|sameseed|repeat)\s+\d+", "", f" {job.prompt}").strip()
             attachments = [p for p in job.inputs.get("attachments", []) if Path(p).is_file()]
             return await self.imagine(
                 user=user, channel=channel, prompt=prompt, attachments=attachments, allow_paths=True
@@ -787,11 +813,67 @@ class Dreambot:
             detail=_jsonable(plan.detail),
         )
 
-    def _runner(self, plan: Plan) -> Callable[[Job], Awaitable[None]]:
+    def _runner(
+        self, plan: Plan, replan: Callable[..., Plan] | None = None
+    ) -> Callable[[Job], Awaitable[None]]:
         async def run(job: Job) -> None:
-            await self._run_plan(job, plan)
+            final = plan
+            if plan.brief is not None and replan is not None:
+                final = await self._enhance(job, plan, replan)
+            await self._run_plan(job, final)
 
         return run
+
+    async def _enhance(self, job: Job, plan: Plan, replan: Callable[..., Plan]) -> Plan:
+        """Have the local language model art-direct each image, and plan again with what it wrote.
+
+        Enhancement refines a job; it is never a reason for one to fail. Whatever goes wrong
+        here — no language model, an unusable answer, a planning error — the job runs with the
+        plan it already has.
+        """
+        brief = plan.brief
+        vision = self.catalog.vision_model()
+        if brief is None or vision is None:
+            return plan
+        await self._emit(JobEvent(EventType.THINKING, job))
+        request = TextRequest(
+            id=new_request_id(),
+            weights=vision,
+            system=enhance.SYSTEM,
+            prompt=enhance.request(brief),
+            max_tokens=enhance.max_tokens(brief),
+            temperature=enhance.temperature(brief),
+            top_p=enhance.TOP_P,
+            repetition_penalty=enhance.REPETITION_PENALTY,
+            # Seeded like the images, so the same prompt and seed give the same direction.
+            seed=plan.seeds[0] if plan.seeds else None,
+        )
+        self._current_request = request.id
+        try:
+            answers = await self.engine.text(request)
+        except EngineCancelled:
+            raise
+        except EngineError as exc:
+            log.warning(
+                "job %s: the prompt enhancer failed (%s); rendering the prompt as planned", job.id, exc
+            )
+            return plan
+        directions = enhance.parse(answers[0] if answers else "", brief)
+        if not any(directions):
+            log.warning("job %s: the prompt enhancer returned nothing usable", job.id)
+            return plan
+        try:
+            directed = replan(directions=directions)
+        except (PlanError, PromptError) as exc:
+            log.warning("job %s: could not plan with the enhancer's direction (%s)", job.id, exc)
+            return plan
+        job.detail["enhanced"] = True
+        settings = self.settings(job.user)
+        if "enhance" not in settings.hints:
+            job.notes.append(ENHANCE_HINT)
+            settings.hints.append("enhance")
+            self.store.save_settings(job.user, settings.to_dict())
+        return directed
 
     async def _run_plan(self, job: Job, plan: Plan) -> None:
         day = datetime.fromtimestamp(job.created).strftime("%Y-%m-%d")
@@ -802,6 +884,8 @@ class Dreambot:
         units = plan.work + (plan.count if plan.finish else 0)
         done = 0
         last_progress = 0.0
+        # Whether each render's prompt describes its picture and so is worth keeping with it.
+        scene = plan.op in _SCENE_OPS and plan.canvas is None and plan.keep_outside_mask is None
 
         async def on_event(event: Event, base: int) -> None:
             nonlocal last_progress
@@ -854,6 +938,7 @@ class Dreambot:
                             seed=produced.seed,
                             width=produced.width,
                             height=produced.height,
+                            prompt=render.prompt if scene and render.prompt != job.text else None,
                         )
                     )
 
@@ -861,6 +946,7 @@ class Dreambot:
                 final = out_dir / f"{stem}_1.png"
                 placed = [(tile.box, pieces[number]) for number, tile in enumerate(plan.tiles, start=1)]
                 await asyncio.to_thread(imaging.blend_tiles, plan.tile_base, placed, final)
+                # A tiled upscale keeps the prompt of the image it enlarged (that is its text).
                 job.images.append(
                     JobImage(
                         index=1, path=str(final), seed=plan.seeds[0], width=plan.width, height=plan.height
@@ -946,6 +1032,8 @@ def describe_job(job: Job, image: JobImage | None = None) -> str:
         lines.append(f"Prompt: {job.prompt}")
     if image is not None:
         lines.append(f"Image {image.index}: seed {image.seed} · {image.width}x{image.height}")
+        if image.prompt:
+            lines.append(f"Rendered from: {image.prompt}")
         lines.append(f"File: {image.path}")
     elif job.seeds:
         lines.append(f"Seeds: {', '.join(map(str, job.seeds))}")

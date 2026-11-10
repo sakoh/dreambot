@@ -24,6 +24,7 @@ from dreambot.core.commands import Commands, Reply, job_reply
 from dreambot.core.jobs import EventType, Job, JobEvent, JobStatus
 from dreambot.core.service import Dreambot, DreambotError
 from dreambot.core.store import MessageLink
+from dreambot.core.text import split_caption, split_text
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +97,10 @@ class ChatFrontend:
     #: Acknowledge every job with a short message (for platforms without live progress).
     acknowledge: bool = False
     slash: str = "/"
+    #: The longest caption the platform accepts under a picture, and the longest text message.
+    #: Longer replies are sent in parts rather than refused or cut off by the platform.
     max_caption: int = 1000
+    max_text: int = 4000
 
     def __init__(self, service: Dreambot):
         self.service = service
@@ -294,7 +298,7 @@ class ChatFrontend:
             )
             return None
         if action.kind is ActionKind.INFO and result.message:
-            await self.send(conversation, result.message)
+            await self.send_text(conversation, result.message)
             return None
         return result.message
 
@@ -316,14 +320,26 @@ class ChatFrontend:
         if not reply.text and not reply.images:
             return  # nothing to say: the jobs it queued report through job events
         buttons = self._buttons_for(reply)
-        text = reply.text
-        if len(text) > self.max_caption and reply.images:
-            text = text[: self.max_caption - 1].rstrip() + "…"
+        text, overflow = reply.text, ""
+        if reply.images:
+            # What does not fit under the picture follows as a message of its own.
+            text, overflow = split_caption(text, self.max_caption)
+        elif len(text) > self.max_text:
+            *earlier, text = split_text(text, self.max_text)
+            for part in earlier:
+                await self.send(conversation, part)
         refs = await self.send(conversation, text, reply.images, buttons)
         if reply.job is not None and reply.images:
             index = reply.image.index if reply.image else None
             for ref in refs:
                 self._link(conversation, ref, reply.job, index)
+        if overflow:
+            await self.send_text(conversation, overflow)
+
+    async def send_text(self, conversation: str, text: str) -> None:
+        """Send text of any length, in as many messages as the platform needs."""
+        for part in split_text(text, self.max_text):
+            await self.send(conversation, part)
 
     async def deliver(self, job: Job) -> None:
         """Send a finished job to its conversation."""
@@ -338,7 +354,7 @@ class ChatFrontend:
                 for ref in await self.send(conversation, "", [image.path]):
                     self._link(conversation, ref, job, image.index)
             hint = "Reply to a picture to change it, or send U1–U4 · V1–V4 · R (more: /help)"
-            await self.send(conversation, f"{render.job_caption(job)}\n{hint}")
+            await self.send_text(conversation, f"{render.job_caption(job)}\n{hint}")
             return
         await self._send_reply(conversation, reply)
 
@@ -366,13 +382,15 @@ class ChatFrontend:
                 )
             elif self.acknowledge or event.position > 0:
                 await self.send(conversation, f"🎨 {text}")
-        elif kind in (EventType.STARTED, EventType.LOADING, EventType.PROGRESS):
+        elif kind in (EventType.STARTED, EventType.LOADING, EventType.THINKING, EventType.PROGRESS):
             if not self.can_edit:
                 return
             status = self._status.get(job.id)
             if status is None or status.ref is None:
                 return
-            text = render.progress_text(job, event.fraction, loading=kind is EventType.LOADING)
+            text = render.progress_text(
+                job, event.fraction, loading=kind is EventType.LOADING, thinking=kind is EventType.THINKING
+            )
             now = time.monotonic()
             if text == status.text or (kind is EventType.PROGRESS and now - status.edited < STATUS_INTERVAL):
                 return

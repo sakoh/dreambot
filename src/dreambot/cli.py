@@ -130,6 +130,8 @@ async def _imagine(prompt: str, attachments: list[str], show: bool, verbose: boo
             task = tasks[job.id]
             if event.type is EventType.LOADING:
                 progress.update(task, description=f"#{job.id} loading {job.model}")
+            elif event.type is EventType.THINKING:
+                progress.update(task, description=f"#{job.id} art-directing")
             elif event.type in (EventType.STARTED, EventType.PROGRESS):
                 progress.update(task, description=f"#{job.id} {job.model}", completed=event.fraction)
             elif event.type in (EventType.FINISHED, EventType.FAILED, EventType.CANCELLED):
@@ -424,6 +426,7 @@ def params() -> None:
 def doctor() -> None:
     """Check that this Mac is ready to run Dreambot."""
     from dreambot.core.planner import Catalog
+    from dreambot.core.settings import auto_enhance
     from dreambot.engine import weights
 
     config = _config()
@@ -457,6 +460,21 @@ def doctor() -> None:
         bool(installed),
         ", ".join(spec.id for spec in installed) or "run: dreambot models pull z-image-turbo",
     )
+    vision = weights.find_vision_model(config.assist.vision_model)
+    language = (
+        vision.parent.parent.name.removeprefix("models--").replace("--", "/")
+        if vision is not None and vision.parent.parent.name.startswith("models--")
+        else (str(vision) if vision else None)
+    )
+    enhancing = auto_enhance() if config.defaults.enhance is None else config.defaults.enhance
+    if language is None:
+        console.print(
+            "[dim]·[/dim] Language model: none [dim]— `dreambot models pull describe` adds /describe, "
+            "smarter /shorten and the prompt enhancer[/dim]"
+        )
+    else:
+        state = "on" if enhancing else "off by default (`/settings enhance on` to use it)"
+        console.print(f"[green]✓[/green] Language model [dim]— {language}; prompt enhancer {state}[/dim]")
     console.print(f"  [dim]Hugging Face cache: {weights.hf_cache_dir()}[/dim]")
     console.print(
         f"  [dim]Config: {config.config_path}{'' if config.config_path.exists() else ' (not created; defaults in use)'}[/dim]"
@@ -477,25 +495,26 @@ def doctor() -> None:
             else ("[yellow]![/yellow]" if enabled else "[dim]·[/dim]")
         )
         console.print(f"{mark} {name.title()}: {state}, {token}")
-    try:
-        reader = ChatDB()
-        reader.open()
-        reader.close()
-        readable, problem = True, ""
-    except ChatDBError as exc:
-        readable, problem = False, str(exc)
-    state = f"enabled ({config.imessage.mode} mode)" if config.imessage.enabled else "off"
-    if readable:
-        mark = "[green]✓[/green]" if config.imessage.enabled else "[dim]·[/dim]"
-        console.print(f"{mark} iMessage: {state}, Messages database is readable")
+    if not config.imessage.enabled:
+        # The Messages database is only opened once iMessage has been switched on in setup.
+        console.print("[dim]·[/dim] iMessage: off")
     else:
-        mark = "[red]✗[/red]" if config.imessage.enabled else "[dim]·[/dim]"
-        console.print(f"{mark} iMessage: {state}, cannot read the Messages database yet")
-        if config.imessage.enabled:
+        try:
+            reader = ChatDB()
+            reader.open()
+            reader.close()
+            readable, problem = True, ""
+        except ChatDBError as exc:
+            readable, problem = False, str(exc)
+        state = f"enabled ({config.imessage.mode} mode)"
+        if readable:
+            console.print(f"[green]✓[/green] iMessage: {state}, Messages database is readable")
+        else:
             ok = False
+            console.print(f"[red]✗[/red] iMessage: {state}, cannot read the Messages database yet")
             console.print(f"  [dim]{problem}[/dim]")
-    console.print(f"  [dim]For iMessage, grant Full Disk Access to: {launchd.interpreter()}[/dim]")
-    console.print("  [dim](and to your terminal app when you run `dreambot run` by hand)[/dim]")
+        console.print(f"  [dim]For iMessage, grant Full Disk Access to: {launchd.interpreter()}[/dim]")
+        console.print("  [dim](and to your terminal app when you run `dreambot run` by hand)[/dim]")
     service = launchd.status()
     console.print(
         "[dim]· Background service: "
@@ -663,30 +682,65 @@ def _discord_invite(token: str) -> str | None:
     )
 
 
-@app.command()
-def setup() -> None:
-    """Connect Dreambot to Telegram, Discord and iMessage, step by step."""
-    from dreambot import launchd, secrets
-    from dreambot.frontends.imessage.chatdb import ChatDB, ChatDBError
+def _check_telegram_token(token: str) -> tuple[bool | None, str]:
+    """Ask Telegram whose token this is.
 
-    config = _config()
-    console.print("[bold]Dreambot setup[/bold] — press Enter to skip any step.\n")
+    Returns ``(True, username)``, ``(False, why)`` when Telegram rejects it, or ``(None, why)``
+    when Telegram could not be reached. Error text never includes the request URL: the token
+    is part of it.
+    """
+    import re
 
-    console.print("[bold]1. Telegram[/bold]")
+    import httpx
+
+    if not re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{30,}", token):
+        return False, "bot tokens look like 123456789:AAE… (numbers, a colon, then about 35 characters)"
+    try:
+        response = httpx.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
+        data = response.json()
+    except httpx.HTTPError as exc:
+        return None, type(exc).__name__
+    except ValueError:
+        return None, "an unreadable answer"
+    if isinstance(data, dict) and data.get("ok"):
+        return True, str(data.get("result", {}).get("username", ""))
+    reason = data.get("description") if isinstance(data, dict) else None
+    return False, str(reason or f"HTTP {response.status_code}")
+
+
+def _setup_telegram(config: Config) -> None:
+    from dreambot import secrets
+
+    console.print("[bold]Telegram[/bold]")
     console.print("   In Telegram, message @BotFather, send /newbot, and copy the token it gives you.")
     if secrets.token_source("telegram"):
-        console.print("   [green]A token is already stored.[/green]")
+        console.print("   [green]A token is already stored.[/green] Press Enter to keep it.")
     token = typer.prompt("   Telegram bot token", default="", hide_input=True, show_default=False).strip()
-    if token:
-        secrets.set_token("telegram", token)
-        _update_config(config, {"telegram": {"enabled": True}})
-        console.print("   [green]Saved to your Keychain; Telegram enabled.[/green]")
+    if not token:
+        return
+    valid, detail = _check_telegram_token(token)
+    if valid is False:
+        console.print(f"   [red]Telegram did not accept that token: {detail}. Nothing was saved.[/red]")
+        return
+    secrets.set_token("telegram", token)
+    _update_config(config, {"telegram": {"enabled": True}})
+    if valid:
+        console.print(f"   [green]That is @{detail}. Token saved to your Keychain; Telegram enabled.[/green]")
+        console.print(f"   Your bot: https://t.me/{detail}")
+    else:
+        console.print(
+            f"   [yellow]Saved to your Keychain, but Telegram could not be reached to check it ({detail}).[/yellow]"
+        )
 
-    console.print("\n[bold]2. Discord[/bold]")
+
+def _setup_discord(config: Config) -> None:
+    from dreambot import secrets
+
+    console.print("[bold]Discord[/bold]")
     console.print("   At https://discord.com/developers/applications create an application, open Bot,")
     console.print("   press Reset Token and copy it. No privileged intents are needed.")
     if secrets.token_source("discord"):
-        console.print("   [green]A token is already stored.[/green]")
+        console.print("   [green]A token is already stored.[/green] Press Enter to keep it.")
     token = typer.prompt("   Discord bot token", default="", hide_input=True, show_default=False).strip()
     if token:
         secrets.set_token("discord", token)
@@ -696,7 +750,12 @@ def setup() -> None:
     if stored and (invite := _discord_invite(stored)):
         console.print(f"   Add the bot to a server (or just DM it): {invite}")
 
-    console.print("\n[bold]3. iMessage[/bold]")
+
+def _setup_imessage(config: Config) -> None:
+    from dreambot import launchd
+    from dreambot.frontends.imessage.chatdb import ChatDB, ChatDBError
+
+    console.print("[bold]iMessage[/bold]")
     console.print(
         "   Dreambot reads new messages from the Messages database and replies through the Messages app."
     )
@@ -704,42 +763,64 @@ def setup() -> None:
         "   [bold]self[/bold]: Messages on this Mac uses your Apple Account — you text yourself to use the bot."
     )
     console.print(
-        "   [bold]dedicated[/bold]: Messages on this Mac is signed into an Apple Account just for the bot."
+        "   [bold]dedicated[/bold]: Messages on this Mac is signed into an Apple Account just for the bot"
     )
+    console.print("   (Messages > Settings > iMessage; the rest of the Mac stays on your own account).")
     mode = (
         typer.prompt("   Mode (self / dedicated, Enter to skip)", default="", show_default=False)
         .strip()
         .lower()
     )
-    if mode in ("self", "dedicated"):
-        _update_config(config, {"imessage": {"enabled": True, "mode": mode}})
-        console.print(f"   [green]iMessage enabled in {mode} mode.[/green]")
-        try:
-            reader = ChatDB()
-            reader.open()
-            reader.close()
-            console.print("   [green]The Messages database is readable from this terminal.[/green]")
-        except ChatDBError as exc:
-            console.print(f"   [yellow]{exc}[/yellow]")
+    if mode not in ("self", "dedicated"):
+        if mode:
+            console.print("   [yellow]Skipped (type self or dedicated).[/yellow]")
+        return
+    _update_config(config, {"imessage": {"enabled": True, "mode": mode}})
+    console.print(f"   [green]iMessage enabled in {mode} mode.[/green]")
+    try:
+        reader = ChatDB()
+        reader.open()
+        reader.close()
+        console.print("   [green]The Messages database is readable from this terminal.[/green]")
+    except ChatDBError as exc:
+        console.print(f"   [yellow]{exc}[/yellow]")
+    console.print(f"   For the background service, also give Full Disk Access to: {launchd.interpreter()}")
+    console.print("   The first reply makes macOS ask whether Dreambot may control Messages — choose Allow.")
+    if mode == "self":
         console.print(
-            f"   For the background service, also give Full Disk Access to: {launchd.interpreter()}"
+            "   Then text [bold]your own phone number[/bold] from your iPhone: that thread is your Dreambot."
         )
+    else:
         console.print(
-            "   The first reply makes macOS ask whether Dreambot may control Messages — choose Allow."
+            "   Then text the bot's Apple Account from your iPhone and send it the code from `dreambot pair`."
         )
-        if mode == "self":
-            console.print(
-                "   Then text [bold]your own phone number[/bold] from your iPhone: that thread is your Dreambot."
-            )
-    elif mode:
-        console.print("   [yellow]Skipped (type self or dedicated).[/yellow]")
 
-    console.print("\n[bold]4. Start it[/bold]")
+
+_SETUP_STEPS = {"telegram": _setup_telegram, "discord": _setup_discord, "imessage": _setup_imessage}
+
+
+@app.command()
+def setup(
+    frontend: Annotated[
+        str | None, typer.Argument(help="Set up just one: telegram, discord or imessage.")
+    ] = None,
+) -> None:
+    """Connect Dreambot to Telegram, Discord and iMessage, step by step."""
+    config = _config()
+    chosen = frontend.lower() if frontend else None
+    if chosen is not None and chosen not in _SETUP_STEPS:
+        err.print(f"[red]I can set up {', '.join(_SETUP_STEPS)} — not `{frontend}`.[/red]")
+        raise typer.Exit(2)
+    console.print("[bold]Dreambot setup[/bold] — press Enter to skip any step.\n")
+    for name, step in _SETUP_STEPS.items():
+        if chosen in (None, name):
+            step(config)
+            console.print()
+
+    console.print("[bold]Start it[/bold]")
     console.print("   dreambot run                 run in this terminal")
     console.print("   dreambot service install     run in the background and at login")
-    console.print(
-        "   dreambot pair                print the code that makes you the owner on Telegram/Discord"
-    )
+    console.print("   dreambot pair                print the code that makes you the bot's owner")
 
 
 @app.command()

@@ -384,7 +384,7 @@ class Commands:
             if lowered not in VARIATION_MODES:
                 raise DreambotError("Variation mode is `strong` or `subtle`.")
             settings.variation = lowered
-        elif key in ("remix", "raw", "hd"):
+        elif key in ("remix", "raw", "hd", "enhance"):
             setattr(settings, key, _on_off(lowered, key))
         elif key in ("count", "images"):
             if not lowered.isdigit() or not 1 <= int(lowered) <= 16:
@@ -415,6 +415,7 @@ class Commands:
             f"  variation   {resolved.variation}",
             f"  remix       {on(resolved.remix)}",
             f"  hd          {on(resolved.hd)}",
+            f"  enhance     {self._enhance_state(resolved)}",
             f"  count       {resolved.count} images per job",
         ]
         if resolved.suffix:
@@ -427,6 +428,16 @@ class Commands:
             f"`{slash}settings reset` restores the defaults."
         )
         return "\n".join(lines)
+
+    def _enhance_state(self, resolved) -> str:
+        """`on`/`off`, and why it is not doing anything when it is on but cannot run."""
+        if not resolved.enhance:
+            return "off"
+        if resolved.raw:
+            return "on (but raw mode uses prompts as written)"
+        if self.service.catalog.vision_model() is None:
+            return "on (needs a language model: dreambot models pull describe)"
+        return "on — a local language model art-directs short prompts"
 
     async def _cmd_prefer(self, *, user, rest, slash, **_) -> list[Reply]:
         service = self.service

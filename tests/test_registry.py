@@ -176,3 +176,38 @@ def test_registry_module_does_not_import_the_inference_stack():
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, f"the bot process would import: {result.stdout.strip()}"
+
+
+def test_files_of_shared_repos_match_what_mflux_reads():
+    """Where several models share an upstream repo, ``files`` names exactly what mflux loads."""
+    from mflux.models.anima.weights.anima_weight_definition import AnimaWeightDefinition as Anima
+    from mflux.models.seedvr2.weights.seedvr2_weight_definition import (
+        SeedVR2WeightDefinition3B,
+        SeedVR2WeightDefinition7B,
+    )
+
+    assert REGISTRY.get("seedvr2-3b").files == tuple(SeedVR2WeightDefinition3B.get_download_patterns())
+    assert REGISTRY.get("seedvr2-7b").files == tuple(SeedVR2WeightDefinition7B.get_download_patterns())
+    for variant, filename in Anima.TRANSFORMER_FILES.items():
+        spec = REGISTRY.get(variant)
+        assert spec.repo == Anima.REPO
+        assert spec.files == (
+            f"{Anima.TRANSFORMER_DIR}/{filename}",
+            f"{Anima.TEXT_ENCODER_DIR}/{Anima.TEXT_ENCODER_FILE}",
+            f"{Anima.VAE_DIR}/{Anima.VAE_FILE}",
+        )
+
+
+def test_models_that_share_everything_upstream_declare_their_files():
+    """A new mflux model that reuses an existing repo must say which files are its own."""
+    seen: dict[tuple, list] = {}
+    for spec in REGISTRY:
+        seen.setdefault((spec.repo, spec.extra_repos), []).append(spec)
+    # Iris turbo and base are one checkpoint run two ways (mflux gives both the same repo and file).
+    one_checkpoint = {frozenset({"iris-3b", "iris-3b-base"})}
+    for (repo, _), specs in seen.items():
+        if len(specs) < 2 or frozenset(spec.id for spec in specs) in one_checkpoint:
+            continue
+        for spec in specs:
+            assert spec.files, f"{spec.id} shares {repo} with {[s.id for s in specs]} but names no files"
+        assert len({spec.files for spec in specs}) == len(specs), f"models in {repo} have the same files"

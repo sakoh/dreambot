@@ -107,6 +107,7 @@ class DiscordFrontend(ChatFrontend):
     can_edit = True
     grid_as_one_image = True
     max_caption = MESSAGE_LIMIT
+    max_text = MESSAGE_LIMIT
 
     def __init__(self, service: Dreambot, token: str, *, guild_ids: Sequence[int] = ()):
         super().__init__(service)
@@ -459,6 +460,7 @@ class DiscordFrontend(ChatFrontend):
         button("Strong Variation Mode", "variation:strong", resolved.variation == "strong", 2)
         button("Subtle Variation Mode", "variation:subtle", resolved.variation == "subtle", 2)
         button("HD (2K)", "hd", resolved.hd, 3)
+        button("Enhance prompts", "enhance", resolved.enhance, 3)
         view.add_item(
             ui.Button(
                 label="Reset Settings",
@@ -488,7 +490,7 @@ class DiscordFrontend(ChatFrontend):
                 settings.stylize = int(rest[0])
             elif key == "variation":
                 settings.variation = rest[0]
-            elif key in ("raw", "remix", "hd"):
+            elif key in ("raw", "remix", "hd", "enhance"):
                 setattr(settings, key, not getattr(resolved, key))
             self.service.save_settings(user, settings)
         except (DreambotError, ValueError, IndexError) as exc:

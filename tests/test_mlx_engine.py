@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from PIL import Image
+from PIL import Image, ImageChops, ImageStat
 
 from dreambot.engine import weights
 from dreambot.engine.client import Engine, EngineCancelled, new_request_id
@@ -320,6 +320,36 @@ async def test_other_installed_models_generate(mlx_engine: Engine, tmp_path: Pat
     print(f"\n[{model}] 768px in {result.seconds:.1f}s (load {result.load_seconds or 0:.1f}s)")
 
 
+async def test_seedvr2_upscales_faithfully(mlx_engine: Engine, tmp_path: Path, photo: str):
+    """The dedicated upscaler doubles the size and keeps the picture: Upscale (Subtle) and --hd."""
+    found = installed("seedvr2-3b")
+    with Image.open(photo) as source:
+        source = source.convert("RGB")
+        width, height = source.size
+    upscale = GenerateRequest(
+        id=new_request_id(),
+        model="seedvr2-3b",
+        op=Op.UPSCALE,
+        weights=found.location,
+        image=photo,
+        seeds=[1],
+        out_dir=str(tmp_path),
+        basename="up",
+        extra={"scale": 2},
+    )
+    result = await mlx_engine.generate(upscale)
+    (image,) = result.images
+    assert (image.width, image.height) == (width * 2, height * 2)
+    assert looks_like_a_picture(image.path)
+    with Image.open(image.path) as big:
+        back = big.convert("RGB").resize((width, height), Image.LANCZOS)
+    difference = ImageStat.Stat(ImageChops.difference(back, source)).mean
+    assert max(difference) < 12, f"the upscale drifted from its source: {difference}"
+    print(
+        f"\n[seedvr2] {width}x{height} -> {image.width}x{image.height} in {result.seconds:.1f}s, drift {max(difference):.1f}"
+    )
+
+
 async def test_describe_and_text_with_the_local_vision_model(mlx_engine: Engine, photo: str):
     from dreambot.engine.protocol import DescribeRequest, TextRequest
 
@@ -342,3 +372,45 @@ async def test_describe_and_text_with_the_local_vision_model(mlx_engine: Engine,
         )
     )
     assert "ready" in replies[0].lower()
+
+
+async def test_the_language_model_art_directs_a_prompt(mlx_engine: Engine):
+    """The prompt enhancer's request, answered by the real language model and checked by its parser."""
+    from dreambot.core import enhance
+    from dreambot.core.enhance import Brief
+    from dreambot.engine.protocol import TextRequest
+
+    vision = weights.find_vision_model()
+    if vision is None:
+        pytest.skip("no vision model is installed")
+
+    async def direct(brief: Brief, seed: int) -> list[str]:
+        request = TextRequest(
+            id=new_request_id(),
+            weights=str(vision),
+            system=enhance.SYSTEM,
+            prompt=enhance.request(brief),
+            max_tokens=enhance.max_tokens(brief),
+            temperature=enhance.temperature(brief),
+            top_p=enhance.TOP_P,
+            repetition_penalty=enhance.REPETITION_PENALTY,
+            seed=seed,
+        )
+        (answer,) = await mlx_engine.text(request)
+        return enhance.parse(answer, brief)
+
+    brief = Brief("a red fox in the snow", 4)
+    lines = await direct(brief, 7)
+    assert len(lines) == 4 and all(lines), lines
+    assert len(set(lines)) >= 3, "the four images should not all get the same shot"
+    for line in lines:
+        assert 3 <= len(line.split()) <= round(brief.words * 1.5) + 4, line
+        assert line.isascii() or all(ord(char) < 0x250 for char in line), line
+    assert lines == await direct(brief, 7), "the same seed gives the same direction"
+    print("\n[enhance] " + " | ".join(lines)[:400])
+
+    # Maximum chaos and stylize is where a small model used to fall apart into word salad.
+    wild = await direct(Brief("a red fox in the snow", 4, stylize=1000, chaos=100), 7)
+    assert all(wild) and len(set(wild)) == 4, wild
+    words = " ".join(wild).lower().split()
+    assert len(set(words)) > len(words) * 0.4, f"the model is looping: {wild}"

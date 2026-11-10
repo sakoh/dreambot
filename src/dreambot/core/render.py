@@ -62,8 +62,10 @@ def failure_text(job: Job) -> str:
     return f"Couldn't finish “{job_title(job, 120)}”: {job.error or 'unknown error'}"
 
 
-def progress_text(job: Job, fraction: float, *, loading: bool = False) -> str:
+def progress_text(job: Job, fraction: float, *, loading: bool = False, thinking: bool = False) -> str:
     title = job_title(job, 120)
+    if thinking:
+        return f"Art-directing… — {title}"
     if loading:
         return f"Loading {job.model}… — {title}"
     return f"{round(fraction * 100)}% — {title}"
@@ -165,6 +167,7 @@ Dreambot — image generation that runs entirely on this Mac.
 {intro}
 Add Midjourney-style parameters at the end, for example:
   a red fox in the snow --ar 16:9 --stylize 250 --no people
+Short prompts are art-directed for you (a different shot for each image); --raw uses yours as written.
 
 Attach an image to use it as an image prompt, or steer with it:
   --edit (change it by instruction) · --oref (keep this person/object) · --sref (borrow its style)
@@ -173,7 +176,8 @@ Attach an image to use it as an image prompt, or steer with it:
 
 Commands:
   {slash}imagine <prompt>     {slash}describe (with an image)     {slash}blend (with 2–5 images)
-  {slash}settings             {slash}prefer suffix|option ...      {slash}models
+  {slash}shorten <prompt>     {slash}edit (with an image)         {slash}models
+  {slash}settings             {slash}prefer suffix|option ...
   {slash}info                 {slash}show <job id>                 {slash}params
   {slash}cancel               {slash}help"""
 

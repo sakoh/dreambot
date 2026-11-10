@@ -129,7 +129,7 @@ class Preferences(_Section):
 
 
 class AssistConfig(_Section):
-    """The local vision-language model behind ``/describe``."""
+    """The local vision-language model behind ``/describe``, ``/shorten`` and the prompt enhancer."""
 
     #: Folder or cached Hugging Face repo id of an MLX vision model. Default: auto-detect.
     vision_model: str | None = None
@@ -148,6 +148,9 @@ class Defaults(_Section):
     variation: Literal["strong", "subtle"] = "strong"
     remix: bool = False
     hd: bool = False
+    #: Let a local language model add art direction to prompts. Unset: on when the Mac has the
+    #: memory to keep that model loaded next to the image model (24 GB or more).
+    enhance: bool | None = None
 
 
 class AccessConfig(_Section):

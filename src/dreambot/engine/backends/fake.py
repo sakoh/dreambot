@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from pathlib import Path
 
@@ -150,6 +151,16 @@ class FakeBackend:
         return [f"a placeholder description #{i + 1} of a {width}x{height} image" for i in range(req.count)]
 
     def text(self, req: TextRequest, ctx: JobContext) -> list[str]:
+        asked = re.search(r"Write exactly (\d+|one) lines?", req.prompt)
+        if req.system and asked:
+            # A request for numbered lines (the prompt enhancer): answer in kind.
+            count = 1 if asked.group(1) == "one" else int(asked.group(1))
+            return [
+                "\n".join(
+                    f"{n}. placeholder shot {n} from a low angle, soft window light, muted earth tones"
+                    for n in range(1, count + 1)
+                )
+            ]
         return [f"[fake llm] {req.prompt[: req.max_tokens]}"]
 
     # ------------------------------------------------------------------- memory ----

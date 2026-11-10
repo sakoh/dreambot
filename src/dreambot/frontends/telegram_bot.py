@@ -82,7 +82,9 @@ class TelegramFrontend(ChatFrontend):
     has_buttons = True
     can_edit = True
     grid_as_one_image = True
+    # Telegram's own limits are 1024 characters for a caption and 4096 for a message.
     max_caption = 1000
+    max_text = 4000
 
     def __init__(
         self, service: Dreambot, token: str, *, request: BaseRequest | None = None, polling: bool = True
@@ -196,20 +198,21 @@ class TelegramFrontend(ChatFrontend):
             common["reply_to_message_id"] = int(reply_to)
         if not images:
             markup = ForceReply(selective=True) if ask_reply else self._keyboard(buttons)
-            message = await bot.send_message(text=text or "…", reply_markup=markup, **common)
+            # The base class already splits long replies; the slices here are a last line of
+            # defence, because Telegram rejects an over-long message outright.
+            message = await bot.send_message(text=(text or "…")[:4096], reply_markup=markup, **common)
             return [str(message.message_id)]
+        caption = text[:1024] or None
         if len(images) == 1:
             markup = self._keyboard(buttons)
             with self._photo(images[0]).open("rb") as handle:
-                message = await bot.send_photo(
-                    photo=handle, caption=text or None, reply_markup=markup, **common
-                )
+                message = await bot.send_photo(photo=handle, caption=caption, reply_markup=markup, **common)
             return [str(message.message_id)]
         media = []
         handles = [self._photo(path).open("rb") for path in images[:10]]
         try:
             for position, handle in enumerate(handles):
-                media.append(InputMediaPhoto(handle, caption=text if position == 0 and text else None))
+                media.append(InputMediaPhoto(handle, caption=caption if position == 0 else None))
             messages = await bot.send_media_group(media=media, **common)
         finally:
             for handle in handles:
@@ -220,7 +223,7 @@ class TelegramFrontend(ChatFrontend):
         chat_id, _ = self._address(conversation)
         try:
             await self.app.bot.edit_message_text(
-                text=text, chat_id=chat_id, message_id=int(ref), reply_markup=self._keyboard(buttons)
+                text=text[:4096], chat_id=chat_id, message_id=int(ref), reply_markup=self._keyboard(buttons)
             )
         except BadRequest as exc:
             if "not modified" not in str(exc).lower():

@@ -22,7 +22,7 @@ app you choose to talk to it with.
 ## Contents
 
 - [Requirements](#requirements) · [Install](#install) · [Quick start](#quick-start)
-- [Models](#models) · [Prompts and parameters](#prompts-and-parameters) · [Working with results](#working-with-results)
+- [Models](#models) · [Prompts and parameters](#prompts-and-parameters) · [The prompt enhancer](#the-prompt-enhancer) · [Working with results](#working-with-results)
 - [Chat frontends](#chat-frontends): [Telegram](#telegram) · [Discord](#discord) · [iMessage](#imessage)
 - [Privacy](#privacy) · [How it works](#how-it-works) · [Midjourney parity](#midjourney-parity) · [Development](#development)
 
@@ -105,7 +105,8 @@ a lighthouse at dusk, oil painting --ar 3:2 --stylize 250 --no people --seed 42
 | | Parameters |
 | --- | --- |
 | **Native** — same behaviour, done by the local model | `--ar` `--seed` `--sameseed` `--repeat` `--stop` `--raw` `--no` `--edit` |
-| **Approximated** — Midjourney's version lives inside its own model | `--stylize` `--chaos` `--weird` `--exp` `--quality` `--hd` `--draft` `--iw` `--sref` `--sw` `--cref` `--cw` `--oref` `--ow` `--niji` |
+| **Art direction** — done by [the prompt enhancer](#the-prompt-enhancer) | `--stylize` `--chaos` `--weird` `--exp` |
+| **Approximated** — Midjourney's version lives inside its own model | `--quality` `--hd` `--draft` `--iw` `--sref` `--sw` `--cref` `--cw` `--oref` `--ow` `--niji` |
 | **Accepted, no effect locally** | `--v` `--sv` `--fast` `--relax` `--turbo` `--stealth` `--public` `--preview` |
 | **Planned** | `--tile` `--p` (personalization) `--video` `--motion` `--loop` `--end` `--bs` |
 | **Dreambot extensions** | `--model` `--steps` `--cfg` `--strength` `--lora` `--neg` `--n` |
@@ -124,6 +125,41 @@ dash that iPhones substitute for `--`.
 | `a castle` (image attached, no flag) | use it as an image prompt |
 
 With several attachments, `@1`, `@2` pick which is which: `... --oref @1 --sref @2`.
+
+## The prompt enhancer
+
+Midjourney's look comes from inside its model: a short prompt comes back composed, lit and
+colour-graded. Open models draw what the prompt says and leave the rest to chance, and their four
+images of one prompt tend to look alike.
+
+So for a short prompt, a small language model on your Mac acts as art director. For each image it
+writes one line — the shot, the light, the palette, the finish — and that line is added after your
+prompt:
+
+```
+you typed    a red fox in the snow
+image 1      a red fox in the snow. Low angle close-up, soft morning light filtering through trees,
+             deep red fur contrasting snow white ground, sharp focus on fox's face
+image 2      a red fox in the snow. High angle side view, distant trees silhouetted against sky,
+             warm sunlight on fox's back, soft focus background
+```
+
+Your own words are never rewritten or dropped — it only adds — so nothing you asked for is lost and
+quoted text comes through letter for letter. `info` on any image shows the line it was given.
+
+| Dial | What it tells the art director |
+| --- | --- |
+| `--stylize 0…1000` | How bold to be. 0 uses your prompt as written; 100 (the default) is balanced; 750 is theatrical. |
+| `--chaos 0…100` | How different the four images are. At 0 they share a look and differ in the shot; higher values vary light, palette and setting; from 75 each image is a different medium. |
+| `--weird 0…3000` | Adds a strange twist to the scene itself. |
+| `--exp 0…100` | More intricate detail and more dynamic composition. |
+| `--raw` | No art direction for this prompt. |
+
+It leaves alone prompts that are already detailed (45 words or more at default settings), flat
+graphics such as logos and icons, and anything with an image attached. It needs the vision model
+(`dreambot models pull describe`); it adds about a second per job, and without it the same dials fall
+back to simple rule-based phrases. It is on by default on Macs with 24 GB of memory or more — switch
+it with `/settings enhance on|off`.
 
 ## Working with results
 
@@ -154,8 +190,8 @@ Commands: `/imagine`, `/describe` (image → four prompts), `/blend` (2–5 imag
 
 ## Chat frontends
 
-`dreambot setup` walks through all three. A Dreambot is **private by default**: nobody can use it until
-its owner allows them.
+`dreambot setup` walks through all three (`dreambot setup telegram` does just one). A Dreambot is
+**private by default**: nobody can use it until its owner allows them.
 
 ```sh
 dreambot setup             # store tokens in the Keychain, enable frontends
@@ -168,8 +204,9 @@ dreambot service install   # run in the background and at login
 ### Telegram
 
 1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, copy the token.
-2. `dreambot setup` → paste the token (stored in your macOS Keychain, not in a file).
-3. `dreambot run`, then `dreambot pair` and send the code to your bot.
+2. `dreambot setup telegram` → paste the token. Dreambot asks Telegram whose token it is, shows you the
+   bot's @name, and stores the token in your macOS Keychain (not in a file).
+3. `dreambot run` prints a pairing code; send `/pair <code>` to your bot to become its owner.
 
 In a private chat every message is a prompt; in groups use `/imagine`. It connects by long polling, so
 no public address or port forwarding is needed.
@@ -193,7 +230,8 @@ Messages app. Two modes (`dreambot setup` asks which):
   number**: that thread is your conversation with Dreambot. You can also summon it inside any conversation
   by starting a message with `/imagine …`. It never answers anyone you have not allowed.
 - **dedicated** — Messages on the Mac is signed into an Apple Account that belongs to the bot, and people
-  text that account like any contact.
+  text that account like any contact. Messages has its own sign-in (*Messages → Settings → iMessage*), so
+  the rest of the Mac stays on your own account; only your personal iMessages stop arriving on this Mac.
 
 Each image is sent as its own message, so you can reply to a picture or tapback it:
 ❤️ favourite · 👍 upscale · ‼️ variations · 👎 cancel.
@@ -244,6 +282,7 @@ Configuration is optional: `~/Library/Application Support/Dreambot/config.toml`.
 [defaults]
 model = "qwen-image"        # instead of the first installed preferred model
 count = 4
+enhance = true              # the prompt enhancer for everyone (default: on with 24 GB or more)
 
 [prefer]
 edit = ["flux2-klein-9b", "flux2-klein-4b"]
@@ -262,19 +301,20 @@ idle_unload_seconds = 900
 - **Works:** `/imagine` grids, U/V/reroll, variations (subtle/strong, remix), upscales, zoom out, pan, make
   square, vary region, instruction edits, image/style/character references, `/blend`, `/describe`,
   `/shorten`, `/settings`, `/prefer`, permutations, repeat, seeds (exactly reproducible), job history.
-- **Approximated:** the aesthetic dials (`--stylize`, `--chaos`, `--weird`, `--exp`) and style codes, which
-  steer Midjourney's proprietary model and have no equivalent inside open models.
-- **Not yet:** video (Animate), personalization profiles and moodboards, `--tile`, a web gallery, and an
-  optional LLM prompt enhancer.
+- **Approximated:** the aesthetic dials (`--stylize`, `--chaos`, `--weird`, `--exp`), which steer
+  Midjourney's proprietary model; here a local language model art-directs the prompt instead. Style codes
+  work, but they are Dreambot's own, not Midjourney's.
+- **Not yet:** video (Animate), personalization profiles and moodboards, `--tile`, a web gallery.
 
 ## What is verified
 
 | | How it was checked |
 | --- | --- |
 | Engine, queue, cancellation, crash recovery, offline loading | automated tests, including real MLX runs |
-| Z-Image Turbo, FLUX.2 klein 4B, Qwen-Image 2512, Qwen-Image 2.1, Ming-Image | real weights, in `tests/test_mlx_engine.py` |
-| Variations, tiled upscale, edits, references, zoom/pan/square, region edits, describe | real weights, results inspected by eye |
-| The other 47 models | class paths, arguments and defaults checked against mflux; **not run** (weights not installed during development) |
+| Z-Image Turbo, FLUX.2 klein 4B, Qwen-Image 2512, Qwen-Image 2.1, Ming-Image, SeedVR2 3B | real weights, in `tests/test_mlx_engine.py` |
+| Variations, upscales (SeedVR2 and tiled), `--hd`, edits, references, zoom/pan/square, region edits, describe | real weights, results inspected by eye |
+| The prompt enhancer | real language model (Qwen2.5-VL 7B) and real images, compared with and without |
+| The other 46 models | class paths, arguments and defaults checked against mflux; **not run** (weights not installed during development) |
 | Discord, Telegram | real library objects against a simulated API; **not run against the live service** |
 | iMessage | a synthetic Messages database; the AppleScript compiles; **not run against Messages** |
 
@@ -284,7 +324,7 @@ idle_unload_seconds = 900
 
 ```sh
 uv sync
-uv run pytest                 # ~500 tests, no model weights needed (about a minute)
+uv run pytest                 # ~540 tests, no model weights needed (about a minute)
 uv run pytest -m mlx -s       # real inference with whatever models are installed
 uv run ruff check . && uv run ruff format .
 DREAMBOT_BACKEND=fake uv run dreambot chat    # try everything without any weights

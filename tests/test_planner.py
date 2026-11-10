@@ -39,7 +39,8 @@ def planner(tmp_path: Path, *installed: str, **config) -> Planner:
     return Planner(Shelf(cfg, *installed), cfg, rng=random.Random(1))
 
 
-SETTINGS = UserSettings().resolved(Config().defaults)
+# The enhancer's default depends on the Mac's memory; planning tests pin it off.
+SETTINGS = UserSettings(enhance=False).resolved(Config().defaults)
 
 
 def imagine(p: Planner, prompt: str, refs: ResolvedRefs | None = None):

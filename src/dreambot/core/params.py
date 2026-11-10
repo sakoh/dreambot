@@ -229,7 +229,10 @@ PARAMS: tuple[ParamSpec, ...] = (
         maximum=1000,
         support=_E,
         summary="How much artistic interpretation to add (0-1000, default 100).",
-        how="Controls how far the local prompt enhancer may elaborate on your prompt; 0 uses it verbatim.",
+        how=(
+            "Sets how boldly the local language model art-directs your prompt (0 uses it as written). "
+            "Without a language model, 250 and up add artistic emphasis by rule."
+        ),
     ),
     ParamSpec(
         "chaos",
@@ -239,7 +242,10 @@ PARAMS: tuple[ParamSpec, ...] = (
         maximum=100,
         support=_E,
         summary="How different the images in a grid are from each other (0-100).",
-        how="Varies composition, framing and lighting cues per image instead of only the seed.",
+        how=(
+            "Each image gets its own direction: different shots at 0, then different light, palette and "
+            "setting, and from 75 a different medium. Written by the local language model, or picked by rule."
+        ),
     ),
     ParamSpec(
         "weird",
@@ -249,7 +255,7 @@ PARAMS: tuple[ParamSpec, ...] = (
         maximum=3000,
         support=_E,
         summary="Push results toward the unconventional (0-3000).",
-        how="Adds offbeat aesthetic direction to the prompt, scaled by the value.",
+        how="Adds a strange twist to each image, scaled by the value (by the language model, or by rule).",
     ),
     ParamSpec(
         "exp",
@@ -258,9 +264,9 @@ PARAMS: tuple[ParamSpec, ...] = (
         maximum=100,
         support=_E,
         summary="Experimental aesthetics: more detail and dynamism (0-100).",
-        how="Adds detail and dynamic-composition direction to the prompt, scaled by the value.",
+        how="Asks for more intricate detail and more dynamic composition, scaled by the value.",
     ),
-    ParamSpec("raw", Kind.FLAG, summary="Use your prompt as written: no enhancement, no house style."),
+    ParamSpec("raw", Kind.FLAG, summary="Use your prompt as written: no art direction is added."),
     ParamSpec(
         "style",
         Kind.CHOICE,

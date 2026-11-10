@@ -290,6 +290,43 @@ def test_third_party_exports_extra_repos_and_helpers(tmp_path: Path):
     assert weights.resolve(fibo, cache=cache) is not None
 
 
+def test_models_sharing_a_repo_are_told_apart_by_their_files(tmp_path: Path):
+    """SeedVR2 3B and 7B live in one repo; having one must not make the other look installed."""
+    cache = tmp_path / "hub"
+    cache.mkdir()
+    small, large = REGISTRY.get("seedvr2-3b"), REGISTRY.get("seedvr2-7b")
+    snapshot = make_repo(
+        cache,
+        "numz/SeedVR2_comfyUI",
+        {"seedvr2_ema_3b_fp16.safetensors": b"x" * 30, "ema_vae_fp16.safetensors": b"x" * 5},
+    )
+    found = weights.resolve(small, cache=cache)
+    assert found is not None and found.upstream and found.size_bytes == 35
+    assert weights.resolve(large, cache=cache) is None, "only the 3B file is there"
+    (snapshot / "seedvr2_ema_7b_fp16.safetensors").write_bytes(b"x" * 70)
+    assert weights.resolve(large, cache=cache).size_bytes == 75, "its own files, not the whole repo"
+    assert weights.resolve(small, cache=cache).size_bytes == 35
+
+    turbo, base = REGISTRY.get("anima-turbo"), REGISTRY.get("anima-base")
+    make_repo(
+        cache,
+        "circlestone-labs/Anima",
+        {
+            "split_files/diffusion_models/anima-turbo-v1.1.safetensors": b"x",
+            "split_files/text_encoders/qwen_3_06b_base.safetensors": b"x",
+            "split_files/vae/qwen_image_vae.safetensors": b"x",
+        },
+    )
+    assert weights.resolve(turbo, cache=cache) is not None and weights.resolve(base, cache=cache) is None
+
+
+def test_memory_is_reported_in_the_units_macs_are_sold_in(monkeypatch):
+    sizes = {"SC_PHYS_PAGES": 96 * 1024**3 // 16384, "SC_PAGE_SIZE": 16384}
+    monkeypatch.setattr(weights.os, "sysconf", lambda name: sizes[name])
+    assert weights.physical_memory_gb() == 96
+    assert weights.quant_preference()[0] == "q8"
+
+
 def test_recommended_download_and_vision_model_lookup(tmp_path: Path):
     assert weights.recommended_repo(REGISTRY.get("flux2-klein-4b"), ("q8",)) == (
         "mflux-community/flux2-klein-4b-mflux-q8",

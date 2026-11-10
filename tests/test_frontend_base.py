@@ -11,10 +11,12 @@ from pathlib import Path
 
 import pytest
 
+from dreambot.core import render
 from dreambot.core.actions import Action, ActionKind, encode_action
 from dreambot.core.jobs import EventType, JobEvent, JobKind, JobStatus
 from dreambot.core.service import Dreambot
 from dreambot.core.settings import UserSettings
+from dreambot.core.text import split_caption, split_text
 from dreambot.engine.client import Engine
 from dreambot.frontends.base import Buttons, ChatFrontend, Incoming
 from tests.test_service import make_config
@@ -336,8 +338,61 @@ async def test_strangers_cannot_press_buttons_and_only_own_conversations_are_ser
     assert other.messages == []
 
 
-async def test_long_captions_are_trimmed_for_the_platform(service: Dreambot):
+async def test_a_caption_that_does_not_fit_continues_in_a_message(service: Dreambot):
     front = MemoryFrontend(service, max_caption=120)
     await front.start()
-    await front.say("a fox " + "very " * 80 + "detailed --n 1")
-    assert len(front.visible[-1].text) <= 120 and front.visible[-1].text.endswith("…")
+    await front.say("a fox in the snow --n 1 --tile")
+    picture, rest = front.visible[-2:]
+    assert picture.images and len(picture.text) <= 120 and picture.labels(), "the buttons stay on the picture"
+    assert picture.text.startswith("a fox in the snow") and "#" in picture.text
+    assert rest.images == [] and "isn't available yet" in rest.text, "the note follows in full"
+
+    # A title too long for any caption is shortened, and the facts and notes still arrive.
+    await front.say("a fox " + "very " * 80 + "detailed --n 1 --tile")
+    picture, rest = front.visible[-2:]
+    assert picture.images and picture.text.endswith("…") and len(picture.text) <= 120
+    assert "#" in rest.text and "isn't available yet" in rest.text
+
+
+async def test_long_text_replies_are_sent_in_parts(service: Dreambot):
+    front = MemoryFrontend(service, max_text=1900)
+    await front.start()
+    await front.say("/params")
+    parts = [message.text for message in front.visible]
+    assert len(parts) >= 3 and all(0 < len(part) <= 1900 for part in parts)
+    assert "--aspect" in parts[0] and "--model" in "".join(parts)
+    assert "\n".join(parts).count("--") == render.params_text().count("--"), (
+        "nothing was dropped between parts"
+    )
+    # A short reply is still one message.
+    before = len(front.visible)
+    await front.say("/help")
+    assert len(front.visible) == before + 1
+
+
+def test_split_text_prefers_paragraphs_then_lines_then_words():
+    paragraphs = "\n\n".join(f"paragraph {n} " + "word " * 30 for n in range(6))
+    parts = split_text(paragraphs, 400)
+    assert all(len(part) <= 400 for part in parts) and all(part.startswith("paragraph") for part in parts)
+    assert " ".join(" ".join(parts).split()) == " ".join(paragraphs.split())
+
+    lines = "\n".join(f"line {n}: " + "x" * 40 for n in range(20))
+    assert all(part.startswith("line") and len(part) <= 200 for part in split_text(lines, 200))
+    words = "word " * 200
+    assert all(len(part) <= 90 and not part.startswith(" ") for part in split_text(words, 90))
+    unbroken = "x" * 1000
+    assert split_text(unbroken, 300) == ["x" * 300, "x" * 300, "x" * 300, "x" * 100]
+    assert split_text("short", 300) == ["short"] and split_text("", 300) == []
+
+
+def test_split_caption_keeps_whole_lines():
+    caption = "the title line\nmodel · 1024×1024 · 9s · #ABC123\nⓘ a note about this job\nⓘ another note"
+    assert split_caption(caption, 500) == (caption, "")
+    head, rest = split_caption(caption, 50)
+    assert head == "the title line\nmodel · 1024×1024 · 9s · #ABC123"
+    assert rest == "ⓘ a note about this job\nⓘ another note"
+    assert split_caption("one long line without any break at all", 12) == ("one long li…", "")
+    assert split_caption("a title that is far too long\nfacts\nⓘ note", 12) == (
+        "a title tha…",
+        "facts\nⓘ note",
+    )

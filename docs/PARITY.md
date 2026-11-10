@@ -22,7 +22,7 @@ to `dreambot models pull` when something is missing.
 | `/blend` (2–5 images, dimensions) | 🟡 | Through FLUX.1 Redux when installed, otherwise an edit model asked to blend its references. |
 | `/describe` | ✅ | Four prompts from a local vision model, with 1–4 buttons to imagine them. |
 | `/shorten` | 🟡 | Five shorter versions from the local language model (or mechanical trimming without one). No per-token importance display. |
-| `/settings` | ✅ | Model, stylize presets, RAW, remix, variation mode, HD, images per job. A button panel on Discord. |
+| `/settings` | ✅ | Model, stylize presets, RAW, remix, variation mode, HD, prompt enhancer, images per job. A button panel on Discord. |
 | `/prefer suffix`, `/prefer option set`, `/prefer option list`, `/prefer remix`, `/prefer variability` | ✅ | |
 | `/show <job id>` | ✅ | Job ids are short (`7QK2MD`). Without an id it lists recent jobs. |
 | `/info` | ✅ | Queue, job counts, installed models. |
@@ -41,10 +41,10 @@ platforms, which is how iMessage works.
 | --- | --- | --- | --- |
 | U1–U4 | ✅ | `U2` | Returns the full-size image with the single-image buttons. |
 | V1–V4 | ✅ | `V2` | Follows the variation mode setting; opens a prompt box when remix is on. |
-| Reroll 🔄 | ✅ | `R` | |
+| Reroll 🔄 | ✅ | `R` | Rerolling one result of a `--repeat` runs it once, as in Midjourney. |
 | Vary (Subtle) / (Strong) | ✅ | `vary subtle`, `vary strong` | Controlled by noise level, so it behaves the same across models and sizes. |
 | Vary (Region) | 🟡 | `region B2-D4: …`, `region the sky: …` | No drawing canvas: choose cells on a labelled grid, or describe the part. Mask inpainting when such a model is installed, otherwise an edit model plus restoring everything outside the region. |
-| Upscale (Subtle) | ✅ | `upscale` | SeedVR2. Without it, falls back to a low-noise re-render and says so. |
+| Upscale (Subtle) | ✅ | `upscale` | SeedVR2: 2× in about 30 s, faithful to the pixel. Without it, falls back to a low-noise re-render and says so. |
 | Upscale (Creative) | 🟡 | `upscale creative` | Re-renders the enlarged image tile by tile with the model that made it. |
 | Zoom Out 2x / 1.5x / Custom | ✅ | `zoom 2x`, `zoom 1.3x` | The original pixels are kept exactly; colour is matched across the seam. |
 | Make Square | ✅ | `square` | |
@@ -69,12 +69,12 @@ Tapbacks and reactions on an image: ❤️ favourite, 👍 upscale, ‼️ / �
 | `--no` | ✅ / 🟡 | A real negative prompt on models with classifier-free guidance; otherwise folded into the prompt, best-effort. |
 | `--stop` | ✅ | Decodes the partially denoised image at that point. |
 | `--repeat`, `--r` | ✅ | Up to 40. |
-| `--raw`, `--style raw` | ✅ | Disables Dreambot's own prompt direction. |
+| `--raw`, `--style raw` | ✅ | The prompt is used exactly as written: no art direction is added. |
 | `--edit` (V8 Edit Model) | ✅ | A local instruction-edit model: FLUX.2 klein, Qwen-Image-Edit, Qwen-Image 2.1, FLUX 3 klein, Kontext. |
-| `--stylize`, `--s` | 🟡 | Adds artistic emphasis to the prompt from 250 up. Below that the prompt is used as written. |
-| `--chaos`, `--c` | 🟡 | Gives each image of the grid different framing, light, palette and (at the top) medium. |
-| `--weird`, `--w` | 🟡 | Adds offbeat aesthetic direction, scaled by the value. |
-| `--exp` | 🟡 | Adds detail and dynamism direction, scaled by the value. |
+| `--stylize`, `--s` | 🟡 | How boldly a local language model art-directs the prompt: 0 leaves it as written, 100 is balanced, 750 theatrical. (Without a language model: rule-based emphasis from 250 up.) |
+| `--chaos`, `--c` | 🟡 | How different the images of a grid are: the language model writes each its own shot, then light, palette and setting, and from 75 a different medium. (Without one: picked by rule from fixed lists.) |
+| `--weird`, `--w` | 🟡 | The language model adds a strange twist to the scene, scaled by the value. |
+| `--exp` | 🟡 | Asks for more intricate detail and more dynamic composition, scaled by the value. |
 | `--quality`, `--q` | 🟡 | Scales denoising steps; on step-distilled models, trades resolution instead. (Midjourney dropped `--q` in V8.) |
 | `--hd` / `--sd` | 🟡 | Generates at standard size, then upscales every image 2× with SeedVR2. |
 | `--draft` | 🟡 | Half resolution with the fastest installed model, still a grid of four. |

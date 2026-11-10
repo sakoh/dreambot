@@ -70,6 +70,10 @@ class ModelSpec:
     slug: str | None = None
     #: Additional upstream repos the model needs (ControlNets, adapters).
     extra_repos: tuple[str, ...] = ()
+    #: The files this model reads from the upstream repo, when that repo holds several models
+    #: (SeedVR2 3B and 7B, the Anima variants). The original weights then count as installed
+    #: only if these are present. Empty: the whole repo is the model.
+    files: tuple[str, ...] = ()
     #: Separate models the model cannot run without, whatever export of it is installed
     #: (FIBO's prompt-writing VLM).
     helper_repos: tuple[str, ...] = ()
@@ -1084,6 +1088,11 @@ def _specs() -> list[ModelSpec]:
             summary="Anime and illustration model; 10 steps. Powers --niji.",
             mflux_key="anima-turbo",
             repo="circlestone-labs/Anima",
+            files=(
+                "split_files/diffusion_models/anima-turbo-v1.1.safetensors",
+                "split_files/text_encoders/qwen_3_06b_base.safetensors",
+                "split_files/vae/qwen_image_vae.safetensors",
+            ),
             slug="anima-turbo",
             variants={Op.TXT2IMG: _v(_ANIMA, _L_ANIMA)},
             steps=10,
@@ -1100,6 +1109,11 @@ def _specs() -> list[ModelSpec]:
             summary="Anima's aesthetic-tuned anime checkpoint (30 steps, CFG).",
             mflux_key="anima-aesthetic",
             repo="circlestone-labs/Anima",
+            files=(
+                "split_files/diffusion_models/anima-aesthetic-v1.1.safetensors",
+                "split_files/text_encoders/qwen_3_06b_base.safetensors",
+                "split_files/vae/qwen_image_vae.safetensors",
+            ),
             slug="anima-aesthetic",
             variants={Op.TXT2IMG: _v(_ANIMA, _L_ANIMA)},
             steps=30,
@@ -1115,6 +1129,11 @@ def _specs() -> list[ModelSpec]:
             summary="The Anima base anime checkpoint (30 steps, CFG).",
             mflux_key="anima-base",
             repo="circlestone-labs/Anima",
+            files=(
+                "split_files/diffusion_models/anima-base-v1.0.safetensors",
+                "split_files/text_encoders/qwen_3_06b_base.safetensors",
+                "split_files/vae/qwen_image_vae.safetensors",
+            ),
             slug="anima-base",
             variants={Op.TXT2IMG: _v(_ANIMA, _L_ANIMA)},
             steps=30,
@@ -1131,12 +1150,17 @@ def _specs() -> list[ModelSpec]:
             summary="One-step, highly faithful diffusion upscaler. Powers Upscale (Subtle).",
             mflux_key="seedvr2-3b",
             repo="numz/SeedVR2_comfyUI",
+            files=(
+                "seedvr2_ema_3b_fp16.safetensors",
+                "ema_vae_fp16.safetensors",
+            ),
             variants={Op.UPSCALE: _v(_SEEDVR2, args={"image": "image_path"}, adapter="seedvr2")},
             steps=1,
             distilled=True,
             license=_LIC_APACHE,
             tags=("upscale",),
             aliases=("seedvr2",),
+            verified=True,
         ),
         ModelSpec(
             id="seedvr2-7b",
@@ -1145,6 +1169,10 @@ def _specs() -> list[ModelSpec]:
             summary="The larger SeedVR2 upscaler.",
             mflux_key="seedvr2-7b",
             repo="numz/SeedVR2_comfyUI",
+            files=(
+                "seedvr2_ema_7b_fp16.safetensors",
+                "ema_vae_fp16.safetensors",
+            ),
             variants={Op.UPSCALE: _v(_SEEDVR2, args={"image": "image_path"}, adapter="seedvr2")},
             steps=1,
             distilled=True,
