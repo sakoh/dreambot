@@ -33,6 +33,10 @@ class FakeBotAPI(BaseRequest):
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self._ids = itertools.count(500)
         self.files = files or {}
+        #: Errors to raise, in order, the next times an endpoint is called.
+        self.failures: dict[str, list[Exception]] = {}
+        #: How many files each call carried.
+        self.uploads: list[tuple[str, list[int]]] = []
 
     @property
     def read_timeout(self) -> float | None:
@@ -50,6 +54,11 @@ class FakeBotAPI(BaseRequest):
             return 200, self.files[url.rsplit("/", 1)[-1]].read_bytes()
         params = dict(request_data.parameters) if request_data else {}
         self.calls.append((endpoint, params))
+        if request_data is not None and request_data.multipart_data:
+            sizes = [len(part[1]) for part in request_data.multipart_data.values()]
+            self.uploads.append((endpoint, sizes))
+        if self.failures.get(endpoint):
+            raise self.failures[endpoint].pop(0)
         return 200, json.dumps({"ok": True, "result": self._result(endpoint, params)}).encode()
 
     def _message(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -288,3 +297,90 @@ async def test_button_that_needs_words_uses_force_reply(chat: Chat):
     assert markup.get("force_reply") is True
     await chat.message("make it night")
     assert chat.service.store.recent_jobs(limit=1)[0].kind is JobKind.EDIT
+
+
+# --------------------------------------------------------------------------------------
+# An unreliable network
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_waiting(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record the frontend's back-off sleeps instead of sitting through them."""
+    import dreambot.frontends.telegram_bot as module
+
+    waits: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def sleep(seconds: float, *args) -> None:
+        if seconds >= 1:
+            waits.append(seconds)
+            return
+        await real_sleep(seconds, *args)
+
+    monkeypatch.setattr(module.asyncio, "sleep", sleep)
+    return waits
+
+
+# The library warns that RetryAfter.retry_after will become a timedelta; the frontend handles both.
+@pytest.mark.filterwarnings("ignore::telegram.warnings.PTBDeprecationWarning")
+async def test_flood_control_is_waited_out_and_the_result_still_arrives(chat: Chat, no_waiting: list[float]):
+    from telegram.error import RetryAfter
+
+    chat.api.failures["sendPhoto"] = [RetryAfter(7)]
+    await chat.message("a fox --n 1")
+    photos = chat.api.of("sendPhoto")
+    assert len(photos) == 2 and "a fox" in photos[-1]["caption"], "sent again after the wait"
+    assert no_waiting == [7.5]
+    uploads = [sizes for endpoint, sizes in chat.api.uploads if endpoint == "sendPhoto"]
+    assert len(uploads) == 2 and uploads[0] == uploads[1] and uploads[0][0] > 1000, (
+        "the picture is read afresh"
+    )
+    job = chat.service.store.recent_jobs(limit=1)[0]
+    assert chat.api.labels(photos[-1]), "and its buttons are recorded"
+    assert job.status is JobStatus.DONE
+
+
+async def test_a_dropped_connection_gets_one_more_try_but_a_timeout_does_not(
+    chat: Chat, no_waiting: list[float]
+):
+    from telegram.error import NetworkError, TimedOut
+
+    chat.api.failures["sendPhoto"] = [NetworkError("connection reset")]
+    await chat.message("a fox --n 1")
+    assert len(chat.api.of("sendPhoto")) == 2 and no_waiting == [2]
+
+    # A timeout may mean Telegram has the picture already: sending again would post it twice.
+    before = len(chat.api.of("sendPhoto"))
+    chat.api.failures["sendPhoto"] = [TimedOut()]
+    await chat.message("a wolf --n 1")
+    assert len(chat.api.of("sendPhoto")) == before + 1
+
+    # Twice in a row is given up on, without taking the bot down.
+    chat.api.failures["sendPhoto"] = [NetworkError("down"), NetworkError("still down")]
+    await chat.message("a bear --n 1")
+    await chat.message("a lynx --n 1")
+    assert "a lynx" in chat.api.of("sendPhoto")[-1]["caption"], "the next job is delivered normally"
+
+
+# The library warns that RetryAfter.retry_after will become a timedelta; the frontend handles both.
+@pytest.mark.filterwarnings("ignore::telegram.warnings.PTBDeprecationWarning")
+async def test_status_updates_that_fail_are_dropped_quietly(chat: Chat, caplog: pytest.LogCaptureFixture):
+    from telegram.error import BadRequest, RetryAfter
+
+    chat.api.failures["editMessageText"] = [RetryAfter(30)] * 20
+    chat.api.failures["deleteMessage"] = [BadRequest("Message to delete not found")]
+    with caplog.at_level("WARNING"):
+        await chat.message("a fox --n 1")
+    assert "a fox" in chat.api.of("sendPhoto")[-1]["caption"]
+    assert not [record for record in caplog.records if record.levelname in ("ERROR", "CRITICAL")]
+
+
+async def test_the_original_file_button_is_acknowledged_before_the_upload(chat: Chat):
+    await chat.message("a fox --n 1")
+    photo = chat.api.of("sendPhoto")[-1]
+    start = len(chat.api.calls)
+    await chat.press(photo, "⬇️ Original")
+    after = [name for name, _ in chat.api.calls[start:]]
+    assert after.index("answerCallbackQuery") < after.index("sendDocument")
+    assert after.count("answerCallbackQuery") == 1

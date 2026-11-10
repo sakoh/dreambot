@@ -14,9 +14,11 @@ import asyncio
 import contextlib
 import logging
 import uuid
-from collections.abc import Sequence
+import warnings
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypeVar
 
 from PIL import Image
 from telegram import (
@@ -30,7 +32,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatType
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -48,6 +50,7 @@ from dreambot.core.service import Dreambot, DreambotError
 from dreambot.frontends.base import Buttons, ChatFrontend, Incoming
 
 log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 #: Telegram shows a photo at up to 1280px and rejects photos over 10 MB or 10,000px combined.
 PHOTO_MAX_BYTES = 9 * 1024 * 1024
@@ -94,6 +97,17 @@ class TelegramFrontend(ChatFrontend):
         if request is not None:
             # Tests inject an offline transport here.
             builder = builder.request(request).get_updates_request(request)
+        else:
+            # The library allows 5 seconds for an answer and 20 for an upload. A grid of several
+            # megabytes over a home connection needs longer, and a timeout after Telegram has
+            # in fact accepted the picture would leave it on screen with buttons nobody recorded.
+            builder = (
+                builder.connect_timeout(15)
+                .read_timeout(40)
+                .write_timeout(40)
+                .pool_timeout(15)
+                .media_write_timeout(180)
+            )
         self.app: Application = builder.build()
         self._polling = polling
         self._albums: dict[str, _Album] = {}
@@ -129,6 +143,36 @@ class TelegramFrontend(ChatFrontend):
     @staticmethod
     async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.error("telegram: handler error", exc_info=context.error)
+
+    async def _call(self, request: Callable[[], Awaitable[T]]) -> T:
+        """Make one Bot API call that must get through (a result, an answer).
+
+        Telegram's flood control is waited out, and a connection that drops before the request
+        is sent gets one more try. A timeout is not retried: the message may have arrived, and
+        sending it again would post it twice.
+        """
+        for attempt in (1, 2):
+            try:
+                return await request()
+            except RetryAfter as exc:
+                if attempt == 2:
+                    raise
+                with warnings.catch_warnings():
+                    # The library is changing this from seconds to a timedelta and warns on
+                    # every read until it has; both are handled here.
+                    warnings.simplefilter("ignore")
+                    wait = exc.retry_after
+                seconds = wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait)
+                log.warning("telegram: asked to slow down; waiting %.0fs", seconds)
+                await asyncio.sleep(min(seconds + 0.5, 60))
+            except (BadRequest, TimedOut):
+                raise
+            except NetworkError as exc:
+                if attempt == 2:
+                    raise
+                log.warning("telegram: connection problem (%s); trying once more", type(exc).__name__)
+                await asyncio.sleep(2)
+        raise AssertionError("unreachable")
 
     # ------------------------------------------------------------- addresses ----
 
@@ -200,23 +244,28 @@ class TelegramFrontend(ChatFrontend):
             markup = ForceReply(selective=True) if ask_reply else self._keyboard(buttons)
             # The base class already splits long replies; the slices here are a last line of
             # defence, because Telegram rejects an over-long message outright.
-            message = await bot.send_message(text=(text or "…")[:4096], reply_markup=markup, **common)
+            message = await self._call(
+                lambda: bot.send_message(text=(text or "…")[:4096], reply_markup=markup, **common)
+            )
             return [str(message.message_id)]
         caption = text[:1024] or None
-        if len(images) == 1:
+        # Files are passed as paths, not open handles: each attempt then reads the file afresh.
+        photos = [self._photo(path) for path in images[:10]]
+        if len(photos) == 1:
             markup = self._keyboard(buttons)
-            with self._photo(images[0]).open("rb") as handle:
-                message = await bot.send_photo(photo=handle, caption=caption, reply_markup=markup, **common)
+            message = await self._call(
+                lambda: bot.send_photo(photo=photos[0], caption=caption, reply_markup=markup, **common)
+            )
             return [str(message.message_id)]
-        media = []
-        handles = [self._photo(path).open("rb") for path in images[:10]]
-        try:
-            for position, handle in enumerate(handles):
-                media.append(InputMediaPhoto(handle, caption=caption if position == 0 else None))
-            messages = await bot.send_media_group(media=media, **common)
-        finally:
-            for handle in handles:
-                handle.close()
+        messages = await self._call(
+            lambda: bot.send_media_group(
+                media=[
+                    InputMediaPhoto(photo, caption=caption if position == 0 else None)
+                    for position, photo in enumerate(photos)
+                ],
+                **common,
+            )
+        )
         return [str(message.message_id) for message in messages]
 
     async def edit(self, conversation: str, ref: str, text: str, buttons: Buttons | None = None) -> None:
@@ -228,10 +277,16 @@ class TelegramFrontend(ChatFrontend):
         except BadRequest as exc:
             if "not modified" not in str(exc).lower():
                 raise
+        except (RetryAfter, NetworkError) as exc:
+            # A progress update that does not get through is not worth a retry or a traceback.
+            log.debug("telegram: skipped a status edit (%s)", type(exc).__name__)
 
     async def delete(self, conversation: str, ref: str) -> None:
         chat_id, _ = self._address(conversation)
-        await self.app.bot.delete_message(chat_id=chat_id, message_id=int(ref))
+        try:
+            await self.app.bot.delete_message(chat_id=chat_id, message_id=int(ref))
+        except TelegramError as exc:
+            log.debug("telegram: could not delete a status message (%s)", type(exc).__name__)
 
     # -------------------------------------------------------------- incoming ----
 
@@ -313,9 +368,14 @@ class TelegramFrontend(ChatFrontend):
             return
         conversation = self._conversation(query.message)  # type: ignore[arg-type]
         if query.data.startswith(f"{FILE_PREFIX}:"):
+            # Uploading the PNGs can take longer than Telegram waits for a button to be answered.
+            with contextlib.suppress(TelegramError):
+                await query.answer()
             notice = await self._send_originals(str(query.from_user.id), conversation, query.data)
-        else:
-            notice = await self.handle_button(str(query.from_user.id), conversation, query.data)
+            if notice:
+                await self.send(conversation, notice)
+            return
+        notice = await self.handle_button(str(query.from_user.id), conversation, query.data)
         with contextlib.suppress(TelegramError):
             if notice:
                 await query.answer(text=notice[:190], show_alert=notice.startswith("⚠️") or len(notice) > 60)
@@ -336,21 +396,22 @@ class TelegramFrontend(ChatFrontend):
         if not paths:
             return "⚠️ Those files are no longer on disk."
         chat_id, thread = self._address(conversation)
-        handles = [path.open("rb") for path in paths[:10]]
-        try:
-            if len(handles) == 1:
-                await self.app.bot.send_document(
-                    chat_id=chat_id, document=handles[0], filename=paths[0].name, message_thread_id=thread
+        paths = paths[:10]
+        bot = self.app.bot
+        if len(paths) == 1:
+            await self._call(
+                lambda: bot.send_document(
+                    chat_id=chat_id, document=paths[0], filename=paths[0].name, message_thread_id=thread
                 )
-            else:
-                media = [
-                    InputMediaDocument(handle, filename=path.name)
-                    for handle, path in zip(handles, paths, strict=False)
-                ]
-                await self.app.bot.send_media_group(chat_id=chat_id, media=media, message_thread_id=thread)
-        finally:
-            for handle in handles:
-                handle.close()
+            )
+        else:
+            await self._call(
+                lambda: bot.send_media_group(
+                    chat_id=chat_id,
+                    media=[InputMediaDocument(path, filename=path.name) for path in paths],
+                    message_thread_id=thread,
+                )
+            )
         return None
 
     async def _on_reaction(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
