@@ -909,12 +909,24 @@ def service_install() -> None:
     from dreambot import launchd
 
     config = _config()
+    folder = launchd.code_is_guarded()
+    if folder:
+        console.print(
+            f"Dreambot's code is in {folder if folder[0].islower() else f'your {folder} folder'}, "
+            "which macOS does not let a background service read without asking on screen."
+        )
+        console.print("Making a copy for the service to run from (this takes a moment) …")
     try:
-        path = launchd.install(config.log_dir)
+        path, runtime = launchd.install(config.log_dir, config.home)
     except RuntimeError as exc:
         err.print(f"[red]Could not start the service:[/red] {exc}")
         raise typer.Exit(1) from exc
     console.print(f"Installed and started: {path}")
+    if runtime is not None:
+        console.print(f"It runs the copy in: {runtime}")
+        console.print(
+            "[bold]After changing or updating Dreambot, run `dreambot service install` again.[/bold]"
+        )
     console.print(f"Logs: {config.log_dir / 'dreambot.log'}")
     console.print(f"For iMessage, grant Full Disk Access to: [bold]{launchd.interpreter()}[/bold]")
     console.print(
@@ -927,7 +939,7 @@ def service_uninstall() -> None:
     """Stop the background service and remove it."""
     from dreambot import launchd
 
-    console.print("Removed." if launchd.uninstall() else "The service was not installed.")
+    console.print("Removed." if launchd.uninstall(_config().home) else "The service was not installed.")
 
 
 @service_app.command("status")
