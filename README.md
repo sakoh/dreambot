@@ -202,6 +202,16 @@ dreambot access allow telegram:123456789     # let someone else in (or /allow in
 dreambot service install   # run in the background and at login
 ```
 
+The background service is a login item (a launchd agent): it starts when you log in, restarts if it
+crashes, and gives model memory back after 15 idle minutes. `dreambot service status`, `restart` and
+`uninstall` manage it, and `dreambot setup` restarts it for you when you change something.
+
+If your copy of Dreambot is inside Desktop, Documents or Downloads, the service runs from a copy that
+`service install` makes under `~/Library/Application Support/Dreambot/runtime`. macOS does not let a
+background program read those folders without a confirmation on screen, and a service waiting for a
+click nobody sees is a service that is down. **Run `dreambot service install` again after updating
+Dreambot** to refresh that copy.
+
 ### Telegram
 
 1. Message [@BotFather](https://t.me/BotFather), send `/newbot`, copy the token.
@@ -216,8 +226,10 @@ no public address or port forwarding is needed.
 
 1. Create an application at <https://discord.com/developers/applications>, open **Bot**, reset and copy the
    token. No privileged intents are required.
-2. `dreambot setup` → paste the token; it prints the link that adds the bot to a server.
-3. `dreambot run`, then `/pair <code>`.
+2. `dreambot setup discord` → paste the token. Dreambot asks Discord whose token it is, stores it in
+   your Keychain and prints the link that adds the bot to a server.
+3. Open that link and add the bot to a server you manage (a private one is fine).
+4. `dreambot run` (or the background service), then `/pair <code>` in that server.
 
 Slash commands and buttons work in servers; plain-text prompts work in direct messages and when you
 @mention the bot.
@@ -317,7 +329,7 @@ idle_unload_seconds = 900
 | The prompt enhancer | real language model (Qwen2.5-VL 7B) and real images, compared with and without |
 | The other 46 models | class paths, arguments and defaults checked against mflux; **not run** (weights not installed during development) |
 | Telegram | **live**: pairing, prompts with the enhancer, grids with buttons, variations, `/describe` with a photo. The other actions: real library objects against a simulated API |
-| Discord | real library objects against a simulated API; **not run against the live service** |
+| Discord | the real command tree, buttons and modals, with stand-ins for Discord's interactions and channels; **not run against the live service** |
 | iMessage | a synthetic Messages database; the AppleScript compiles; **not run against Messages** |
 
 `dreambot models list` marks verified models with ✓.

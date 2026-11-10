@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import uuid
 from collections.abc import Sequence
 from contextvars import ContextVar
@@ -39,6 +40,10 @@ log = logging.getLogger(__name__)
 UPLOAD_LIMIT = 9_500_000
 SETTINGS_PREFIX = "set"
 MESSAGE_LIMIT = 1900
+#: An interaction's reply can be edited through the interaction for 15 minutes. After that
+#: (a job that waited in a long queue) the message is reached as an ordinary channel message.
+INTERACTION_LIFETIME = 14 * 60
+IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".heic", ".gif"})
 
 _interaction: ContextVar[discord.Interaction | None] = ContextVar(
     "dreambot_discord_interaction", default=None
@@ -127,6 +132,16 @@ class DiscordFrontend(ChatFrontend):
         self._runner = asyncio.get_running_loop().create_task(
             self.client.connect(reconnect=True), name="dreambot-discord"
         )
+        self._runner.add_done_callback(self._connection_ended)
+
+    @staticmethod
+    def _connection_ended(task: asyncio.Task[None]) -> None:
+        """Log why the gateway connection ended; a task nobody awaits would take it to its grave."""
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            log.error("discord: the connection ended: %s: %s", type(error).__name__, error)
 
     async def stop(self) -> None:
         with contextlib.suppress(Exception):
@@ -219,6 +234,7 @@ class DiscordFrontend(ChatFrontend):
                 message = await interaction.followup.send(
                     content=content or "​", ephemeral=ephemeral, wait=True, **extras
                 )
+            interaction.extras["answered"] = True
         else:
             channel = await self._channel(conversation)
             if reply_to:
@@ -226,45 +242,59 @@ class DiscordFrontend(ChatFrontend):
                     message_id=int(reply_to), channel_id=int(conversation), fail_if_not_exists=False
                 )
             message = await channel.send(content=content, **extras)
-        self._sent[str(message.id)] = message
+        self._sent[str(message.id)] = (message, time.monotonic())
         if len(self._sent) > 500:
             for key in list(self._sent)[:250]:
                 del self._sent[key]
         return [str(message.id)]
 
     async def _message(self, conversation: str, ref: str) -> Any:
-        if ref in self._sent:
-            return self._sent[ref]
+        cached = self._sent.get(ref)
+        if cached is not None:
+            message, sent = cached
+            fresh = time.monotonic() - sent < INTERACTION_LIFETIME
+            if fresh or not isinstance(message, discord.InteractionMessage | discord.WebhookMessage):
+                return message
+            del self._sent[ref]  # the interaction it was sent through has expired
         channel = await self._channel(conversation)
         return channel.get_partial_message(int(ref))
 
     async def edit(self, conversation: str, ref: str, text: str, buttons: Buttons | None = None) -> None:
-        message = await self._message(conversation, ref)
-        await message.edit(content=text[:MESSAGE_LIMIT], view=self._view(buttons))
+        try:
+            message = await self._message(conversation, ref)
+            await message.edit(content=text[:MESSAGE_LIMIT], view=self._view(buttons))
+        except discord.HTTPException as exc:
+            # A progress update that does not get through is not worth a traceback.
+            log.debug("discord: skipped a status edit (%s)", exc)
 
     async def delete(self, conversation: str, ref: str) -> None:
-        message = await self._message(conversation, ref)
-        self._sent.pop(ref, None)
-        await message.delete()
+        try:
+            message = await self._message(conversation, ref)
+            self._sent.pop(ref, None)
+            await message.delete()
+        except discord.HTTPException as exc:
+            log.debug("discord: could not delete a status message (%s)", exc)
 
     # -------------------------------------------------------------- incoming ----
 
-    async def _save(self, attachments: Sequence[discord.Attachment | None]) -> list[str]:
-        saved: list[str] = []
+    @staticmethod
+    def _check(attachments: Sequence[discord.Attachment | None]) -> None:
+        """Refuse attachments that are not images, before anything is downloaded."""
         for attachment in attachments:
             if attachment is None:
                 continue
             kind = (attachment.content_type or "").lower()
             suffix = Path(attachment.filename).suffix.lower()
-            if not kind.startswith("image/") and suffix not in {
-                ".png",
-                ".jpg",
-                ".jpeg",
-                ".webp",
-                ".heic",
-                ".gif",
-            }:
+            if not kind.startswith("image/") and suffix not in IMAGE_SUFFIXES:
                 raise DreambotError(f"`{attachment.filename}` isn't an image.")
+
+    async def _save(self, attachments: Sequence[discord.Attachment | None]) -> list[str]:
+        self._check(attachments)
+        saved: list[str] = []
+        for attachment in attachments:
+            if attachment is None:
+                continue
+            suffix = Path(attachment.filename).suffix.lower()
             self._downloads.mkdir(parents=True, exist_ok=True)
             target = self._downloads / f"in-{uuid.uuid4().hex[:12]}{suffix or '.img'}"
             await attachment.save(target)
@@ -313,10 +343,15 @@ class DiscordFrontend(ChatFrontend):
         flag = _ephemeral.set(private)
         try:
             try:
-                saved = await self._save(attachments)
+                self._check(attachments)
             except DreambotError as exc:
-                await interaction.response.send_message(f"⚠️ {exc}", ephemeral=True)
+                await self._tell(interaction, f"⚠️ {exc}")
                 return
+            if any(attachment is not None for attachment in attachments):
+                # Discord waits 3 seconds for an answer; fetching the attachments can take longer.
+                # "Dreambot is thinking…" holds the place until the first real message.
+                await interaction.response.defer(ephemeral=private, thinking=True)
+            saved = await self._save(attachments)
             await self.handle_message(
                 Incoming(
                     user=str(interaction.user.id),
@@ -326,11 +361,20 @@ class DiscordFrontend(ChatFrontend):
                     direct=True,
                 )
             )
-            if not interaction.response.is_done():
-                await interaction.response.send_message("Done.", ephemeral=True)
+            if not interaction.extras.get("answered"):
+                await self._tell(interaction, "Done.")
         finally:
             _interaction.reset(outer)
             _ephemeral.reset(flag)
+
+    @staticmethod
+    async def _tell(interaction: discord.Interaction, text: str) -> None:
+        """A private note to the person who used a command or button, however far along the reply is."""
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+        interaction.extras["answered"] = True
 
     async def _on_component(self, interaction: discord.Interaction) -> None:
         payload = str((interaction.data or {}).get("custom_id", ""))
@@ -347,14 +391,12 @@ class DiscordFrontend(ChatFrontend):
                 return
         outer = _interaction.set(interaction)
         try:
+            # Acknowledge the press at once: uploading a picture in answer to it can take longer
+            # than the 3 seconds Discord allows, and a late answer shows as "interaction failed".
+            await interaction.response.defer()
             notice = await self.handle_button(user, conversation, payload)
-            if interaction.response.is_done():
-                if notice:
-                    await interaction.followup.send(notice, ephemeral=True)
-            elif notice:
-                await interaction.response.send_message(notice, ephemeral=True)
-            else:
-                await interaction.response.defer()
+            if notice:
+                await interaction.followup.send(notice, ephemeral=True)
         finally:
             _interaction.reset(outer)
 

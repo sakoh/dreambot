@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-from dreambot import cli, secrets
+from dreambot import cli, launchd, secrets
 
 TOKEN = "123456789:AAExampleExampleExampleExample_12345"
 runner = CliRunner()
@@ -31,6 +32,15 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(secrets, "get_token", lambda name: stored.get(name))
     monkeypatch.setattr(secrets, "token_source", lambda name: "keychain" if name in stored else None)
     monkeypatch.setattr(cli, "_stored_for_test", stored, raising=False)
+    # ...and no launchd: these tests must never see or restart a real background service.
+    launchctl: list[tuple[str, ...]] = []
+
+    def no_service(*arguments: str) -> subprocess.CompletedProcess[str]:
+        launchctl.append(arguments)
+        return subprocess.CompletedProcess(arguments, 113, "", "Could not find service")
+
+    monkeypatch.setattr(launchd, "_launchctl", no_service)
+    monkeypatch.setattr(cli, "_launchctl_for_test", launchctl, raising=False)
     return tmp_path / "home"
 
 
@@ -133,3 +143,65 @@ def test_doctor_leaves_messages_alone_until_imessage_is_enabled(home: Path, monk
     assert "iMessage: enabled (dedicated mode), Messages database is readable" in said(result) and opened == [
         True
     ]
+
+
+DISCORD_TOKEN = "MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.GabcDE.exampleExampleExampleExample_1234567"
+
+
+def discord_answers(monkeypatch: pytest.MonkeyPatch, status: int, body: dict):
+    asked: list[dict] = []
+
+    def get(url: str, **kwargs) -> httpx.Response:
+        asked.append({"url": url, **kwargs})
+        return httpx.Response(status, json=body, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", get)
+    return asked
+
+
+def test_a_discord_token_is_checked_and_the_invite_link_shown(home: Path, monkeypatch: pytest.MonkeyPatch):
+    asked = discord_answers(
+        monkeypatch, 200, {"id": "1234567890123456789", "username": "Dreambot", "bot": True}
+    )
+    result = runner.invoke(cli.app, ["setup", "discord"], input=f"{DISCORD_TOKEN}\n")
+    assert result.exit_code == 0, result.output
+    assert "That is Dreambot" in said(result) and "Discord enabled" in said(result)
+    assert asked[0]["url"] == "https://discord.com/api/v10/users/@me"
+    assert asked[0]["headers"]["Authorization"] == f"Bot {DISCORD_TOKEN}"
+    assert cli._stored_for_test == {"discord": DISCORD_TOKEN}
+    assert tomllib.loads((home / "config.toml").read_text())["discord"] == {"enabled": True}
+    assert "client_id=1234567890123456789" in said(result).replace(" ", ""), "the add-to-server link"
+    assert DISCORD_TOKEN not in result.output
+
+    rejected = discord_answers(monkeypatch, 401, {"message": "401: Unauthorized", "code": 0})
+    cli._stored_for_test.clear()
+    result = runner.invoke(cli.app, ["setup", "discord"], input=f"{DISCORD_TOKEN}\n")
+    assert "did not accept that token: 401: Unauthorized" in said(result) and cli._stored_for_test == {}
+    rejected.clear()
+    result = runner.invoke(cli.app, ["setup", "discord"], input="nonsense\n")
+    assert "three runs of letters and digits" in said(result) and rejected == []
+
+
+def test_setup_restarts_a_running_service_only_when_something_changed(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    telegram_answers(monkeypatch, 200, {"ok": True, "result": {"username": "my_dream_bot"}})
+    calls: list[tuple[str, ...]] = []
+
+    def running(*arguments: str) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(launchd, "_launchctl", running)
+    result = runner.invoke(cli.app, ["setup", "telegram"], input="\n")
+    assert "restarted" not in said(result) and not [call for call in calls if call[0] == "kickstart"]
+
+    result = runner.invoke(cli.app, ["setup", "telegram"], input=f"{TOKEN}\n")
+    assert "The background service was restarted" in said(result)
+    assert [call[:2] for call in calls if call[0] == "kickstart"] == [("kickstart", "-k")]
+
+
+def test_service_restart_needs_a_running_service(home: Path, monkeypatch: pytest.MonkeyPatch):
+    result = runner.invoke(cli.app, ["service", "restart"])
+    assert result.exit_code == 1 and "not running" in said(result)
+    assert not [call for call in cli._launchctl_for_test if call[0] == "kickstart"]

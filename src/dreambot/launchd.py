@@ -194,6 +194,11 @@ def is_loaded() -> bool:
     return _launchctl("print", f"{_domain()}/{LABEL}").returncode == 0
 
 
+def restart() -> bool:
+    """Stop and start the running service, so that it reads a changed configuration."""
+    return _launchctl("kickstart", "-k", f"{_domain()}/{LABEL}").returncode == 0
+
+
 def status() -> dict[str, str | bool | None]:
     result = _launchctl("print", f"{_domain()}/{LABEL}")
     info: dict[str, str | bool | None] = {

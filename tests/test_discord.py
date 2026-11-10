@@ -76,22 +76,31 @@ class FakeResponse:
         self.done = False
         self.modal: Any = None
         self.deferred = False
+        self.thinking = False
+        self.thinking_private = False
         self.edited: tuple[str, Any] | None = None
 
     def is_done(self) -> bool:
         return self.done
 
     async def send_message(self, content=None, files=None, view=None, ephemeral=False, **_):
+        assert not self.done, "an interaction can only be answered once"
         self.done = True
         self.interaction.original = FakeMessage(self.interaction.log, content, files, view, ephemeral)
 
     async def send_modal(self, modal):
+        assert not self.done, "a modal has to be the first answer to an interaction"
         self.done, self.modal = True, modal
 
-    async def defer(self, **_):
+    async def defer(self, *, ephemeral: bool = False, thinking: bool = False):
+        assert not self.done, "an interaction can only be answered once"
         self.done = self.deferred = True
+        #: A "thinking" defer shows a placeholder that the first follow-up replaces, and that
+        #: follow-up is private or public as the defer was, whatever it asks for itself.
+        self.thinking, self.thinking_private = thinking, ephemeral
 
     async def edit_message(self, content=None, view=None, **_):
+        assert not self.done, "an interaction can only be answered once"
         self.done, self.edited = True, (content, view)
 
 
@@ -104,6 +113,8 @@ class FakeInteraction:
         self.response = FakeResponse(self)
         self.original: FakeMessage | None = None
         self.followup = SimpleNamespace(send=self._followup)
+        self.followups: list[FakeMessage] = []
+        self.extras: dict[Any, Any] = {}
 
     def is_expired(self) -> bool:
         return False
@@ -113,7 +124,12 @@ class FakeInteraction:
         return self.original
 
     async def _followup(self, content=None, files=None, view=None, ephemeral=False, **_):
-        return FakeMessage(self.log, content, files, view, ephemeral)
+        assert self.response.done, "a follow-up needs the interaction to have been answered first"
+        if self.response.thinking and not self.followups:
+            ephemeral = self.response.thinking_private
+        message = FakeMessage(self.log, content, files, view, ephemeral)
+        self.followups.append(message)
+        return message
 
 
 class Server:
@@ -227,17 +243,19 @@ async def test_buttons_select_and_generate(server: Server):
     grid = server.visible[-1]
 
     picked = await server.press(grid, "U3")
-    single = picked.original
+    # The press is acknowledged at once (Discord allows 3 seconds); the picture follows.
+    assert picked.response.deferred and picked.original is None
+    (single,) = picked.followups
     assert single.files == [Path(job.image(3).path).name] and "Upscale (Subtle)" in single.labels()
     assert len({item.row for item in single.view.children}) <= 5
 
     varied = await server.press(grid, "V2")
-    assert varied.original is not None  # the status line answers the button press
+    assert varied.response.deferred and varied.followups, "the status line follows the press"
     latest = server.service.store.recent_jobs(limit=1)[0]
     assert latest.kind is JobKind.VARIATION and latest.parent_index == 2
 
     favorite = await server.press(single, "❤️")
-    assert favorite.original.ephemeral and favorite.original.content == "Added to favorites."
+    assert favorite.followups[-1].ephemeral and favorite.followups[-1].content == "Added to favorites."
 
 
 async def test_buttons_that_need_text_open_a_modal(server: Server):
@@ -277,7 +295,10 @@ async def test_attachments_describe_and_blend(server: Server, sample_image: Path
     other = tmp_path / "other.png"
     Image.new("RGB", (256, 256), (0, 200, 0)).save(other)
 
-    await server.slash("describe", image=FakeAttachment(sample_image))
+    asked = await server.slash("describe", image=FakeAttachment(sample_image))
+    # Fetching an attachment can outlast Discord's 3 seconds, so the command says "thinking" first.
+    assert asked.response.deferred and asked.response.thinking and not asked.response.thinking_private
+    assert asked.followups and asked.followups[0].content.startswith("⏳"), "the status line replaces it"
     described = server.visible[-1]
     assert described.labels() == ["1", "2", "3", "4"]
 
@@ -293,8 +314,10 @@ async def test_attachments_describe_and_blend(server: Server, sample_image: Path
     await server.slash("edit", instruction="make it night", image=FakeAttachment(sample_image))
     assert server.service.store.recent_jobs(limit=1)[0].status is JobStatus.DONE
 
+    # Something that is not an image is refused privately, before anything is fetched or deferred.
     refused = await server.slash("describe", image=FakeAttachment(tmp_path / "notes.txt", "text/plain"))
     assert refused.original.ephemeral and "isn't an image" in refused.original.content
+    assert not refused.response.deferred
 
 
 async def test_settings_panel(server: Server):
@@ -329,7 +352,7 @@ async def test_strangers_are_refused_privately_and_pairing_works(server: Server)
     await server.slash("imagine", prompt="a fox")
     grid = server.visible[-1]
     pressed = await server.press(grid, "V1", user=8002)
-    assert pressed.original.ephemeral and "private" in pressed.original.content
+    assert pressed.followups[-1].ephemeral and "private" in pressed.followups[-1].content
 
     code = server.service.access.new_pairing_code()
     paired = await server.slash("pair", as_user=8002, code=code)
@@ -380,3 +403,69 @@ async def test_oversized_files_are_sent_as_jpeg(server: Server, tmp_path: Path, 
     monkeypatch.setattr(module, "UPLOAD_LIMIT", 1000)
     await server.slash("imagine", prompt="a fox --n 1")
     assert server.visible[-1].files[0].endswith(".jpg")
+
+
+# --------------------------------------------------------------------------------------
+# What only the real Discord does
+# --------------------------------------------------------------------------------------
+
+
+def http_error(status: int, text: str) -> discord.HTTPException:
+    return discord.HTTPException(SimpleNamespace(status=status, reason=text), text)
+
+
+async def test_a_plain_slash_command_is_answered_directly(server: Server):
+    interaction = await server.slash("imagine", prompt="a fox --n 1")
+    assert not interaction.response.deferred, "nothing slow happens first, so the status line is the answer"
+    assert interaction.original is not None and interaction.extras.get("answered")
+
+
+async def test_status_edits_that_fail_do_not_lose_the_result(
+    server: Server, caplog: pytest.LogCaptureFixture
+):
+    async def expired(self, content=None, view=None, **_):
+        raise http_error(401, "Invalid Webhook Token")
+
+    original_edit, original_delete = FakeMessage.edit, FakeMessage.delete
+    FakeMessage.edit = FakeMessage.delete = expired  # type: ignore[method-assign]
+    try:
+        with caplog.at_level("WARNING"):
+            await server.slash("imagine", prompt="a fox --n 1")
+    finally:
+        FakeMessage.edit, FakeMessage.delete = original_edit, original_delete  # type: ignore[method-assign]
+    job = server.service.store.recent_jobs(limit=1)[0]
+    assert job.status is JobStatus.DONE and server.visible[-1].files == [Path(job.images[0].path).name]
+    assert not [record for record in caplog.records if record.levelname == "ERROR"]
+
+
+async def test_an_old_interaction_reply_is_reached_through_the_channel(server: Server):
+    import time
+
+    from dreambot.frontends.discord_bot import INTERACTION_LIFETIME
+
+    class OldReply(discord.WebhookMessage):
+        def __init__(self) -> None:  # the real one is built from a payload; only its type matters here
+            pass
+
+    in_channel = FakeMessage(server.log, "⏳ 40% — a fox")
+    ref = str(in_channel.id)
+    stale = OldReply()
+    server.front._sent[ref] = (stale, time.monotonic() - INTERACTION_LIFETIME - 1)
+    assert await server.front._message(str(CHANNEL), ref) is in_channel, "the interaction has expired"
+    fresh = OldReply()
+    server.front._sent[ref] = (fresh, time.monotonic())
+    assert await server.front._message(str(CHANNEL), ref) is fresh
+    # A message sent to the channel in the first place never expires.
+    server.front._sent[ref] = (in_channel, time.monotonic() - 10 * INTERACTION_LIFETIME)
+    assert await server.front._message(str(CHANNEL), ref) is in_channel
+
+
+async def test_a_dead_gateway_connection_is_logged(server: Server, caplog: pytest.LogCaptureFixture):
+    async def refused() -> None:
+        raise discord.PrivilegedIntentsRequired(None)
+
+    task = asyncio.get_running_loop().create_task(refused())
+    await asyncio.wait([task])
+    with caplog.at_level("ERROR"):
+        server.front._connection_ended(task)
+    assert "the connection ended: PrivilegedIntentsRequired" in caplog.text

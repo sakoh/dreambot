@@ -708,7 +708,33 @@ def _check_telegram_token(token: str) -> tuple[bool | None, str]:
     return False, str(reason or f"HTTP {response.status_code}")
 
 
-def _setup_telegram(config: Config) -> None:
+def _check_discord_token(token: str) -> tuple[bool | None, str]:
+    """Ask Discord whose token this is: ``(True, name)``, ``(False, why)`` or ``(None, why)`` if unreachable."""
+    import re
+
+    import httpx
+
+    if not re.fullmatch(r"[\w-]{18,}\.[\w-]{4,}\.[\w-]{20,}", token):
+        return False, "bot tokens are three runs of letters and digits separated by dots"
+    try:
+        response = httpx.get(
+            "https://discord.com/api/v10/users/@me",
+            headers={"Authorization": f"Bot {token}", "User-Agent": f"DiscordBot (dreambot, {__version__})"},
+            timeout=10,
+        )
+        data = response.json()
+    except httpx.HTTPError as exc:
+        return None, type(exc).__name__
+    except ValueError:
+        return None, "an unreadable answer"
+    if response.status_code == 200 and isinstance(data, dict) and data.get("username"):
+        return True, str(data["username"])
+    reason = data.get("message") if isinstance(data, dict) else None
+    return False, str(reason or f"HTTP {response.status_code}")
+
+
+def _setup_telegram(config: Config) -> bool:
+    """Returns whether anything was changed."""
     from dreambot import secrets
 
     console.print("[bold]Telegram[/bold]")
@@ -717,11 +743,11 @@ def _setup_telegram(config: Config) -> None:
         console.print("   [green]A token is already stored.[/green] Press Enter to keep it.")
     token = typer.prompt("   Telegram bot token", default="", hide_input=True, show_default=False).strip()
     if not token:
-        return
+        return False
     valid, detail = _check_telegram_token(token)
     if valid is False:
         console.print(f"   [red]Telegram did not accept that token: {detail}. Nothing was saved.[/red]")
-        return
+        return False
     secrets.set_token("telegram", token)
     _update_config(config, {"telegram": {"enabled": True}})
     if valid:
@@ -731,9 +757,10 @@ def _setup_telegram(config: Config) -> None:
         console.print(
             f"   [yellow]Saved to your Keychain, but Telegram could not be reached to check it ({detail}).[/yellow]"
         )
+    return True
 
 
-def _setup_discord(config: Config) -> None:
+def _setup_discord(config: Config) -> bool:
     from dreambot import secrets
 
     console.print("[bold]Discord[/bold]")
@@ -742,16 +769,33 @@ def _setup_discord(config: Config) -> None:
     if secrets.token_source("discord"):
         console.print("   [green]A token is already stored.[/green] Press Enter to keep it.")
     token = typer.prompt("   Discord bot token", default="", hide_input=True, show_default=False).strip()
+    changed = False
     if token:
+        valid, detail = _check_discord_token(token)
+        if valid is False:
+            console.print(f"   [red]Discord did not accept that token: {detail}. Nothing was saved.[/red]")
+            return False
         secrets.set_token("discord", token)
         _update_config(config, {"discord": {"enabled": True}})
-        console.print("   [green]Saved to your Keychain; Discord enabled.[/green]")
+        changed = True
+        if valid:
+            console.print(
+                f"   [green]That is {detail}. Token saved to your Keychain; Discord enabled.[/green]"
+            )
+        else:
+            console.print(
+                f"   [yellow]Saved to your Keychain, but Discord could not be reached to check it ({detail}).[/yellow]"
+            )
     stored = secrets.get_token("discord")
     if stored and (invite := _discord_invite(stored)):
-        console.print(f"   Add the bot to a server (or just DM it): {invite}")
+        console.print(
+            "   Add the bot to a server you manage (a private one is fine), then use /imagine there"
+        )
+        console.print(f"   or message the bot directly: {invite}")
+    return changed
 
 
-def _setup_imessage(config: Config) -> None:
+def _setup_imessage(config: Config) -> bool:
     from dreambot import launchd
     from dreambot.frontends.imessage.chatdb import ChatDB, ChatDBError
 
@@ -774,7 +818,7 @@ def _setup_imessage(config: Config) -> None:
     if mode not in ("self", "dedicated"):
         if mode:
             console.print("   [yellow]Skipped (type self or dedicated).[/yellow]")
-        return
+        return False
     _update_config(config, {"imessage": {"enabled": True, "mode": mode}})
     console.print(f"   [green]iMessage enabled in {mode} mode.[/green]")
     try:
@@ -794,6 +838,7 @@ def _setup_imessage(config: Config) -> None:
         console.print(
             "   Then text the bot's Apple Account from your iPhone and send it the code from `dreambot pair`."
         )
+    return True
 
 
 _SETUP_STEPS = {"telegram": _setup_telegram, "discord": _setup_discord, "imessage": _setup_imessage}
@@ -811,12 +856,21 @@ def setup(
     if chosen is not None and chosen not in _SETUP_STEPS:
         err.print(f"[red]I can set up {', '.join(_SETUP_STEPS)} — not `{frontend}`.[/red]")
         raise typer.Exit(2)
+    from dreambot import launchd
+
     console.print("[bold]Dreambot setup[/bold] — press Enter to skip any step.\n")
+    changed = False
     for name, step in _SETUP_STEPS.items():
         if chosen in (None, name):
-            step(config)
+            changed = step(config) or changed
             console.print()
 
+    if changed and launchd.is_loaded():
+        # The background service read its configuration when it started.
+        launchd.restart()
+        console.print("[green]The background service was restarted and is using the new setup.[/green]")
+        console.print("   dreambot pair                print the code that makes you the bot's owner")
+        return
     console.print("[bold]Start it[/bold]")
     console.print("   dreambot run                 run in this terminal")
     console.print("   dreambot service install     run in the background and at login")
@@ -940,6 +994,18 @@ def service_uninstall() -> None:
     from dreambot import launchd
 
     console.print("Removed." if launchd.uninstall(_config().home) else "The service was not installed.")
+
+
+@service_app.command("restart")
+def service_restart() -> None:
+    """Restart the background service (after changing config.toml, for example)."""
+    from dreambot import launchd
+
+    if not launchd.is_loaded():
+        console.print("The service is not running. Start it with: dreambot service install")
+        raise typer.Exit(1)
+    launchd.restart()
+    console.print("Restarted.")
 
 
 @service_app.command("status")
