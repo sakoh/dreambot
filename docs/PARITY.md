@@ -159,4 +159,5 @@ Tapbacks and reactions on an image: ❤️ favourite, 👍 upscale, ‼️ / �
 | Grid | one image | one image | four separate images |
 | Full-quality originals | attached PNG (JPEG above 9.5 MB) | "Original" button sends the file | the PNG itself |
 
-None of the three has been run against the live service yet; see the README's verification table.
+Telegram has been used on the live service; Discord and iMessage have not yet. See the README's
+verification table.

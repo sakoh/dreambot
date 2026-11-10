@@ -15,9 +15,10 @@ you:       zoom 2x · pan left · region the sky: an aurora · edit: make it nig
 No account, no subscription, no cloud. Prompts and images never leave the Mac except through the chat
 app you choose to talk to it with.
 
-> **Status: early (0.1).** The core, the command line and the image pipeline are verified on real models.
-> The three chat frontends are complete and tested against simulated platforms, but have **not yet been
-> run against the live services**. See [what is verified](#what-is-verified).
+> **Status: early (0.1).** The core, the command line and the image pipeline are verified on real models,
+> and the Telegram bot has been used on the live service. The Discord and iMessage frontends are complete
+> and tested against simulated platforms, but have **not yet been run against the live services**. See
+> [what is verified](#what-is-verified).
 
 ## Contents
 
@@ -315,7 +316,8 @@ idle_unload_seconds = 900
 | Variations, upscales (SeedVR2 and tiled), `--hd`, edits, references, zoom/pan/square, region edits, describe | real weights, results inspected by eye |
 | The prompt enhancer | real language model (Qwen2.5-VL 7B) and real images, compared with and without |
 | The other 46 models | class paths, arguments and defaults checked against mflux; **not run** (weights not installed during development) |
-| Discord, Telegram | real library objects against a simulated API; **not run against the live service** |
+| Telegram | **live**: pairing, prompts with the enhancer, grids with buttons, variations, `/describe` with a photo. The other actions: real library objects against a simulated API |
+| Discord | real library objects against a simulated API; **not run against the live service** |
 | iMessage | a synthetic Messages database; the AppleScript compiles; **not run against Messages** |
 
 `dreambot models list` marks verified models with ✓.
