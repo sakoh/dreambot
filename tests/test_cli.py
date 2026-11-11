@@ -227,3 +227,25 @@ def test_setup_imessage_points_at_the_service_when_one_is_running(
         "enabled": True,
         "mode": "dedicated",
     }
+
+
+def test_setup_warns_when_discord_would_refuse_the_invite_link(home: Path, monkeypatch: pytest.MonkeyPatch):
+    """The wall a real setup ran into: "Integration requires code grant"."""
+    answers = {
+        "/users/@me": {"id": "1234567890123456789", "username": "Dreambot", "bot": True},
+        "/applications/@me": {"id": "1234567890123456789", "bot_require_code_grant": True},
+    }
+
+    def get(url: str, **kwargs) -> httpx.Response:
+        body = next(value for path, value in answers.items() if url.endswith(path))
+        return httpx.Response(200, json=body, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", get)
+    result = runner.invoke(cli.app, ["setup", "discord"], input=f"{DISCORD_TOKEN}\n")
+    assert "Requires OAuth2 Code Grant" in said(result) and "Switch it off" in said(result)
+    assert "cannot be added as a friend" in said(result)
+
+    answers["/applications/@me"]["bot_require_code_grant"] = False
+    cli._stored_for_test.clear()
+    result = runner.invoke(cli.app, ["setup", "discord"], input=f"{DISCORD_TOKEN}\n")
+    assert "Requires OAuth2 Code Grant" not in said(result) and "client_id=" in said(result).replace(" ", "")

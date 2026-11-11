@@ -742,6 +742,26 @@ def _check_discord_token(token: str) -> tuple[bool | None, str]:
     return False, str(reason or f"HTTP {response.status_code}")
 
 
+def _discord_needs_code_grant(token: str) -> bool:
+    """Whether the application has "Requires OAuth2 Code Grant" switched on.
+
+    With it on, Discord refuses the plain add-to-server link ("Integration requires code
+    grant"), which looks like the link being wrong. False when Discord cannot be asked.
+    """
+    import httpx
+
+    try:
+        response = httpx.get(
+            "https://discord.com/api/v10/applications/@me",
+            headers={"Authorization": f"Bot {token}", "User-Agent": f"DiscordBot (dreambot, {__version__})"},
+            timeout=10,
+        )
+        data = response.json()
+    except (httpx.HTTPError, ValueError):
+        return False
+    return isinstance(data, dict) and bool(data.get("bot_require_code_grant"))
+
+
 def _setup_telegram(config: Config) -> bool:
     """Returns whether anything was changed."""
     from dreambot import secrets
@@ -801,6 +821,12 @@ def _setup_discord(config: Config) -> bool:
             "   Add the bot to a server you manage (a private one is fine), then use /imagine there"
         )
         console.print(f"   or message the bot directly: {invite}")
+        console.print("   (A bot cannot be added as a friend; sharing a server with it is how you reach it.)")
+        if _discord_needs_code_grant(stored):
+            console.print(
+                "   [yellow]This application has “Requires OAuth2 Code Grant” switched on, so Discord will "
+                "refuse that link. Switch it off on the Bot page of the developer portal, and save.[/yellow]"
+            )
     return changed
 
 

@@ -16,9 +16,9 @@ No account, no subscription, no cloud. Prompts and images never leave the Mac ex
 app you choose to talk to it with.
 
 > **Status: early (0.1).** The core, the command line and the image pipeline are verified on real models,
-> and the Telegram bot has been used on the live service. The Discord and iMessage frontends are complete
-> and tested against simulated platforms, but have **not yet been run against the live services**. See
-> [what is verified](#what-is-verified).
+> and the Telegram and Discord bots have been used on the live services. **Next up: iMessage**, which is
+> complete and tested against a synthetic Messages database but has not yet been run against the Messages
+> app. See [what is verified](#what-is-verified).
 
 ## Contents
 
@@ -225,14 +225,15 @@ no public address or port forwarding is needed.
 ### Discord
 
 1. Create an application at <https://discord.com/developers/applications>, open **Bot**, reset and copy the
-   token. No privileged intents are required.
+   token. No privileged intents are required. Leave **Requires OAuth2 Code Grant** off, or Discord refuses
+   the add-to-server link with "Integration requires code grant".
 2. `dreambot setup discord` → paste the token. Dreambot asks Discord whose token it is, stores it in
    your Keychain and prints the link that adds the bot to a server.
 3. Open that link and add the bot to a server you manage (a private one is fine).
 4. `dreambot run` (or the background service), then `/pair <code>` in that server.
 
 Slash commands and buttons work in servers; plain-text prompts work in direct messages and when you
-@mention the bot.
+@mention the bot. A bot cannot be added as a friend: you can message it once you share a server with it.
 
 ### iMessage
 
@@ -334,7 +335,7 @@ idle_unload_seconds = 900
 | The prompt enhancer | real language model (Qwen2.5-VL 7B) and real images, compared with and without |
 | The other 46 models | class paths, arguments and defaults checked against mflux; **not run** (weights not installed during development) |
 | Telegram | **live**: pairing, prompts with the enhancer, grids with buttons, variations, `/describe` with a photo. The other actions: real library objects against a simulated API |
-| Discord | the real command tree, buttons and modals, with stand-ins for Discord's interactions and channels; **not run against the live service** |
+| Discord | **live**: adding the bot to a server, `/pair`, `/imagine` with the enhancer, variation buttons. The other commands and buttons: the real command tree and views, with stand-ins for Discord's interactions and channels |
 | iMessage | a synthetic Messages database; the AppleScript compiles; **not run against Messages** |
 
 `dreambot models list` marks verified models with ✓.
