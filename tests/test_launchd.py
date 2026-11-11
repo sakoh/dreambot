@@ -38,17 +38,36 @@ def test_folders_macos_guards_are_recognised(path: Path, expected: str | None):
 
 
 class Launchctl:
-    """Stands in for /bin/launchctl."""
+    """Stands in for /bin/launchctl, including a service that takes its time to stop."""
 
-    def __init__(self, loaded: bool = False):
+    def __init__(self, loaded: bool = False, lingers: int = 0):
         self.calls: list[tuple[str, ...]] = []
         self.loaded = loaded
+        #: How many more times the old instance is still seen after it was told to stop.
+        self.lingers = lingers
+        self.stopping = False
+
+    def _still_there(self) -> bool:
+        if self.stopping and self.lingers > 0:
+            self.lingers -= 1
+            return True
+        if self.stopping:
+            self.stopping = self.loaded = False
+        return self.loaded
 
     def __call__(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         self.calls.append(arguments)
         if arguments[0] == "print":
-            return subprocess.CompletedProcess(arguments, 0 if self.loaded else 113, "", "")
-        self.loaded = arguments[0] == "bootstrap"
+            return subprocess.CompletedProcess(arguments, 0 if self._still_there() else 113, "", "")
+        if arguments[0] == "bootout":
+            self.stopping = True
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        if arguments[0] == "bootstrap":
+            if self._still_there():
+                return subprocess.CompletedProcess(
+                    arguments, 5, "", "Bootstrap failed: 5: Input/output error"
+                )
+            self.loaded = True
         return subprocess.CompletedProcess(arguments, 0, "", "")
 
 
@@ -80,7 +99,7 @@ def test_a_checkout_in_documents_gets_a_copy_for_the_service(tmp_path: Path, ser
     plist = plistlib.loads(path.read_bytes())
     assert plist["ProgramArguments"] == [str(copied), "-m", "dreambot", "run"]
     assert runtime == home / "runtime"
-    assert [call[0] for call in service.calls] == ["print", "bootout", "bootstrap"]
+    assert [call[0] for call in service.calls] == ["print", "bootout", "print", "bootstrap"]
 
     (home / "runtime").mkdir(parents=True)
     assert launchd.uninstall(home) is True
@@ -173,3 +192,48 @@ def test_service_install_explains_the_copy(tmp_path: Path, monkeypatch: pytest.M
     monkeypatch.setattr(launchd, "install", broken)
     result = CliRunner().invoke(cli.app, ["service", "install"])
     assert result.exit_code == 1 and "boom" in " ".join(result.output.split())
+
+
+def test_a_replacement_waits_for_the_old_service_to_finish_stopping(tmp_path: Path, monkeypatch):
+    """With models loaded a service takes seconds to stop; launchd refuses to start its
+    replacement meanwhile ("Bootstrap failed: 5"), which once left the bots down."""
+    naps: list[float] = []
+    monkeypatch.setattr(launchd.time, "sleep", naps.append)
+    monkeypatch.setattr(launchd, "plist_path", lambda: tmp_path / "LaunchAgents" / "agent.plist")
+    monkeypatch.setattr(launchd, "code_is_guarded", lambda: None)
+
+    slow = Launchctl(loaded=True, lingers=6)
+    monkeypatch.setattr(launchd, "_launchctl", slow)
+    launchd.install(tmp_path / "logs", tmp_path / "home")
+    kinds = [call[0] for call in slow.calls]
+    assert kinds.count("bootstrap") == 1 and kinds[-1] == "bootstrap", (
+        "started once, after the old one had gone"
+    )
+    assert kinds.index("bootout") < kinds.index("bootstrap") and len(naps) >= 5
+    assert slow.loaded
+
+    # If launchd still refuses for a moment after the job has gone, the start is tried again.
+    class Flaky(Launchctl):
+        refusals = 2
+
+        def __call__(self, *arguments: str):
+            if arguments[0] == "bootstrap" and self.refusals:
+                self.refusals -= 1
+                self.calls.append(arguments)
+                return subprocess.CompletedProcess(
+                    arguments, 5, "", "Bootstrap failed: 5: Input/output error"
+                )
+            return super().__call__(*arguments)
+
+    flaky = Flaky()
+    monkeypatch.setattr(launchd, "_launchctl", flaky)
+    launchd.install(tmp_path / "logs", tmp_path / "home")
+    assert [call[0] for call in flaky.calls].count("bootstrap") == 3 and flaky.loaded
+
+    # A start that keeps failing is reported, not retried for ever.
+    flaky = Flaky()
+    flaky.refusals = 99
+    monkeypatch.setattr(launchd, "_launchctl", flaky)
+    with pytest.raises(RuntimeError, match="Bootstrap failed: 5"):
+        launchd.install(tmp_path / "logs", tmp_path / "home")
+    assert [call[0] for call in flaky.calls].count("bootstrap") == launchd.START_ATTEMPTS

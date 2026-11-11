@@ -19,11 +19,17 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 LABEL = "com.dreambot.agent"
 #: Folders in the home directory that macOS guards with a consent prompt per program.
 GUARDED = ("Desktop", "Documents", "Downloads")
+#: How long a running service is given to shut down before its replacement is started. With
+#: models loaded it needs several seconds, and launchd refuses to start a job that is still
+#: stopping ("Bootstrap failed: 5: Input/output error").
+STOP_TIMEOUT = 45.0
+START_ATTEMPTS = 4
 
 
 def plist_path() -> Path:
@@ -162,7 +168,8 @@ def install(log_dir: Path, home: Path) -> tuple[Path, Path | None]:
     """
     path = plist_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    if is_loaded():
+    was_running = is_loaded()
+    if was_running:
         _launchctl("bootout", f"{_domain()}/{LABEL}")
     python: str | None = None
     runtime: Path | None = None
@@ -171,10 +178,28 @@ def install(log_dir: Path, home: Path) -> tuple[Path, Path | None]:
         runtime = runtime_dir(home)
     with path.open("wb") as handle:
         plistlib.dump(build_plist(log_dir, python=python), handle)
+    if was_running:
+        _wait_until_stopped()
     result = _launchctl("bootstrap", _domain(), str(path))
+    for _ in range(START_ATTEMPTS - 1):
+        if result.returncode == 0:
+            break
+        # Usually the old instance, still on its way out: give it a moment and try again.
+        time.sleep(3)
+        result = _launchctl("bootstrap", _domain(), str(path))
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "launchctl bootstrap failed")
     return path, runtime
+
+
+def _wait_until_stopped(timeout: float = STOP_TIMEOUT) -> bool:
+    """Wait for a service that was told to stop to be gone. Returns whether it is."""
+    deadline = time.monotonic() + timeout
+    while is_loaded():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+    return True
 
 
 def uninstall(home: Path | None = None) -> bool:
