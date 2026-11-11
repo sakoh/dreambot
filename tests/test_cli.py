@@ -249,3 +249,59 @@ def test_setup_warns_when_discord_would_refuse_the_invite_link(home: Path, monke
     cli._stored_for_test.clear()
     result = runner.invoke(cli.app, ["setup", "discord"], input=f"{DISCORD_TOKEN}\n")
     assert "Requires OAuth2 Code Grant" not in said(result) and "client_id=" in said(result).replace(" ", "")
+
+
+def test_a_restart_waits_for_running_jobs_unless_told_not_to(home: Path, monkeypatch: pytest.MonkeyPatch):
+    """Restarting mid-job throws the job away (it happened to a live Telegram pan)."""
+    import time
+
+    from dreambot.core.jobs import Job, JobKind, JobStatus
+    from dreambot.core.store import Store
+
+    calls: list[tuple[str, ...]] = []
+
+    def running(*arguments: str) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, "", "")
+
+    monkeypatch.setattr(launchd, "_launchctl", running)
+    home.mkdir(parents=True, exist_ok=True)
+    database = cli._config().database_path
+    store = Store(database)
+    job = Job(
+        id="BUSY01",
+        kind=JobKind.PAN,
+        user="telegram:1",
+        channel="telegram:1",
+        prompt="a fox",
+        status=JobStatus.RUNNING,
+    )
+    store.save_job(job)
+
+    naps: list[float] = []
+
+    def nap(seconds: float) -> None:
+        naps.append(seconds)
+        if len(naps) == 3:  # the job finishes while the command waits
+            job.status = JobStatus.DONE
+            store.save_job(job)
+
+    monkeypatch.setattr(time, "sleep", nap)
+    result = runner.invoke(cli.app, ["service", "restart"])
+    assert result.exit_code == 0, result.output
+    assert "busy with 1 job(s)" in said(result) and "Restarted." in said(result)
+    assert len(naps) == 3 and [call[0] for call in calls].count("kickstart") == 1
+
+    # --now does not wait.
+    job.status = JobStatus.RUNNING
+    store.save_job(job)
+    naps.clear()
+    result = runner.invoke(cli.app, ["service", "restart", "--now"])
+    assert "busy" not in said(result) and naps == [] and "Restarted." in said(result)
+
+    # A job that never finishes does not hold the restart for ever.
+    monkeypatch.setattr(cli, "RESTART_PATIENCE", 0.0)
+    monkeypatch.setattr(cli._wait_for_jobs, "__kwdefaults__", {"now": False, "patience": 0.0})
+    result = runner.invoke(cli.app, ["service", "restart"])
+    assert "restarting anyway" in said(result) and "Restarted." in said(result)
+    store.close()

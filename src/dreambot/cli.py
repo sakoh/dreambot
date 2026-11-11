@@ -915,6 +915,7 @@ def setup(
 
     if changed and launchd.is_loaded():
         # The background service read its configuration when it started.
+        _wait_for_jobs(config)
         launchd.restart()
         console.print("[green]The background service was restarted and is using the new setup.[/green]")
         console.print("   dreambot pair                print the code that makes you the bot's owner")
@@ -1005,12 +1006,54 @@ def access_revoke(user: Annotated[str, typer.Argument(help="The id to remove.")]
 # --------------------------------------------------------------------------------------
 
 
+#: How long a restart waits for jobs that are running or queued before going ahead anyway.
+RESTART_PATIENCE = 300.0
+
+
+def _wait_for_jobs(config: Config, *, now: bool = False, patience: float = RESTART_PATIENCE) -> None:
+    """Before stopping a running service, let the jobs it is working on finish.
+
+    Stopping it mid-job throws the job away, and the person who asked is left looking at a
+    progress message that never moves again.
+    """
+    import time
+
+    from dreambot import launchd
+    from dreambot.core.store import Store
+
+    if now or not launchd.is_loaded() or not config.database_path.exists():
+        return
+    store = Store(config.database_path)
+    try:
+        waiting = len(store.interrupted_jobs())
+        if not waiting:
+            return
+        console.print(
+            f"The service is busy with {waiting} job(s). Waiting for it to finish before restarting "
+            "(`--now` restarts at once)…"
+        )
+        deadline = time.monotonic() + patience
+        while store.interrupted_jobs():
+            if time.monotonic() >= deadline:
+                console.print("[yellow]Still busy after waiting; restarting anyway.[/yellow]")
+                return
+            time.sleep(2)
+    finally:
+        store.close()
+
+
+NowOption = Annotated[
+    bool, typer.Option("--now", help="Do not wait for running jobs to finish; they are lost.")
+]
+
+
 @service_app.command("install")
-def service_install() -> None:
+def service_install(now: NowOption = False) -> None:
     """Install and start the background service (a per-user LaunchAgent)."""
     from dreambot import launchd
 
     config = _config()
+    _wait_for_jobs(config, now=now)
     folder = launchd.code_is_guarded()
     if folder:
         console.print(
@@ -1045,13 +1088,14 @@ def service_uninstall() -> None:
 
 
 @service_app.command("restart")
-def service_restart() -> None:
+def service_restart(now: NowOption = False) -> None:
     """Restart the background service (after changing config.toml, for example)."""
     from dreambot import launchd
 
     if not launchd.is_loaded():
         console.print("The service is not running. Start it with: dreambot service install")
         raise typer.Exit(1)
+    _wait_for_jobs(_config(), now=now)
     launchd.restart()
     console.print("Restarted.")
 
