@@ -517,3 +517,20 @@ def test_restore_helpers_keep_what_must_not_change(tmp_path: Path, picture: str)
     imaging.restore_outside_mask(edited, picture, mask)
     with Image.open(edited) as image:
         assert image.getpixel((500, 330)) == (0, 255, 0) and image.getpixel((50, 50)) == (90, 140, 200)
+
+
+def test_strength_says_outright_how_much_of_an_image_prompt_to_keep(tmp_path: Path, picture: str):
+    """Classic image-to-image: a model that cannot take references re-renders the picture."""
+    p = planner(tmp_path, "z-image-turbo", "flux2-klein-4b")
+    refs = ResolvedRefs(image_prompts=[picture])
+    plain = imagine(p, "a castle --model z-image-turbo", refs).renders[0]
+    assert plain.op is Op.IMG2IMG and plain.image == picture
+    assert plain.strength is None and plain.noise == pytest.approx(0.8), "by default --iw 1 decides"
+    assert imagine(p, "a castle --model z-image-turbo --iw 2", refs).renders[0].noise == pytest.approx(0.65)
+
+    kept = imagine(p, "a castle --model z-image-turbo --strength 0.7", refs).renders[0]
+    assert kept.strength == 0.7 and kept.noise is None, "--strength wins over the image weight"
+    both = imagine(p, "a castle --model z-image-turbo --strength 0.3 --iw 3", refs).renders[0]
+    assert both.strength == 0.3 and both.noise is None
+    # With an edit model and no --model, the picture is a reference instead, and strength does not apply.
+    assert imagine(p, "a castle --strength 0.7", refs).renders[0].op is Op.EDIT

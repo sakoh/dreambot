@@ -564,9 +564,13 @@ class Planner:
             base.image_weights = [min(1.0, weight)] * len(refs.image_prompts)
         elif op is Op.IMG2IMG:
             base.image = refs.image_prompts[0]
-            weight = 1.0 if params.iw is None else params.iw
-            # A heavier image weight keeps more of the picture, i.e. starts from less noise.
-            base.noise = max(0.4, min(0.95, 0.95 - 0.15 * weight))
+            if params.strength is not None:
+                # Said outright: how much of the picture to keep.
+                base.strength = params.strength
+            else:
+                weight = 1.0 if params.iw is None else params.iw
+                # A heavier image weight keeps more of the picture, i.e. starts from less noise.
+                base.noise = max(0.4, min(0.95, 0.95 - 0.15 * weight))
             if len(refs.image_prompts) > 1:
                 notes.append(
                     "Only the first image prompt was used; install an edit model to combine several."

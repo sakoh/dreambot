@@ -50,6 +50,12 @@ ECHO_WINDOW = 20.0
 JOIN_RETRIES = 20
 ATTACHMENT_WAIT = 30.0
 FILE_REF = "file:"
+#: Where the place reached in the database is kept between runs, and for how long it stays
+#: worth going back to: a restart picks up what arrived in the meantime, but a bot that was
+#: off for an hour does not wake up and answer an hour of old messages.
+CURSOR_KEY = "imessage.cursor"
+RESUME_WINDOW = 10 * 60
+CURSOR_SAVE_INTERVAL = 30.0
 
 
 def _normalize_text(text: str) -> str:
@@ -104,6 +110,8 @@ class IMessageFrontend(ChatFrontend):
         self.db = db or ChatDB()
         self.sender = sender or Sender()
         self._cursor = 0
+        #: (cursor, monotonic time) as last written to the store.
+        self._saved_cursor: tuple[int, float] = (0, 0.0)
         self._task: asyncio.Task[None] | None = None
         self._retry: dict[int, int] = {}
         self._outgoing: deque[_Outgoing] = deque()
@@ -121,7 +129,8 @@ class IMessageFrontend(ChatFrontend):
 
     async def start(self) -> None:
         self.db.open()  # raises ChatDBError with instructions when Full Disk Access is missing
-        self._cursor = self.db.max_rowid()
+        self._cursor = self._starting_point(self.db.max_rowid())
+        self._saved_cursor = (self._cursor, time.monotonic())
         self.db.changed()
         await super().start()
         with contextlib.suppress(Exception):
@@ -134,6 +143,36 @@ class IMessageFrontend(ChatFrontend):
                 ", ".join(self.db.missing_optional),
             )
         self._permission = asyncio.create_task(self._check_permission(), name="dreambot-imessage-permission")
+
+    def _starting_point(self, newest: int) -> int:
+        """Where to start reading: the newest message, or where a recent run left off.
+
+        Only the dedicated mode resumes. There, messages this Mac sent are never acted on; in a
+        note-to-self thread the bot's own last words, read back without the ledger that
+        recognises them, would look like the owner talking.
+        """
+        saved = self.service.store.get_state(CURSOR_KEY, None)
+        if self.mode != "dedicated" or not isinstance(saved, dict):
+            return newest
+        try:
+            rowid, at = int(saved["rowid"]), float(saved["at"])
+        except (KeyError, TypeError, ValueError):
+            return newest
+        if time.time() - at > RESUME_WINDOW or not 0 < rowid <= newest:
+            return newest
+        if rowid < newest:
+            log.info(
+                "imessage: picking up %d message row(s) that arrived while Dreambot was restarting",
+                newest - rowid,
+            )
+        return rowid
+
+    def _save_cursor(self, *, force: bool = False) -> None:
+        cursor, at = self._saved_cursor
+        if not force and cursor == self._cursor and time.monotonic() - at < CURSOR_SAVE_INTERVAL:
+            return
+        self.service.store.set_state(CURSOR_KEY, {"rowid": self._cursor, "at": time.time()})
+        self._saved_cursor = (self._cursor, time.monotonic())
 
     async def _check_permission(self) -> None:
         """Ask for the right to control Messages now, not in the middle of the first reply."""
@@ -162,6 +201,8 @@ class IMessageFrontend(ChatFrontend):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
         self._task = None
+        with contextlib.suppress(Exception):
+            self._save_cursor(force=True)
         self.db.close()
         await super().stop()
 
@@ -171,6 +212,7 @@ class IMessageFrontend(ChatFrontend):
             try:
                 await self.poll_once()
                 failures = 0
+                self._save_cursor()
             except asyncio.CancelledError:
                 raise
             except ChatDBError as exc:

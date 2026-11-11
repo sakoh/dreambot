@@ -813,3 +813,68 @@ def test_every_copy_of_a_sent_picture_is_found_by_its_name(tmp_path: Path):
     assert reader.guids_of_attachment("fox-1a2b3c4d.png") == [sent, received]
     assert reader.guids_of_attachment("never-sent.png") == []
     reader.close()
+
+
+# --------------------------------------------------------------------------------------
+# Restarts
+# --------------------------------------------------------------------------------------
+
+
+async def test_a_restart_picks_up_what_arrived_in_the_meantime(dedicated: Phone, tmp_path: Path):
+    from dreambot.frontends.base import ChatFrontend
+    from dreambot.frontends.imessage.bot import CURSOR_KEY, RESUME_WINDOW
+
+    chat = dedicated.messages.chat(FRIEND)
+    dedicated.messages.insert(chat, text="a fox --n 1", sender=FRIEND)
+    await dedicated.settle()
+    first = dedicated.latest()
+    # The service stops (a restart, an update)...
+    dedicated.front._save_cursor(force=True)
+    await ChatFrontend.stop(dedicated.front)
+    left_off = dedicated.front._cursor
+    # ...and a message arrives while it is down.
+    dedicated.messages.insert(chat, text="a wolf --n 1", sender=FRIEND)
+
+    def restarted(mode: str) -> IMessageFrontend:
+        sender = Sender(
+            stage_dir=tmp_path / "stage",
+            fallback_dir=tmp_path / "fallback",
+            run=dedicated.messages.run,
+            pause=0,
+        )
+        front = IMessageFrontend(
+            dedicated.service, db=ChatDB(dedicated.messages.path), sender=sender, mode=mode, poll_seconds=0.01
+        )
+        front.db.open()
+        return front
+
+    again = restarted("dedicated")
+    newest = again.db.max_rowid()
+    assert again._starting_point(newest) == left_off < newest, "it starts where the last run stopped"
+    again._cursor = again._starting_point(newest)
+    await ChatFrontend.start(again)
+    await Phone(dedicated.service, dedicated.messages, again).settle()
+    wolf = dedicated.latest()
+    assert wolf.id != first.id and wolf.text == "a wolf" and wolf.status is JobStatus.DONE
+    await ChatFrontend.stop(again)
+
+    store = dedicated.service.store
+    # A bot that was off for longer does not wake up and answer old messages.
+    saved = store.get_state(CURSOR_KEY, None)
+    store.set_state(CURSOR_KEY, {**saved, "rowid": left_off, "at": saved["at"] - RESUME_WINDOW - 5})
+    assert again._starting_point(newest) == newest
+    # In a note-to-self thread its own last words would look like the owner's: never resumed there.
+    store.set_state(CURSOR_KEY, {"rowid": left_off, "at": saved["at"]})
+    assert restarted("self")._starting_point(newest) == newest
+    assert again._starting_point(newest) == left_off
+    # Nonsense in the store is ignored.
+    for junk in (
+        None,
+        "x",
+        {"rowid": "n"},
+        {"rowid": newest + 50, "at": saved["at"]},
+        {"rowid": 0, "at": saved["at"]},
+    ):
+        store.set_state(CURSOR_KEY, junk)
+        assert again._starting_point(newest) == newest, junk
+    again.db.close()
