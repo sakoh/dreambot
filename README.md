@@ -252,9 +252,14 @@ Each image is sent as its own message, so you can reply to a picture or tapback 
 macOS permissions it needs (macOS asks for the second one itself):
 
 1. **Full Disk Access** for the program running Dreambot — your terminal when you use `dreambot run`, and the
-   Python binary shown by `dreambot doctor` for the background service. *System Settings → Privacy &
+   Python binary shown by `dreambot setup imessage` for the background service. *System Settings → Privacy &
    Security → Full Disk Access.*
-2. **Automation → Messages**, on the first reply.
+2. **Automation → Messages.** Dreambot asks for it when it starts, so the prompt appears while you are
+   setting up rather than in the middle of its first reply.
+
+When it starts, the log says whether both worked, whether Messages is signed in to iMessage, and then what
+arrives and what is sent: the kind of thing only (a message, a picture, a tapback), never the words or
+who sent them.
 
 Limits that come from iMessage itself: no buttons, no editing a sent message (so no live progress bar), and
 one attachment per message.

@@ -27,6 +27,41 @@ APPLE_EPOCH = 978307200
 
 TAPBACKS = {0: "❤", 1: "👍", 2: "👎", 3: "😂", 4: "‼", 5: "❓"}
 
+#: Columns Dreambot cannot work without, by table. They have been stable across macOS releases;
+#: if one ever goes, it is better to say so once at start than to fail on every poll.
+REQUIRED = {
+    "message": {
+        "guid",
+        "text",
+        "attributedBody",
+        "date",
+        "is_from_me",
+        "service",
+        "handle_id",
+        "cache_has_attachments",
+    },
+    "handle": {"id"},
+    "chat": {"guid", "chat_identifier", "style"},
+    "chat_message_join": {"chat_id", "message_id"},
+    "attachment": {
+        "filename",
+        "mime_type",
+        "transfer_name",
+        "transfer_state",
+        "total_bytes",
+        "hide_attachment",
+    },
+    "message_attachment_join": {"message_id", "attachment_id"},
+}
+#: Columns that are used when present (tapbacks, inline replies, which address was written to).
+OPTIONAL = (
+    "associated_message_guid",
+    "associated_message_type",
+    "associated_message_emoji",
+    "thread_originator_guid",
+    "destination_caller_id",
+)
+
 
 class ChatDBError(Exception):
     """The Messages database cannot be read. The message says how to fix it."""
@@ -141,6 +176,8 @@ class ChatDB:
         self._db: sqlite3.Connection | None = None
         self._columns: set[str] = set()
         self._data_version: int | None = None
+        #: Optional columns this macOS does not have (the features that use them are off).
+        self.missing_optional: list[str] = []
 
     def open(self) -> None:
         if not self.path.exists():
@@ -151,8 +188,13 @@ class ChatDB:
             # Read-only, but NOT immutable: immutable connections never see new rows.
             db = sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True, timeout=5, isolation_level=None)
             db.row_factory = sqlite3.Row
-            self._columns = {row["name"] for row in db.execute("PRAGMA table_info(message)").fetchall()}
-            db.execute("SELECT MAX(ROWID) FROM message").fetchone()
+            layout = {
+                table: {row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+                for table in REQUIRED
+            }
+            self._columns = layout["message"]
+            if self._columns:
+                db.execute("SELECT MAX(ROWID) FROM message").fetchone()
         except sqlite3.Error as exc:
             raise ChatDBError(
                 "macOS is blocking access to your Messages database. Grant Full Disk Access to the program "
@@ -162,6 +204,18 @@ class ChatDB:
         if not self._columns:
             db.close()
             raise ChatDBError(f"{self.path} does not look like a Messages database.")
+        missing = [
+            f"{table}.{column}"
+            for table, columns in REQUIRED.items()
+            for column in sorted(columns - layout[table])
+        ]
+        if missing:
+            db.close()
+            raise ChatDBError(
+                "This version of macOS stores messages differently from what Dreambot expects "
+                f"(missing: {', '.join(missing)}). Please report it."
+            )
+        self.missing_optional = [name for name in OPTIONAL if name not in self._columns]
         self._db = db
 
     def close(self) -> None:

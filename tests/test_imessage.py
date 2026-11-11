@@ -328,6 +328,9 @@ def test_older_schemas_without_newer_columns_still_read(tmp_path: Path):
         CREATE TABLE message (ROWID INTEGER PRIMARY KEY, guid TEXT, text TEXT, attributedBody BLOB, handle_id INTEGER,
                               service TEXT, date INTEGER, is_from_me INTEGER, cache_has_attachments INTEGER);
         CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
+        CREATE TABLE attachment (ROWID INTEGER PRIMARY KEY, filename TEXT, mime_type TEXT, transfer_name TEXT,
+                                 transfer_state INTEGER, total_bytes INTEGER, hide_attachment INTEGER);
+        CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER);
         INSERT INTO handle VALUES (1, '+15550002222');
         INSERT INTO chat VALUES (1, 'iMessage;-;+15550002222', '+15550002222', 45);
         INSERT INTO message VALUES (1, 'G1', 'hello', NULL, 1, 'iMessage', 600000000, 0, 0);
@@ -340,6 +343,33 @@ def test_older_schemas_without_newer_columns_still_read(tmp_path: Path):
     reader.open()
     (row,) = reader.rows_after(0)
     assert row.text == "hello" and row.reply_to is None and row.reaction is None and row.own_address is None
+    # The features those columns carry are reported as unavailable rather than failing later.
+    assert set(reader.missing_optional) == {
+        "associated_message_guid",
+        "associated_message_type",
+        "associated_message_emoji",
+        "thread_originator_guid",
+        "destination_caller_id",
+    }
+    reader.close()
+
+
+def test_a_database_laid_out_differently_is_refused_once_with_the_details(tmp_path: Path):
+    """If a future macOS drops a column Dreambot depends on, say which, at start."""
+    path = tmp_path / "future.db"
+    db = sqlite3.connect(path)
+    db.executescript(SCHEMA.replace("attributedBody BLOB, ", "").replace(" transfer_name TEXT,", ""))
+    db.commit()
+    db.close()
+    with pytest.raises(ChatDBError, match=r"missing: message\.attributedBody, attachment\.transfer_name"):
+        ChatDB(path).open()
+    complete = tmp_path / "now.db"
+    db = sqlite3.connect(complete)
+    db.executescript(SCHEMA)
+    db.close()
+    reader = ChatDB(complete)
+    reader.open()
+    assert reader.missing_optional == []
     reader.close()
 
 
@@ -614,3 +644,119 @@ async def test_summoning_the_bot_inside_another_conversation(myself: Phone):
     myself.messages.insert(chat, text="/imagine a wolf --n 1", sender=FRIEND)
     await myself.settle()
     assert myself.latest().text == "a wolf" and myself.latest().user == f"imessage:{FRIEND}"
+
+
+# --------------------------------------------------------------------------------------
+# Permission to control Messages, checked at start
+# --------------------------------------------------------------------------------------
+
+
+async def run_must_not_be_called(arguments: list[str]) -> str:
+    raise AssertionError("nothing should be sent")
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [("ok\t1", 1), ("ok\t2", 2), ("ok\t0", 0), ("ok\t-1", -1), ("ok", -1)],
+)
+async def test_the_permission_check_reports_the_imessage_accounts(tmp_path: Path, answer: str, expected: int):
+    async def probe() -> str:
+        return answer
+
+    sender = Sender(
+        stage_dir=tmp_path / "s", fallback_dir=tmp_path / "f", run=run_must_not_be_called, probe=probe
+    )
+    assert await sender.check() == expected
+
+
+async def test_a_refused_permission_says_where_to_allow_it(tmp_path: Path):
+    async def refused() -> str:
+        return "fail\t-1743\tNot authorized to send Apple events to Messages."
+
+    sender = Sender(
+        stage_dir=tmp_path / "s", fallback_dir=tmp_path / "f", run=run_must_not_be_called, probe=refused
+    )
+    with pytest.raises(SendError, match="Automation") as caught:
+        await sender.check()
+    assert caught.value.code == -1743
+
+    async def odd() -> str:
+        return "fail\t-9999\tsomething new"
+
+    sender = Sender(
+        stage_dir=tmp_path / "s", fallback_dir=tmp_path / "f", run=run_must_not_be_called, probe=odd
+    )
+    with pytest.raises(SendError, match=r"\(-9999\): something new"):
+        await sender.check()
+    # A stand-in for sending has no Messages app to ask.
+    assert (
+        await Sender(
+            stage_dir=tmp_path / "s", fallback_dir=tmp_path / "f", run=run_must_not_be_called
+        ).check()
+        is None
+    )
+
+
+def test_the_probe_script_compiles():
+    from dreambot.frontends.imessage.sender import PROBE
+
+    if shutil.which("osacompile") is None:
+        pytest.skip("osacompile is not available")
+    result = subprocess.run(
+        ["osacompile", "-o", "/dev/null", "-"], input=PROBE.encode(), capture_output=True, check=False
+    )
+    assert result.returncode == 0, result.stderr.decode()
+
+
+@pytest.mark.parametrize(
+    ("answer", "level", "expected"),
+    [
+        ("ok\t1", "INFO", "allowed to send through Messages (1 iMessage account(s))"),
+        ("ok\t0", "ERROR", "Messages is not signed in to iMessage"),
+        ("fail\t-1743\tNot authorized", "ERROR", "cannot send replies yet"),
+    ],
+)
+async def test_the_frontend_checks_at_start_and_logs_what_it_finds(
+    tmp_path: Path,
+    messages: FakeMessages,
+    caplog: pytest.LogCaptureFixture,
+    answer: str,
+    level: str,
+    expected: str,
+):
+    async def probe() -> str:
+        return answer
+
+    engine = Engine(backend="fake", idle_timeout=None, stderr=subprocess.DEVNULL)
+    async with Dreambot(make_config(tmp_path), engine=engine) as service:
+        sender = Sender(
+            stage_dir=tmp_path / "s", fallback_dir=tmp_path / "f", run=messages.run, pause=0, probe=probe
+        )
+        front = IMessageFrontend(
+            service, db=ChatDB(messages.path), sender=sender, mode="dedicated", poll_seconds=0.01
+        )
+        with caplog.at_level("INFO", logger="dreambot.frontends.imessage.bot"):
+            await front.start()
+            await asyncio.sleep(0.05)
+            await front.stop()
+    records = [record for record in caplog.records if expected in record.getMessage()]
+    assert records and records[0].levelname == level, caplog.text
+    assert "watching for messages (dedicated mode)" in caplog.text
+
+
+async def test_the_log_says_what_arrived_but_not_what_it_said(
+    dedicated: Phone, caplog: pytest.LogCaptureFixture
+):
+    with caplog.at_level("INFO", logger="dreambot.frontends.imessage.bot"):
+        dedicated.messages.insert(
+            dedicated.messages.chat(FRIEND), text="a very private prompt about a fox --n 1", sender=FRIEND
+        )
+        await dedicated.settle()
+        dedicated.messages.insert(
+            dedicated.messages.chat(STRANGER), text="hello, is this the bot?", sender=STRANGER
+        )
+        await dedicated.settle()
+    assert "imessage: a message" in caplog.text and "imessage: sent 1 picture(s)" in caplog.text
+    assert "ignoring a message from someone who is not allowed" in caplog.text
+    for private in ("private prompt", "fox", "is this the bot", FRIEND, STRANGER):
+        assert private not in caplog.text, private

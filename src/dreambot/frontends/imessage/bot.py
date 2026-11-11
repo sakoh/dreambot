@@ -125,13 +125,40 @@ class IMessageFrontend(ChatFrontend):
             self.sender.cleanup()
         self._task = asyncio.create_task(self._run(), name="dreambot-imessage")
         log.info("imessage: watching for messages (%s mode)", self.mode)
+        if self.db.missing_optional:
+            log.warning(
+                "imessage: this macOS has no %s; tapbacks or replies to pictures may not be recognised",
+                ", ".join(self.db.missing_optional),
+            )
+        self._permission = asyncio.create_task(self._check_permission(), name="dreambot-imessage-permission")
+
+    async def _check_permission(self) -> None:
+        """Ask for the right to control Messages now, not in the middle of the first reply."""
+        try:
+            accounts = await self.sender.check()
+        except SendError as exc:
+            log.error("imessage: cannot send replies yet. %s", exc)
+            return
+        except Exception:
+            log.exception("imessage: could not check whether Messages can be controlled")
+            return
+        if accounts is None:
+            return
+        if accounts == 0:
+            log.error("imessage: Messages is not signed in to iMessage, so nothing can be sent or received")
+        else:
+            log.info(
+                "imessage: allowed to send through Messages (%s iMessage account(s))",
+                accounts if accounts > 0 else "?",
+            )
 
     async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._task
-            self._task = None
+        for task in (self._task, getattr(self, "_permission", None)):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+        self._task = None
         self.db.close()
         await super().stop()
 
@@ -252,6 +279,7 @@ class IMessageFrontend(ChatFrontend):
                 and row.reaction_target
                 and not self._is_echo(row, (chat, "tapback", row.reaction_target, row.reaction))
             ) and self.service.access.is_allowed(self.user_id(user)):
+                log.info("imessage: a tapback")
                 await self.handle_reaction(user, chat, row.reaction_target, row.reaction)
             return
 
@@ -269,11 +297,21 @@ class IMessageFrontend(ChatFrontend):
         if not self.service.access.is_allowed(full_user) and not text.lower().startswith("/pair"):
             # Never answer strangers: in self mode the reply would come from the owner's own
             # account, and in any mode it would confirm a live number to a spammer.
-            log.info("imessage: ignoring a message from %s (not allowed)", full_user)
+            log.info(
+                "imessage: ignoring a message from someone who is not allowed (send `/pair <code>` to claim the bot)"
+            )
             return
 
+        # The log says that something arrived and what kind of thing, never what it said.
+        log.info(
+            "imessage: a %s%s%s",
+            "message" if text else "picture",
+            f" with {len(images)} picture(s)" if text and images else "",
+            " (a reply)" if row.reply_to else "",
+        )
         paths = await self._collect(images)
         if images and not paths:
+            log.warning("imessage: the attached picture never finished arriving from Messages")
             await self.send(chat, "⚠️ I couldn't get that image from Messages. Try sending it again.")
             return
         await self.handle_message(
@@ -332,8 +370,17 @@ class IMessageFrontend(ChatFrontend):
             if text:
                 self._outgoing.append(_Outgoing(conversation, _normalize_text(text), time.monotonic()))
                 await self.sender.send_text(conversation, partner, text)
+            log.info(
+                "imessage: sent %s",
+                " and ".join(
+                    part
+                    for part in (f"{len(images)} picture(s)" if images else "", "a message" if text else "")
+                    if part
+                )
+                or "nothing",
+            )
         except SendError as exc:
-            log.error("imessage: %s", exc)
+            log.error("imessage: could not send (%s)", exc)
         return refs
 
     async def edit(self, conversation: str, ref: str, text: str, buttons: Buttons | None = None) -> None:

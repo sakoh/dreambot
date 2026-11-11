@@ -63,6 +63,25 @@ on run argv
 end run
 """
 
+#: Asks Messages a harmless question. Its real purpose is to make macOS show the "may control
+#: Messages" prompt while the bot is being set up, instead of in the middle of its first reply.
+PROBE = """\
+try
+    tell application "Messages"
+        try
+            set signedIn to count of (accounts whose service type = iMessage)
+        on error
+            set signedIn to -1
+        end try
+        return "ok" & tab & signedIn
+    end tell
+on error errorMessage number errorNumber
+    return "fail" & tab & errorNumber & tab & errorMessage
+end try
+"""
+#: How long the permission prompt may sit on screen before the check gives up.
+PROBE_TIMEOUT = 600.0
+
 _EXPLANATIONS = {
     -1743: (
         "macOS has not allowed Dreambot to control Messages. Allow it in System Settings → Privacy & Security → "
@@ -88,8 +107,12 @@ class SendError(Exception):
 Runner = Callable[[list[str]], Awaitable[str]]
 
 
-async def run_osascript(arguments: list[str]) -> str:
-    """Run :data:`SCRIPT` with ``arguments`` and return what it printed."""
+async def _probe_messages() -> str:
+    return await run_osascript([], PROBE, PROBE_TIMEOUT)
+
+
+async def run_osascript(arguments: list[str], script: str = SCRIPT, timeout: float = SEND_TIMEOUT) -> str:
+    """Run an AppleScript (by default :data:`SCRIPT`) with ``arguments`` and return what it printed."""
     process = await asyncio.create_subprocess_exec(
         "/usr/bin/osascript",
         "-",
@@ -99,7 +122,7 @@ async def run_osascript(arguments: list[str]) -> str:
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(SCRIPT.encode()), SEND_TIMEOUT)
+        stdout, stderr = await asyncio.wait_for(process.communicate(script.encode()), timeout)
     except TimeoutError as exc:
         with contextlib.suppress(ProcessLookupError):
             process.kill()
@@ -119,13 +142,43 @@ class Sender:
         fallback_dir: Path = FALLBACK_STAGE_DIR,
         run: Runner = run_osascript,
         pause: float = 1.0,
+        probe: Callable[[], Awaitable[str]] | None = None,
     ):
         self.stage_dir = stage_dir
         self.fallback_dir = fallback_dir
         self._run = run
+        if probe is None and run is run_osascript:
+            probe = _probe_messages
+        #: Asks the real Messages app whether it may be controlled; absent when ``run`` is a stand-in.
+        self._probe = probe
         #: Seconds to wait after each attachment so consecutive images arrive in order.
         self.pause = pause
         self._lock = asyncio.Lock()
+
+    async def check(self) -> int | None:
+        """Make sure Messages may be controlled, prompting for the permission if it has to.
+
+        Returns how many iMessage accounts Messages is signed in to (-1 if it would not say),
+        or ``None`` when there is no real Messages app to ask. Raises :class:`SendError` with
+        what to do when permission is refused.
+        """
+        if self._probe is None:
+            return None
+        result = await self._probe()
+        parts = result.split("\t", 2)
+        if parts[0] == "ok":
+            try:
+                return int(parts[1])
+            except (IndexError, ValueError):
+                return -1
+        try:
+            code: int | None = int(parts[1])
+        except (IndexError, ValueError):
+            code = None
+        detail = parts[2] if len(parts) > 2 else result[:200]
+        raise SendError(
+            _EXPLANATIONS.get(code or 0, f"Messages cannot be controlled ({code}): {detail}"), code
+        )
 
     def stage(self, source: Path | str) -> Path:
         """Copy a file to where Messages can read it, under a name unique to this send."""

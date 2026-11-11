@@ -205,3 +205,25 @@ def test_service_restart_needs_a_running_service(home: Path, monkeypatch: pytest
     result = runner.invoke(cli.app, ["service", "restart"])
     assert result.exit_code == 1 and "not running" in said(result)
     assert not [call for call in cli._launchctl_for_test if call[0] == "kickstart"]
+
+
+def test_setup_imessage_points_at_the_service_when_one_is_running(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from dreambot.frontends.imessage import chatdb
+
+    monkeypatch.setattr(
+        chatdb.ChatDB, "open", lambda self: pytest.fail("the terminal's own access is beside the point")
+    )
+    monkeypatch.setattr(
+        launchd, "_launchctl", lambda *arguments: subprocess.CompletedProcess(arguments, 0, "", "")
+    )
+    result = runner.invoke(cli.app, ["setup", "imessage"], input="dedicated\n")
+    assert result.exit_code == 0, result.output
+    assert "iMessage enabled in dedicated mode" in said(result)
+    assert "The background service reads the Messages database" in said(result)
+    assert "The background service was restarted" in said(result)
+    assert tomllib.loads((home / "config.toml").read_text())["imessage"] == {
+        "enabled": True,
+        "mode": "dedicated",
+    }

@@ -509,6 +509,13 @@ def doctor() -> None:
         state = f"enabled ({config.imessage.mode} mode)"
         if readable:
             console.print(f"[green]✓[/green] iMessage: {state}, Messages database is readable")
+        elif launchd.is_loaded():
+            # This check runs in the terminal; the background service has permissions of its own.
+            console.print(
+                f"[yellow]![/yellow] iMessage: {state}; this terminal cannot read the Messages database, "
+                "but the background service may be allowed to"
+            )
+            console.print(f"  [dim]Its log says: {config.log_dir / 'dreambot.log'}[/dim]")
         else:
             ok = False
             console.print(f"[red]✗[/red] iMessage: {state}, cannot read the Messages database yet")
@@ -823,15 +830,28 @@ def _setup_imessage(config: Config) -> bool:
         return False
     _update_config(config, {"imessage": {"enabled": True, "mode": mode}})
     console.print(f"   [green]iMessage enabled in {mode} mode.[/green]")
-    try:
-        reader = ChatDB()
-        reader.open()
-        reader.close()
-        console.print("   [green]The Messages database is readable from this terminal.[/green]")
-    except ChatDBError as exc:
-        console.print(f"   [yellow]{exc}[/yellow]")
-    console.print(f"   For the background service, also give Full Disk Access to: {launchd.interpreter()}")
-    console.print("   The first reply makes macOS ask whether Dreambot may control Messages — choose Allow.")
+    if launchd.is_loaded():
+        # The service reads the database, not this terminal, so it is the service that needs access.
+        console.print(
+            "   The background service reads the Messages database. Give Full Disk Access to its Python"
+        )
+        console.print("   (System Settings → Privacy & Security → Full Disk Access → +, then ⌘⇧G and paste):")
+        console.print(f"   [bold]{launchd.interpreter()}[/bold]")
+        console.print(
+            "   Its log says whether that worked: `dreambot service status` shows where the log is."
+        )
+    else:
+        try:
+            reader = ChatDB()
+            reader.open()
+            reader.close()
+            console.print("   [green]The Messages database is readable from this terminal.[/green]")
+        except ChatDBError as exc:
+            console.print(f"   [yellow]{exc}[/yellow]")
+        console.print(
+            f"   For the background service, also give Full Disk Access to: {launchd.interpreter()}"
+        )
+    console.print("   When Dreambot starts, macOS asks whether it may control Messages — choose Allow.")
     if mode == "self":
         console.print(
             "   Then text [bold]your own phone number[/bold] from your iPhone: that thread is your Dreambot."
