@@ -16,9 +16,8 @@ No account, no subscription, no cloud. Prompts and images never leave the Mac ex
 app you choose to talk to it with.
 
 > **Status: early (0.1).** The core, the command line and the image pipeline are verified on real models,
-> and the Telegram and Discord bots have been used on the live services. **Next up: iMessage**, which is
-> complete and tested against a synthetic Messages database but has not yet been run against the Messages
-> app. See [what is verified](#what-is-verified).
+> and all three bots (Telegram, Discord and iMessage) have been used on the live services. Not every
+> button and command has been pressed on each of them yet. See [what is verified](#what-is-verified).
 
 ## Contents
 
@@ -341,7 +340,7 @@ idle_unload_seconds = 900
 | The other 46 models | class paths, arguments and defaults checked against mflux; **not run** (weights not installed during development) |
 | Telegram | **live**: pairing, prompts with the enhancer, grids with buttons, variations, `/describe` with a photo. The other actions: real library objects against a simulated API |
 | Discord | **live**: adding the bot to a server, `/pair`, `/imagine` with the enhancer, variation buttons. The other commands and buttons: the real command tree and views, with stand-ins for Discord's interactions and channels |
-| iMessage | a synthetic Messages database; the AppleScript compiles; **not run against Messages** |
+| iMessage | **live** (macOS 27, a dedicated Apple Account): reading the Messages database, pairing, prompts with the enhancer, typed shortcuts, `/describe` with a photo from an iPhone, sending pictures. Replies to a picture and tapbacks: a synthetic Messages database only (the first live run found and fixed a bug there) |
 
 `dreambot models list` marks verified models with ✓.
 
