@@ -319,6 +319,26 @@ class ChatDB:
             )
         return rows
 
+    def guids_of_attachment(self, transfer_name: str) -> list[str]:
+        """The guids of the messages carrying the attachment sent under this (unique) name.
+
+        Usually one. In a note-to-self thread there are two: the copy sent and the copy received.
+        """
+        try:
+            rows = self._connection.execute(
+                """
+                SELECT m.guid FROM attachment a
+                JOIN message_attachment_join j ON j.attachment_id = a.ROWID
+                JOIN message m ON m.ROWID = j.message_id
+                WHERE a.transfer_name = ?
+                ORDER BY m.ROWID
+                """,
+                (transfer_name,),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        return [row["guid"] for row in rows if row["guid"]]
+
     def _attachments(self, message_rowid: int) -> list[Attachment]:
         records = self._connection.execute(
             """

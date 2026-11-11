@@ -109,6 +109,9 @@ class IMessageFrontend(ChatFrontend):
         self._outgoing: deque[_Outgoing] = deque()
         self._staged: dict[str, float] = {}
         self._handled: deque[_Handled] = deque(maxlen=200)
+        #: Our own pictures seen in the database before the base class had tied them to a job:
+        #: staged name -> (chat guid, message guid).
+        self._seen_files: dict[str, tuple[str, str]] = {}
         #: The other party of each one-to-one chat, for addressing it when its id is not enough.
         self._partners: dict[str, str] = {}
         #: Addresses of this Mac's own account, learned from the database as messages flow.
@@ -223,6 +226,10 @@ class IMessageFrontend(ChatFrontend):
                     self.service.store.link_message(
                         self.name, f"{row.chat_guid}/{row.guid}", link.job, link.image
                     )
+                elif row.chat_guid:
+                    # Read back before the picture was tied to its job (Messages writes the row
+                    # while the send is still in progress): tie the two together when it is.
+                    self._seen_files[attachment.name] = (row.chat_guid, row.guid)
         if ours:
             return True
         if row.text:
@@ -325,6 +332,22 @@ class IMessageFrontend(ChatFrontend):
             )
         )
 
+    def _link(self, conversation: str, ref: str, job, image: int | None) -> None:
+        super()._link(conversation, ref, job, image)
+        if ref.startswith(FILE_REF):
+            seen = self._seen_files.pop(ref[len(FILE_REF) :], None)
+            if seen is not None:
+                self.service.store.link_message(self.name, f"{seen[0]}/{seen[1]}", job.id, image)
+
+    async def _guids_of_sent(self, name: str) -> list[str]:
+        """The ids Messages gave the picture just sent, which replies and tapbacks refer to."""
+        for _ in range(10):
+            guids = self.db.guids_of_attachment(name)
+            if guids:
+                return guids
+            await asyncio.sleep(0.2)
+        return []
+
     async def _collect(self, attachments: Sequence) -> list[str]:
         """Wait for incoming image files to finish downloading and return their paths."""
         paths: list[str] = []
@@ -364,9 +387,16 @@ class IMessageFrontend(ChatFrontend):
         try:
             # Pictures first, words after: the caption then sits underneath what it describes.
             for image in images:
-                name = await self.sender.send_file(conversation, partner, image)
-                self._staged[name] = time.monotonic()
-                refs.append(f"{FILE_REF}{name}")
+                staged = self.sender.stage(image)
+                # Registered before the send: Messages writes its row while the send is still
+                # running, and the row has to be recognised as ours whenever it is read.
+                self._staged[staged.name] = time.monotonic()
+                await self.sender.send_staged(conversation, partner, staged)
+                # A reply or a tapback names the message it is on, so the picture is recorded under
+                # the message ids Messages gave it. The file name is kept as well: a copy that
+                # shows up later (the received half of a note-to-self) is matched through it.
+                refs.append(f"{FILE_REF}{staged.name}")
+                refs.extend(await self._guids_of_sent(staged.name))
             if text:
                 self._outgoing.append(_Outgoing(conversation, _normalize_text(text), time.monotonic()))
                 await self.sender.send_text(conversation, partner, text)

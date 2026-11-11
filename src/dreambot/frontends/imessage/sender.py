@@ -233,10 +233,14 @@ class Sender:
         if text:
             await self._send(text, "", chat_guid, handle or "")
 
-    async def send_file(self, chat_guid: str, handle: str | None, path: Path | str) -> str:
-        """Send one file. Returns the name it was sent under, which identifies it in the database."""
-        staged = self.stage(path)
+    async def send_staged(self, chat_guid: str, handle: str | None, staged: Path) -> None:
+        """Send a file that :meth:`stage` has already put where Messages can read it."""
         await self._send("", str(staged), chat_guid, handle or "")
         if self.pause:
             await asyncio.sleep(self.pause)
+
+    async def send_file(self, chat_guid: str, handle: str | None, path: Path | str) -> str:
+        """Send one file. Returns the name it was sent under, which identifies it in the database."""
+        staged = self.stage(path)
+        await self.send_staged(chat_guid, handle, staged)
         return staged.name

@@ -78,6 +78,7 @@ class FakeMessages:
         self.self_chat_echo = self_chat_echo
         self.sent: list[tuple[str, str, str]] = []  # (chat guid, text, file name)
         self.fail_with: str | None = None
+        self.during_send = None
 
     # -- building blocks --------------------------------------------------------
 
@@ -171,6 +172,10 @@ class FakeMessages:
             self.insert(
                 chat_guid, text=text or None, sender=identifier, from_me=False, attachments=attachments
             )
+        if self.during_send is not None:
+            # The real app writes its row while the send is still running, and the poller,
+            # which never stops, reads it back before the send has returned.
+            await self.during_send()
         return "ok"
 
     def texts(self) -> list[str]:
@@ -760,3 +765,51 @@ async def test_the_log_says_what_arrived_but_not_what_it_said(
     assert "ignoring a message from someone who is not allowed" in caplog.text
     for private in ("private prompt", "fox", "is this the bot", FRIEND, STRANGER):
         assert private not in caplog.text, private
+
+
+async def test_a_picture_read_back_while_it_is_still_being_sent_stays_tied_to_its_image(dedicated: Phone):
+    """What the first run against the real Messages app got wrong.
+
+    Messages writes the row for a picture while the send is still in progress, and the poller
+    reads it back before the picture has been tied to its job. Every picture then lost its link,
+    and a reply or a tapback on it found nothing.
+    """
+    dedicated.messages.during_send = dedicated.front.poll_once
+    chat = dedicated.messages.chat(FRIEND)
+    dedicated.messages.insert(chat, text="a fox", sender=FRIEND)
+    await dedicated.settle()
+    job = dedicated.latest()
+    files = dedicated.messages.files()
+    assert len(files) == 4
+    for index, name in enumerate(files, start=1):
+        guid = dedicated.messages.guid_of_sent_file(name)
+        link = dedicated.service.store.find_message("imessage", f"{chat}/{guid}")
+        assert link is not None and (link.job, link.image) == (job.id, index), f"picture {index} is not tied"
+
+    third = dedicated.messages.guid_of_sent_file(files[2])
+    dedicated.messages.insert(chat, text="upscale", sender=FRIEND, reply_to=third)
+    await dedicated.settle()
+    upscaled = dedicated.latest()
+    assert upscaled.kind is JobKind.UPSCALE and (upscaled.parent, upscaled.parent_index) == (job.id, 3)
+
+    first = dedicated.messages.guid_of_sent_file(files[0])
+    dedicated.messages.insert(chat, sender=FRIEND, tapback=(2000, first))
+    await dedicated.settle()
+    assert dedicated.service.store.get_job(job.id).image(1).favorite
+
+
+def test_every_copy_of_a_sent_picture_is_found_by_its_name(tmp_path: Path):
+    fake = FakeMessages(tmp_path)
+    chat = fake.chat(ME)
+    picture = tmp_path / "p.png"
+    picture.write_bytes(b"x")
+    _, sent = fake.insert(chat, sender=ME, from_me=True, attachments=[(str(picture), "fox-1a2b3c4d.png")])
+    _, received = fake.insert(
+        chat, sender=ME, from_me=False, attachments=[(str(picture), "fox-1a2b3c4d.png")]
+    )
+    fake.insert(chat, sender=ME, from_me=True, attachments=[(str(picture), "other-99999999.png")])
+    reader = ChatDB(fake.path)
+    reader.open()
+    assert reader.guids_of_attachment("fox-1a2b3c4d.png") == [sent, received]
+    assert reader.guids_of_attachment("never-sent.png") == []
+    reader.close()
