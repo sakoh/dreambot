@@ -204,7 +204,12 @@ dreambot service install   # run in the background and at login
 
 The background service is a login item (a launchd agent): it starts when you log in, restarts if it
 crashes, and gives model memory back after 15 idle minutes. `dreambot service status`, `restart` and
-`uninstall` manage it, and `dreambot setup` restarts it for you when you change something.
+`uninstall` manage it, and `dreambot setup` restarts it for you when you change something. It writes to
+`~/Library/Logs/Dreambot/dreambot.log`.
+
+The bots answer only while the Mac is on, awake and logged in to your account: a login item does not run
+at the login window, and a sleeping Mac is not reachable. To keep a bot available, stop the Mac from
+sleeping (System Settings → Energy, or `caffeinate`).
 
 If your copy of Dreambot is inside Desktop, Documents or Downloads, the service runs from a copy that
 `service install` makes under `~/Library/Application Support/Dreambot/runtime`. macOS does not let a
