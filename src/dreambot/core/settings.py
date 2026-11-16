@@ -37,6 +37,10 @@ class UserSettings:
     hd: bool | None = None
     #: Whether a local language model adds art direction to prompts.
     enhance: bool | None = None
+    #: Whether every prompt uses the default Lookbooks, as if it ended in ``--p``.
+    personalize: bool | None = None
+    #: Ids of the Lookbooks a bare ``--p`` stands for.
+    looks: list[str] = field(default_factory=list)
     #: Text appended to every prompt (``/prefer suffix``).
     suffix: str = ""
     #: Named shortcuts for parameter text (``/prefer option set``), used as ``--name``.
@@ -67,6 +71,8 @@ class UserSettings:
             remix=pick(self.remix, defaults.remix),
             hd=pick(self.hd, defaults.hd),
             enhance=pick(self.enhance, auto_enhance() if defaults.enhance is None else defaults.enhance),
+            personalize=bool(self.personalize),
+            looks=tuple(self.looks),
             suffix=self.suffix,
             option_sets=dict(self.option_sets),
         )
@@ -82,6 +88,8 @@ class ResolvedSettings:
     remix: bool
     hd: bool
     enhance: bool = False
+    personalize: bool = False
+    looks: tuple[str, ...] = ()
     suffix: str = ""
     option_sets: dict[str, str] = field(default_factory=dict)
 

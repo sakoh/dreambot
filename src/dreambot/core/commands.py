@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from dreambot.core import imaging, render
+from dreambot.core import imaging, lookbook, render
 from dreambot.core.actions import Action, ActionKind, parse_action
 from dreambot.core.jobs import Job, JobImage, JobStatus
 from dreambot.core.params import PromptError, find_param, parse_ratio
@@ -384,7 +384,7 @@ class Commands:
             if lowered not in VARIATION_MODES:
                 raise DreambotError("Variation mode is `strong` or `subtle`.")
             settings.variation = lowered
-        elif key in ("remix", "raw", "hd", "enhance"):
+        elif key in ("remix", "raw", "hd", "enhance", "personalize"):
             setattr(settings, key, _on_off(lowered, key))
         elif key in ("count", "images"):
             if not lowered.isdigit() or not 1 <= int(lowered) <= 16:
@@ -416,6 +416,7 @@ class Commands:
             f"  remix       {on(resolved.remix)}",
             f"  hd          {on(resolved.hd)}",
             f"  enhance     {self._enhance_state(resolved)}",
+            f"  personalize {self._personalize_state(resolved)}",
             f"  count       {resolved.count} images per job",
         ]
         if resolved.suffix:
@@ -428,6 +429,63 @@ class Commands:
             f"`{slash}settings reset` restores the defaults."
         )
         return "\n".join(lines)
+
+    def _personalize_state(self, resolved) -> str:
+        """`on`/`off`, and which Lookbooks every prompt is then given."""
+        if not resolved.personalize:
+            return "off"
+        books = [book for book in map(self.service.store.get_lookbook, resolved.looks) if book]
+        names = ", ".join(lookbook.slug(book["name"]) for book in books if not book["deleted"])
+        return f"on — every prompt uses {names or 'your favourites (no default Lookbook is chosen)'}"
+
+    async def _cmd_looks(self, *, user, rest, slash, **_) -> list[Reply]:
+        """List the Lookbooks, or choose which ones a bare `--p` stands for."""
+        service = self.service
+        words = rest.replace(",", " ").split()
+        if words and words[0].lower() == "default":
+            names = words[1:]
+            if not names:
+                raise DreambotError(
+                    f"Say which: `{slash}looks default <name> [<name> ...]`, or `{slash}looks default none`."
+                )
+            chosen: list[str] = []
+            if [name.lower() for name in names] != ["none"]:
+                for name in names:
+                    book = service.find_lookbook(name)
+                    if book is None:
+                        raise DreambotError(f"I don't know a Lookbook called `{name}`.")
+                    chosen.append(book["id"])
+            service.set_default_lookbooks(user=user, lookbook_ids=chosen)
+        elif words:
+            raise DreambotError(
+                f"Send `{slash}looks` to list your Lookbooks, or `{slash}looks default <name>`."
+            )
+        books = service.lookbooks(user)
+        if not books:
+            return [
+                Reply(
+                    text=(
+                        "There are no Lookbooks yet. A Lookbook is a set of pictures that stands for a look. "
+                        "Reply to a picture with `look: <name>` to start one with it, or make one in the web "
+                        "app (`dreambot web` on the Mac)."
+                    )
+                )
+            ]
+        lines = ["Lookbooks (★ = used by a bare --p):"]
+        for book in books:
+            line = f"  {'★' if book['default'] else '·'} {book['slug']} — {book['count']} picture(s)"
+            if book["code"]:
+                line += f", code {book['code']}"
+            if book["style"]:
+                line += f"\n      {book['style']['summary']}"
+            lines.append(line)
+        lines.append(
+            f"\nUse one with `--p <name>`; several, each with an optional `::weight`, blend. `--stylize` sets "
+            f"how strongly. `{slash}looks default <name>` chooses what a bare `--p` means, and "
+            f"`{slash}settings personalize on` applies it to every prompt. Reply to a picture with "
+            "`look: <name>` to add it to a Lookbook."
+        )
+        return [Reply(text="\n".join(lines))]
 
     def _enhance_state(self, resolved) -> str:
         """`on`/`off`, and why it is not doing anything when it is on but cannot run."""

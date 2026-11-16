@@ -209,7 +209,8 @@ def request(brief: Brief) -> str:
     words = brief.words
     lines = [f"Prompt: {brief.text.strip()}", "", amount]
     for extra in (
-        _medium(brief.chaos),
+        # A style already names its medium; "every image is a photograph" would contradict it.
+        "" if brief.style else _medium(brief.chaos),
         _variety(brief.chaos, brief.count),
         _strangeness(brief.weird),
         _experiment(brief.exp),

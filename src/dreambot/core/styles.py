@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+from collections.abc import Sequence
 
 FRAMINGS = (
     "extreme close-up",
@@ -214,14 +215,16 @@ def direct(
     stylize: int = 100,
     raw: bool = False,
     style_codes: list[tuple[str, int]] | None = None,
+    style: Sequence[str] = (),
 ) -> str:
     """The prompt for image ``index`` (0-based) of a grid, with all emulated direction applied.
 
     ``seed`` is the job's base seed, so the direction is identical on a re-run. ``raw`` switches
-    off the stylize emphasis but keeps chaos, weird, exp and style codes: those are things the
-    person explicitly asked for.
+    off the stylize emphasis but keeps chaos, weird, exp and the style: those are things the
+    person explicitly asked for. ``style`` is the wording of a blended style fingerprint
+    (:mod:`dreambot.core.fingerprint`); ``style_codes`` are the original recipes (``--sv 1``).
     """
-    directions: list[str] = []
+    directions: list[str] = list(style)
     for code, weight in style_codes or []:
         directions.extend(style_recipe(code, weight))
     directions.extend(chaos_directions(chaos, seed, count)[index] if count else [])

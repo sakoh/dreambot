@@ -38,6 +38,8 @@ class ActionKind(StrEnum):
     PAN = "pan"
     SQUARE = "square"
     FAVORITE = "favorite"
+    #: Add the image to a Lookbook. ``prompt`` is the Lookbook's name.
+    LOOK = "look"
     INFO = "info"
     CANCEL = "cancel"
     ANIMATE = "animate"
@@ -99,6 +101,7 @@ _CODES = {
     ActionKind.PAN: "p",
     ActionKind.SQUARE: "sq",
     ActionKind.FAVORITE: "f",
+    ActionKind.LOOK: "lb",
     ActionKind.INFO: "i",
     ActionKind.CANCEL: "x",
     ActionKind.ANIMATE: "a",
@@ -166,10 +169,14 @@ _PATTERNS: list[tuple[re.Pattern[str], ActionKind]] = [
 #   region 2 B2-D4: a red balloon      (cells, then what to paint)
 #   region 2 the sky: an aurora        (a description, then what to paint)
 #   edit 2: make it night
+#   look 2: autumn diner               (add the image to that Lookbook)
+# They are matched against the text as typed, to keep a prompt's capitals, so they ignore case
+# themselves: a phone capitalises the first word, and "Edit: make it night" is still an edit.
 _REGION = re.compile(
-    rf"(?:region|vary\s+region)\s+(?:{_INDEX}\s+)?(?P<where>[^:]+?)\s*:\s*(?P<prompt>.+)", re.S
+    rf"(?:region|vary\s+region)\s+(?:{_INDEX}\s+)?(?P<where>[^:]+?)\s*:\s*(?P<prompt>.+)", re.S | re.I
 )
-_EDIT = re.compile(rf"edit\s*(?:{_INDEX})?\s*:\s*(?P<prompt>.+)", re.S)
+_EDIT = re.compile(rf"edit\s*(?:{_INDEX})?\s*:\s*(?P<prompt>.+)", re.S | re.I)
+_LOOK = re.compile(rf"(?:lookbook|look)\s*(?:{_INDEX})?\s*:\s*(?P<name>[^\n]+)", re.I)
 
 
 def parse_action(text: str) -> Action | None:
@@ -197,6 +204,9 @@ def parse_action(text: str) -> Action | None:
     if match := _EDIT.fullmatch(body):
         index = int(match.group("index")) if match.group("index") else None
         return Action(ActionKind.EDIT, index=index, prompt=match.group("prompt").strip())
+    if match := _LOOK.fullmatch(body):
+        index = int(match.group("index")) if match.group("index") else None
+        return Action(ActionKind.LOOK, index=index, prompt=match.group("name").strip())
 
     for pattern, kind in _PATTERNS:
         match = pattern.fullmatch(lowered)

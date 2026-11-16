@@ -66,6 +66,7 @@ COMMANDS = [
     ("edit", "Change an attached image by instruction"),
     ("shorten", "Suggest shorter versions of a prompt"),
     ("settings", "View or change your settings"),
+    ("looks", "Your Lookbooks: sets of pictures used with --p"),
     ("models", "List the installed models"),
     ("show", "Show a job again"),
     ("info", "Queue and usage"),

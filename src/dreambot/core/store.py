@@ -2,11 +2,16 @@
 
 Everything lives in one small SQLite file on the Mac. Calls are synchronous — each is a
 sub-millisecond local write — and guarded by a lock so background threads may use the store too.
+
+The schema only ever grows by whole tables, and nothing is added to the JSON of a job that an
+older build would trip over. So an older Dreambot can still open a database a newer one has
+used: it simply does not see the newer tables. That is why they do not raise ``SCHEMA_VERSION``.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -16,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dreambot.core.jobs import Job, JobStatus, new_job_id, normalize_job_id
+from dreambot.core.jobs import Job, JobImage, JobStatus, new_job_id, normalize_job_id
 
 SCHEMA_VERSION = 1
 
@@ -57,7 +62,58 @@ CREATE TABLE IF NOT EXISTS state (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
 );
+
+-- What has been worked out about a style, so that it is only ever worked out once: the
+-- fingerprint of an image (keyed by its contents) and the wording of a blend (keyed by its recipe).
+CREATE TABLE IF NOT EXISTS fingerprints (
+    key      TEXT PRIMARY KEY,
+    data     TEXT NOT NULL,
+    created  REAL NOT NULL
+);
+
+-- Styles a person keeps: ones they saved under a name (with the fingerprint in ``data``), and
+-- numeric style codes they liked (``data`` is NULL: a code decodes to its style by itself).
+CREATE TABLE IF NOT EXISTS styles (
+    user     TEXT NOT NULL,
+    code     TEXT NOT NULL,
+    name     TEXT NOT NULL DEFAULT '',
+    liked    INTEGER NOT NULL DEFAULT 0,
+    data     TEXT,
+    created  REAL NOT NULL,
+    PRIMARY KEY (user, code)
+);
+
+-- Lookbooks: named sets of pictures that stand for a look (see dreambot.core.lookbook).
+CREATE TABLE IF NOT EXISTS lookbooks (
+    id       TEXT PRIMARY KEY,
+    user     TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    created  REAL NOT NULL,
+    updated  REAL NOT NULL,
+    deleted  REAL
+);
+CREATE TABLE IF NOT EXISTS lookbook_images (
+    id       TEXT PRIMARY KEY,
+    lookbook TEXT NOT NULL,
+    path     TEXT NOT NULL,
+    key      TEXT NOT NULL,
+    source   TEXT NOT NULL DEFAULT '',
+    added    REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS lookbook_images_by_book ON lookbook_images (lookbook, added);
+-- Every state a Lookbook has been used in, frozen: a code outlives edits to its book, and the book.
+CREATE TABLE IF NOT EXISTS lookbook_codes (
+    code     TEXT PRIMARY KEY,
+    lookbook TEXT NOT NULL,
+    data     TEXT NOT NULL,
+    created  REAL NOT NULL
+);
 """
+
+
+def style_slug(name: str) -> str:
+    """A style's name as the one word it is typed as after ``--sref``."""
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
 
 
 @dataclass(frozen=True)
@@ -223,6 +279,201 @@ class Store:
                 (frontend, job),
             ).fetchall()
         return [(row["ref"], row["image"]) for row in rows]
+
+    # -------------------------------------------------------------------- styles ----
+
+    def get_fingerprint(self, key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute("SELECT data FROM fingerprints WHERE key = ?", (key,)).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def save_fingerprint(self, key: str, data: dict[str, Any]) -> None:
+        with self._lock:
+            self._db.execute(
+                """INSERT INTO fingerprints (key, data, created) VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET data = excluded.data""",
+                (key, json.dumps(data, ensure_ascii=False), time.time()),
+            )
+
+    def save_style(
+        self, user: str, code: str, *, name: str = "", data: dict[str, Any] | None = None, liked: bool = False
+    ) -> None:
+        with self._lock:
+            self._db.execute(
+                """INSERT INTO styles (user, code, name, liked, data, created) VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(user, code) DO UPDATE SET
+                       name = excluded.name, liked = excluded.liked, data = COALESCE(excluded.data, styles.data)""",
+                (
+                    user,
+                    code,
+                    name,
+                    int(liked),
+                    json.dumps(data, ensure_ascii=False) if data is not None else None,
+                    time.time(),
+                ),
+            )
+
+    @staticmethod
+    def _style(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "code": row["code"],
+            "name": row["name"],
+            "liked": bool(row["liked"]),
+            "data": json.loads(row["data"]) if row["data"] else None,
+            "created": row["created"],
+        }
+
+    def get_style(self, user: str, token: str) -> dict[str, Any] | None:
+        """A kept style by its code, or by its name written as one word ("dusty-noir").
+
+        A Dreambot belongs to one household: a style saved from the web app is meant to work from
+        iMessage too. So every allowed person can use a saved style, and ``user``'s own wins
+        when two share a name.
+        """
+        wanted = token.strip().lower()
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM styles WHERE data IS NOT NULL ORDER BY (user = ?) DESC, created DESC", (user,)
+            ).fetchall()
+        for row in rows:
+            if row["code"].lower() == wanted:
+                return self._style(row)
+        for row in rows:
+            if row["name"] and style_slug(row["name"]) == style_slug(wanted):
+                return self._style(row)
+        return None
+
+    def list_styles(
+        self, user: str, *, liked: bool | None = None, saved: bool | None = None
+    ) -> list[dict[str, Any]]:
+        """Newest first. ``saved`` selects named styles (True) or liked codes (False)."""
+        clauses, values = ["user = ?"], [user]
+        if liked is not None:
+            clauses.append("liked = ?")
+            values.append(int(liked))
+        if saved is not None:
+            clauses.append("data IS NOT NULL" if saved else "data IS NULL")
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT * FROM styles WHERE {' AND '.join(clauses)} ORDER BY created DESC, rowid DESC",
+                values,
+            ).fetchall()
+        return [self._style(row) for row in rows]
+
+    def delete_style(self, user: str, code: str) -> bool:
+        with self._lock:
+            done = self._db.execute("DELETE FROM styles WHERE user = ? AND code = ?", (user, code))
+        return done.rowcount > 0
+
+    # ----------------------------------------------------------------- lookbooks ----
+
+    @staticmethod
+    def _lookbook(row: sqlite3.Row) -> dict[str, Any]:
+        return {key: row[key] for key in ("id", "user", "name", "created", "updated", "deleted")}
+
+    def create_lookbook(self, lookbook_id: str, user: str, name: str) -> dict[str, Any]:
+        now = time.time()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO lookbooks (id, user, name, created, updated) VALUES (?, ?, ?, ?, ?)",
+                (lookbook_id, user, name, now, now),
+            )
+        return {
+            "id": lookbook_id,
+            "user": user,
+            "name": name,
+            "created": now,
+            "updated": now,
+            "deleted": None,
+        }
+
+    def get_lookbook(self, lookbook_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM lookbooks WHERE id = ?", (lookbook_id,)).fetchone()
+        return self._lookbook(row) if row else None
+
+    def list_lookbooks(self) -> list[dict[str, Any]]:
+        """Every Lookbook that has not been deleted, most recently changed first."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM lookbooks WHERE deleted IS NULL ORDER BY updated DESC, rowid DESC"
+            ).fetchall()
+        return [self._lookbook(row) for row in rows]
+
+    def update_lookbook(self, lookbook_id: str, *, name: str | None = None, deleted: bool = False) -> None:
+        now = time.time()
+        with self._lock:
+            if name is not None:
+                self._db.execute(
+                    "UPDATE lookbooks SET name = ?, updated = ? WHERE id = ?", (name, now, lookbook_id)
+                )
+            if deleted:
+                self._db.execute("UPDATE lookbooks SET deleted = ? WHERE id = ?", (now, lookbook_id))
+
+    def add_lookbook_image(
+        self, image_id: str, lookbook_id: str, path: str, key: str, source: str = ""
+    ) -> None:
+        now = time.time()
+        with self._transaction() as db:
+            db.execute(
+                "INSERT INTO lookbook_images (id, lookbook, path, key, source, added) VALUES (?, ?, ?, ?, ?, ?)",
+                (image_id, lookbook_id, path, key, source, now),
+            )
+            db.execute("UPDATE lookbooks SET updated = ? WHERE id = ?", (now, lookbook_id))
+
+    def remove_lookbook_image(self, lookbook_id: str, image_id: str) -> bool:
+        with self._transaction() as db:
+            done = db.execute(
+                "DELETE FROM lookbook_images WHERE lookbook = ? AND id = ?", (lookbook_id, image_id)
+            )
+            if done.rowcount:
+                db.execute("UPDATE lookbooks SET updated = ? WHERE id = ?", (time.time(), lookbook_id))
+        return done.rowcount > 0
+
+    def lookbook_images(self, lookbook_id: str) -> list[dict[str, Any]]:
+        """Oldest first: the order the pictures were added in."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, path, key, source, added FROM lookbook_images WHERE lookbook = ? ORDER BY added, rowid",
+                (lookbook_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_lookbook_code(self, code: str, lookbook_id: str, data: dict[str, Any]) -> None:
+        """Record a version of a Lookbook. A code never changes what it stands for."""
+        with self._lock:
+            self._db.execute(
+                "INSERT OR IGNORE INTO lookbook_codes (code, lookbook, data, created) VALUES (?, ?, ?, ?)",
+                (code, lookbook_id, json.dumps(data, ensure_ascii=False), time.time()),
+            )
+
+    def get_lookbook_code(self, code: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT code, lookbook, data, created FROM lookbook_codes WHERE code = ?", (code.lower(),)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "code": row["code"],
+            "lookbook": row["lookbook"],
+            "created": row["created"],
+            **json.loads(row["data"]),
+        }
+
+    def favorite_images(self, limit: int = 24) -> list[tuple[Job, JobImage]]:
+        """The pictures people have favourited, newest first."""
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT data FROM jobs WHERE status = ? AND data LIKE '%"favorite": true%'
+                   ORDER BY created DESC, rowid DESC LIMIT ?""",
+                (JobStatus.DONE.value, limit * 4),
+            ).fetchall()
+        found: list[tuple[Job, JobImage]] = []
+        for row in rows:
+            job = Job.from_dict(json.loads(row["data"]))
+            found.extend((job, image) for image in job.images if image.favorite)
+        return found[:limit]
 
     # --------------------------------------------------------------------- state ----
 

@@ -152,6 +152,7 @@ With one image picked (add its number when replying to a grid):
   region B2-D4: a red balloon     repaint part of it (send `region` alone to see the cells)
   region the sky: an aurora       ...or describe the part instead
   edit: make it night       change it by instruction
+  look: autumn diner        add it to that Lookbook (a set of pictures used with --p)
   fav · info · cancel"""
 
 
@@ -171,13 +172,14 @@ Short prompts are art-directed for you (a different shot for each image); --raw 
 
 Attach an image to use it as an image prompt, or steer with it:
   --edit (change it by instruction) · --oref (keep this person/object) · --sref (borrow its style)
+Styles blend: --sref takes several images, style codes and saved styles, each with an optional ::weight.
 
 {TEXT_SHORTCUTS}
 
 Commands:
   {slash}imagine <prompt>     {slash}describe (with an image)     {slash}blend (with 2–5 images)
   {slash}shorten <prompt>     {slash}edit (with an image)         {slash}models
-  {slash}settings             {slash}prefer suffix|option ...
+  {slash}settings             {slash}prefer suffix|option ...       {slash}looks
   {slash}info                 {slash}show <job id>                 {slash}params
   {slash}cancel               {slash}help"""
 
