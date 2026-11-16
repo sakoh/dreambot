@@ -15,6 +15,11 @@ you:       zoom 2x · pan left · region the sky: an aurora · edit: make it nig
 No account, no subscription, no cloud. Prompts and images never leave the Mac except through the chat
 app you choose to talk to it with.
 
+![The web app's Create page: a prompt bar above a feed of image grids, each with its prompt, parameters and style](docs/screenshots/create.jpg)
+
+*The [web app](#web-app). From the top: a style code, two style references blended one to two, a
+Lookbook, and a plain prompt.*
+
 > **Status: early (0.1).** The core, the command line and the image pipeline are verified on real models,
 > and all three bots (Telegram, Discord and iMessage) have been used on the live services. Not every
 > button and command has been pressed on each of them yet. The web app has been driven end to end in
@@ -212,11 +217,18 @@ another one: on a model that cannot take reference images it is applied in words
 styles. They are shareable between Dreambot users and mean nothing to Midjourney. The web app's Styles
 page lets you browse, search ("anime pastel", "film grain"), like and try them.
 
+![The blend bench: three ingredients with weight sliders on the left, and on the right the colours and description the blend comes to](docs/screenshots/blend.jpg)
+
+*The web app's blend bench: a style code, a picture and a Lookbook at 22, 56 and 22%, and what the
+blend comes to, before anything is rendered.*
+
 ### Lookbooks
 
 A Lookbook is a named set of pictures that stands for a look — Midjourney's moodboard. Make one in the
 web app (upload, paste a link, or pick from your own images), or from a chat by replying to a picture
 with `look: autumn diner`.
+
+![A Lookbook open in the web app: its four pictures, and beside them the palette, medium, light and mood Dreambot reads in them](docs/screenshots/lookbook.jpg)
 
 ```
 a harbour at dawn --p autumn-diner                that Lookbook
@@ -286,6 +298,13 @@ Midjourney's website, for one Mac: <http://127.0.0.1:7373/>.
 | **Organize** | Every image, to search and to filter by liked, model, kind of job, Lookbook, folder and day. Select many (shift-click for a range) to like, trash, file or download as a zip. Trash only hides. |
 | **Lookbooks** | Make, fill, rename and delete Lookbooks; choose your defaults; see what Dreambot reads in a book. |
 | **Styles** | Explore style codes (shuffle, search, like, the styles one step away, try one on your latest prompt), your saved styles, and the **blend bench**: put codes, pictures and Lookbooks together, set their weights, read what the blend comes to before anything is rendered, then try it or save it under a name. |
+
+| | |
+| --- | --- |
+| ![The prompt bar with two style references, each with a weight, and the settings panel open](docs/screenshots/prompt-bar.jpg) | ![The lightbox: one image large, with its style and every action beside it](docs/screenshots/lightbox.jpg) |
+| The prompt bar, with two weighted style references and the settings open | The lightbox |
+| ![Organize: a gallery with three images selected, and filters, folders and a timeline on the left](docs/screenshots/organize.jpg) | ![Styles: a grid of style cards, each a palette with a name, a code and a description](docs/screenshots/styles.jpg) |
+| Organize, with three images selected | Styles, searched for "watercolor" |
 
 Pictures made from iMessage, Discord and Telegram appear in it too: there is one database. When the
 background service hosts the web app they appear as they are made; a separate `dreambot web` shows them
