@@ -131,7 +131,10 @@ async def _imagine(prompt: str, attachments: list[str], show: bool, verbose: boo
             if event.type is EventType.LOADING:
                 progress.update(task, description=f"#{job.id} loading {job.model}")
             elif event.type is EventType.THINKING:
-                progress.update(task, description=f"#{job.id} art-directing")
+                styled = job.params.get("sref") or job.params.get("personalize") or job.detail.get("style")
+                progress.update(
+                    task, description=f"#{job.id} {'working out the look' if styled else 'art-directing'}"
+                )
             elif event.type in (EventType.STARTED, EventType.PROGRESS):
                 progress.update(task, description=f"#{job.id} {job.model}", completed=event.fraction)
             elif event.type in (EventType.FINISHED, EventType.FAILED, EventType.CANCELLED):

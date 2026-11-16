@@ -65,7 +65,10 @@ def failure_text(job: Job) -> str:
 def progress_text(job: Job, fraction: float, *, loading: bool = False, thinking: bool = False) -> str:
     title = job_title(job, 120)
     if thinking:
-        return f"Art-directing… — {title}"
+        # With a style reference or a Lookbook, the vision model reads the pictures before any
+        # art direction is written: "working out the look" is true of both.
+        styled = job.params.get("sref") or job.params.get("personalize") or job.detail.get("style")
+        return f"{'Working out the look' if styled else 'Art-directing'}… — {title}"
     if loading:
         return f"Loading {job.model}… — {title}"
     return f"{round(fraction * 100)}% — {title}"
