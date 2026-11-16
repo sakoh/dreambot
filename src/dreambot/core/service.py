@@ -550,6 +550,29 @@ class Dreambot:
             sources.append(StyleSource("image", "image", ref.weight, print=print_, pictures=[path], key=key))
         return sources
 
+    def style_of(self, path: str | Path) -> tuple[str, StyleFingerprint]:
+        """A picture's content key and what is known about its style so far."""
+        key = fingerprint.image_key(path)
+        return key, self._print_of(path, key)
+
+    def study_picture(self, path: str | Path) -> bool:
+        """Have the vision model read a picture's style when the GPU is next free.
+
+        Returns whether there is anything to wait for.
+        """
+        key, known = self.style_of(path)
+        if known.worded or self.catalog.vision_model() is None:
+            return False
+
+        async def read() -> None:
+            now = self.store.get_fingerprint(key)
+            if not (now and now.get("medium")) and Path(path).is_file():
+                await self._read_style(str(path), key, self._print_of(path, key))
+
+        self._chores.append(read)
+        self._wake.set()
+        return True
+
     def _print_of(self, path: str | Path, key: str) -> StyleFingerprint:
         """What is known about a picture's style: its measured colours, and its words once read."""
         known = self.store.get_fingerprint(key)
@@ -750,13 +773,13 @@ class Dreambot:
             "updated": book["updated"],
             "default": bool(user and book["id"] in self.settings(user).looks),
             "unread": sum(1 for member in members if not member.print.worded),
-            "style": _style_card(blend),
+            "style": style_card(blend),
             "images": [
                 {
                     "id": image["id"],
                     "path": image["path"],
                     "source": image["source"],
-                    "style": _style_card(prints.get(image["key"])),
+                    "style": style_card(prints.get(image["key"])),
                 }
                 for image in images
             ],
@@ -1585,7 +1608,7 @@ def _explain(error: EngineError) -> str:
     return str(error)
 
 
-def _style_card(print_: StyleFingerprint | None) -> dict[str, Any] | None:
+def style_card(print_: StyleFingerprint | None) -> dict[str, Any] | None:
     """A fingerprint as frontends show it."""
     if print_ is None or print_.empty:
         return None

@@ -522,6 +522,12 @@ def doctor() -> None:
             console.print(f"  [dim]{problem}[/dim]")
         console.print(f"  [dim]For iMessage, grant Full Disk Access to: {launchd.interpreter()}[/dim]")
         console.print("  [dim](and to your terminal app when you run `dreambot run` by hand)[/dim]")
+    if config.web.enabled:
+        console.print(
+            f"[green]✓[/green] Web app: on, at http://127.0.0.1:{config.web.port}/ whenever Dreambot runs"
+        )
+    else:
+        console.print("[dim]·[/dim] Web app: off — `dreambot web` opens it, `dreambot setup web` keeps it on")
     service = launchd.status()
     console.print(
         "[dim]· Background service: "
@@ -555,9 +561,12 @@ def run(
     imessage: Annotated[
         bool | None, typer.Option("--imessage/--no-imessage", help="Override the config for this run.")
     ] = None,
+    web: Annotated[
+        bool | None, typer.Option("--web/--no-web", help="Override the config for this run.")
+    ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
-    """Start the bot: serve iMessage, Discord and Telegram (whichever are set up)."""
+    """Start the bot: serve iMessage, Discord, Telegram and the web app (whichever are set up)."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -571,10 +580,11 @@ def run(
         "telegram": config.telegram.enabled if telegram is None else telegram,
         "discord": config.discord.enabled if discord is None else discord,
         "imessage": config.imessage.enabled if imessage is None else imessage,
+        "web": config.web.enabled if web is None else web,
     }
     if not any(want.values()):
         console.print("No chat frontend is enabled yet. Run [bold]dreambot setup[/bold] to connect one,")
-        console.print("or try it right here with [bold]dreambot chat[/bold].")
+        console.print("or try it right here with [bold]dreambot chat[/bold] or [bold]dreambot web[/bold].")
         raise typer.Exit(0)
     code = asyncio.run(_run(config, want, verbose))
     raise typer.Exit(code)
@@ -622,16 +632,27 @@ async def _run(config: Config, want: dict[str, bool], verbose: bool) -> int:
             from dreambot.frontends.imessage.bot import IMessageFrontend
 
             await _start(IMessageFrontend(service), started, log)
+        site = None
+        if want.get("web"):
+            from dreambot.frontends.web.server import WebFrontend, clean_cache
+
+            clean_cache(config.home)
+            site = WebFrontend(service)
+            await _start(site, started, log)
 
         if not started:
             log.error("No frontend could be started.")
             return 1
-        if not service.access.has_owner and not (len(started) == 1 and started[0].name == "imessage"):
+        # The web app answers this Mac only and is its owner's: it is the chat apps that need claiming.
+        chats = [front for front in started if front.name != "web"]
+        if chats and not service.access.has_owner and not (len(chats) == 1 and chats[0].name == "imessage"):
             code = service.access.new_pairing_code()
             console.print(
                 f"\nNobody owns this Dreambot yet. Send this to the bot to claim it:  [bold]/pair {code}[/bold]\n"
             )
         log.info("Dreambot is running: %s. Press Ctrl-C to stop.", ", ".join(front.name for front in started))
+        if site is not None and site in started:
+            log.info("The web app is at %s", site.url)
 
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -652,6 +673,79 @@ async def _start(front, started: list, log: logging.Logger) -> None:
         log.error("Could not start %s: %s", front.name, exc)
         return
     started.append(front)
+
+
+@app.command()
+def web(
+    port: Annotated[
+        int | None, typer.Option("--port", help="Listen on this port instead of the configured one.")
+    ] = None,
+    show: Annotated[bool, typer.Option("--open/--no-open", help="Open it in your browser.")] = True,
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+) -> None:
+    """Open the web app: create, organise, Lookbooks and styles, in your browser."""
+    _logging(verbose)
+    config = _config()
+    from dreambot import launchd
+
+    address = f"http://127.0.0.1:{port or config.web.port}/"
+    if launchd.is_loaded() and config.web.enabled and port is None:
+        # The background service is already serving it, with the chat bots' jobs in its feed.
+        console.print(f"The background service is hosting the web app: [bold]{address}[/bold]")
+        if show:
+            import webbrowser
+
+            webbrowser.open(address)
+        raise typer.Exit(0)
+    if launchd.is_loaded():
+        console.print(
+            "[dim]The background service is running without the web app. `dreambot setup web` has it "
+            "host this too, so that pictures made in the chat apps appear here as they are made.[/dim]"
+        )
+    with contextlib.suppress(KeyboardInterrupt):
+        code = asyncio.run(_web(config, port, show, verbose))
+        raise typer.Exit(code)
+
+
+async def _web(config: Config, port: int | None, show: bool, verbose: bool) -> int:
+    import signal
+
+    from dreambot.core.service import Dreambot
+    from dreambot.engine.client import Engine
+    from dreambot.frontends.web.server import WebFrontend, clean_cache
+
+    worker_log = None if verbose else _quiet_worker_log(config)
+    engine = Engine(
+        backend=config.engine.backend,
+        idle_timeout=config.engine.idle_unload_seconds or None,
+        stderr=worker_log,
+        env=(
+            {"DREAMBOT_MEMORY_BUDGET_GB": str(config.engine.memory_budget_gb)}
+            if config.engine.memory_budget_gb
+            else None
+        ),
+    )
+    clean_cache(config.home)
+    async with Dreambot(config, engine=engine) as service:
+        site = WebFrontend(service, port=port)
+        try:
+            await site.start()
+        except RuntimeError as exc:
+            err.print(f"[red]The web app could not start: {exc}[/red]")
+            return 1
+        console.print(f"Dreambot's web app is at [bold]{site.url}[/bold]  (Ctrl-C to stop)")
+        if show:
+            import webbrowser
+
+            webbrowser.open(site.url)
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(signum, stop.set)
+        await stop.wait()
+        console.print("Stopping…")
+        await site.stop()
+    return 0
 
 
 # --------------------------------------------------------------------------------------
@@ -889,16 +983,48 @@ def _setup_imessage(config: Config) -> bool:
     return True
 
 
-_SETUP_STEPS = {"telegram": _setup_telegram, "discord": _setup_discord, "imessage": _setup_imessage}
+def _setup_web(config: Config) -> bool:
+    """Returns whether anything was changed."""
+    address = f"http://127.0.0.1:{config.web.port}/"
+    console.print("[bold]Web app[/bold]")
+    console.print(
+        "   Midjourney's website for this Mac: create, organise, Lookbooks and styles in a browser."
+    )
+    console.print("   It answers this Mac only, and `dreambot web` opens it without any setup.")
+    if config.web.enabled:
+        console.print(
+            f"   [green]It is on:[/green] {address} whenever Dreambot runs. Type `off` to switch it off."
+        )
+        question = "   Keep it on? (Enter to keep, `off` to switch off)"
+    else:
+        question = "   Have `dreambot run` and the background service host it too? (yes to switch on)"
+    answer = typer.prompt(question, default="", show_default=False).strip().lower()
+    if answer in ("y", "yes", "on") and not config.web.enabled:
+        _update_config(config, {"web": {"enabled": True}})
+        console.print(f"   [green]Switched on.[/green] Once Dreambot is running, open {address}")
+        return True
+    if answer in ("n", "no", "off") and config.web.enabled:
+        _update_config(config, {"web": {"enabled": False}})
+        console.print("   [green]Switched off.[/green] `dreambot web` still opens it when you want it.")
+        return True
+    return False
+
+
+_SETUP_STEPS = {
+    "telegram": _setup_telegram,
+    "discord": _setup_discord,
+    "imessage": _setup_imessage,
+    "web": _setup_web,
+}
 
 
 @app.command()
 def setup(
     frontend: Annotated[
-        str | None, typer.Argument(help="Set up just one: telegram, discord or imessage.")
+        str | None, typer.Argument(help="Set up just one: telegram, discord, imessage or web.")
     ] = None,
 ) -> None:
-    """Connect Dreambot to Telegram, Discord and iMessage, step by step."""
+    """Connect Dreambot to Telegram, Discord, iMessage and the web app, step by step."""
     config = _config()
     chosen = frontend.lower() if frontend else None
     if chosen is not None and chosen not in _SETUP_STEPS:

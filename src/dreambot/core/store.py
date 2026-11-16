@@ -15,7 +15,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -107,6 +107,36 @@ CREATE TABLE IF NOT EXISTS lookbook_codes (
     lookbook TEXT NOT NULL,
     data     TEXT NOT NULL,
     created  REAL NOT NULL
+);
+
+-- The web app's library of pictures a person has uploaded to use in prompts.
+CREATE TABLE IF NOT EXISTS uploads (
+    id       TEXT PRIMARY KEY,
+    user     TEXT NOT NULL,
+    path     TEXT NOT NULL,
+    key      TEXT NOT NULL,
+    name     TEXT NOT NULL DEFAULT '',
+    created  REAL NOT NULL
+);
+-- Images put aside in the gallery. Nothing is deleted: a trashed image is only hidden.
+CREATE TABLE IF NOT EXISTS trash (
+    job      TEXT NOT NULL,
+    image    INTEGER NOT NULL,
+    created  REAL NOT NULL,
+    PRIMARY KEY (job, image)
+);
+CREATE TABLE IF NOT EXISTS folders (
+    id       TEXT PRIMARY KEY,
+    user     TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    created  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS folder_items (
+    folder   TEXT NOT NULL,
+    job      TEXT NOT NULL,
+    image    INTEGER NOT NULL,
+    added    REAL NOT NULL,
+    PRIMARY KEY (folder, job, image)
 );
 """
 
@@ -474,6 +504,161 @@ class Store:
             job = Job.from_dict(json.loads(row["data"]))
             found.extend((job, image) for image in job.images if image.favorite)
         return found[:limit]
+
+    # ------------------------------------------------------------------- gallery ----
+
+    def jobs_page(
+        self,
+        *,
+        before: float | None = None,
+        limit: int = 40,
+        search: str | None = None,
+        ids: Sequence[str] | None = None,
+    ) -> list[Job]:
+        """Jobs for a gallery, newest first: those created before ``before``, matching ``search``.
+
+        ``search`` is words that must all appear in the prompt, in any order.
+        """
+        clauses: list[str] = []
+        values: list[Any] = []
+        if before is not None:
+            clauses.append("created < ?")
+            values.append(before)
+        for word in (search or "").split():
+            clauses.append("json_extract(data, '$.prompt') LIKE ? ESCAPE '\\'")
+            escaped = word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            values.append(f"%{escaped}%")
+        if ids is not None:
+            if not ids:
+                return []
+            clauses.append(f"id IN ({', '.join('?' * len(ids))})")
+            values.extend(ids)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT data FROM jobs {where} ORDER BY created DESC, rowid DESC LIMIT ?", (*values, limit)
+            ).fetchall()
+        return [Job.from_dict(json.loads(row["data"])) for row in rows]
+
+    def job_days(self) -> list[tuple[str, int]]:
+        """(day, number of jobs) for every day something was made, newest first — a gallery's timeline."""
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT date(created, 'unixepoch', 'localtime') AS day, COUNT(*) AS n FROM jobs
+                   WHERE status = ? GROUP BY day ORDER BY day DESC""",
+                (JobStatus.DONE.value,),
+            ).fetchall()
+        return [(row["day"], row["n"]) for row in rows]
+
+    def children_of(self, job_id: str) -> list[Job]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT data FROM jobs WHERE parent = ? ORDER BY created", (normalize_job_id(job_id),)
+            ).fetchall()
+        return [Job.from_dict(json.loads(row["data"])) for row in rows]
+
+    def set_trashed(self, items: Sequence[tuple[str, int]], trashed: bool) -> None:
+        now = time.time()
+        with self._transaction() as db:
+            for job, image in items:
+                if trashed:
+                    db.execute(
+                        "INSERT OR IGNORE INTO trash (job, image, created) VALUES (?, ?, ?)",
+                        (job, image, now),
+                    )
+                else:
+                    db.execute("DELETE FROM trash WHERE job = ? AND image = ?", (job, image))
+
+    def trashed(self) -> set[tuple[str, int]]:
+        with self._lock:
+            return {(row["job"], row["image"]) for row in self._db.execute("SELECT job, image FROM trash")}
+
+    def add_upload(self, upload_id: str, user: str, path: str, key: str, name: str = "") -> dict[str, Any]:
+        now = time.time()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO uploads (id, user, path, key, name, created) VALUES (?, ?, ?, ?, ?, ?)",
+                (upload_id, user, path, key, name, now),
+            )
+        return {"id": upload_id, "path": path, "key": key, "name": name, "created": now}
+
+    def get_upload(self, upload_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT id, path, key, name, created FROM uploads WHERE id = ?", (upload_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def find_upload(self, key: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._db.execute(
+                "SELECT id, path, key, name, created FROM uploads WHERE key = ?", (key,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_uploads(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, path, key, name, created FROM uploads ORDER BY created DESC, rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete_upload(self, upload_id: str) -> bool:
+        with self._lock:
+            return self._db.execute("DELETE FROM uploads WHERE id = ?", (upload_id,)).rowcount > 0
+
+    def create_folder(self, folder_id: str, user: str, name: str) -> dict[str, Any]:
+        now = time.time()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO folders (id, user, name, created) VALUES (?, ?, ?, ?)",
+                (folder_id, user, name, now),
+            )
+        return {"id": folder_id, "name": name, "created": now, "count": 0}
+
+    def list_folders(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute(
+                """SELECT f.id, f.name, f.created, COUNT(i.job) AS count FROM folders f
+                   LEFT JOIN folder_items i ON i.folder = f.id GROUP BY f.id ORDER BY f.name COLLATE NOCASE"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def rename_folder(self, folder_id: str, name: str) -> bool:
+        with self._lock:
+            return (
+                self._db.execute("UPDATE folders SET name = ? WHERE id = ?", (name, folder_id)).rowcount > 0
+            )
+
+    def delete_folder(self, folder_id: str) -> bool:
+        with self._transaction() as db:
+            db.execute("DELETE FROM folder_items WHERE folder = ?", (folder_id,))
+            return db.execute("DELETE FROM folders WHERE id = ?", (folder_id,)).rowcount > 0
+
+    def set_in_folder(self, folder_id: str, items: Sequence[tuple[str, int]], present: bool) -> None:
+        now = time.time()
+        with self._transaction() as db:
+            for job, image in items:
+                if present:
+                    db.execute(
+                        "INSERT OR IGNORE INTO folder_items (folder, job, image, added) VALUES (?, ?, ?, ?)",
+                        (folder_id, job, image, now),
+                    )
+                else:
+                    db.execute(
+                        "DELETE FROM folder_items WHERE folder = ? AND job = ? AND image = ?",
+                        (folder_id, job, image),
+                    )
+
+    def folder_items(self, folder_id: str | None = None) -> dict[tuple[str, int], list[str]]:
+        """Which folders each image is in. With ``folder_id``, only that folder's images."""
+        where, values = ("WHERE folder = ?", (folder_id,)) if folder_id else ("", ())
+        found: dict[tuple[str, int], list[str]] = {}
+        with self._lock:
+            for row in self._db.execute(f"SELECT folder, job, image FROM folder_items {where}", values):
+                found.setdefault((row["job"], row["image"]), []).append(row["folder"])
+        return found
 
     # --------------------------------------------------------------------- state ----
 

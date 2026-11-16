@@ -188,6 +188,17 @@ class IMessageConfig(_Section):
     poll_seconds: float = Field(default=1.0, gt=0)
 
 
+class WebConfig(_Section):
+    """The web app: Midjourney's website, for this Mac only."""
+
+    enabled: bool = False
+    #: The address to listen on. Leave it on this Mac: the web app has no accounts.
+    host: str = "127.0.0.1"
+    port: int = Field(default=7373, ge=1024, le=65535)
+    #: The largest picture, in megabytes, that can be uploaded.
+    max_upload_mb: int = Field(default=25, ge=1, le=200)
+
+
 class Config(_Section):
     home: Path = Field(default_factory=default_home)
     output_dir: Path = Field(default_factory=default_output_dir)
@@ -200,6 +211,7 @@ class Config(_Section):
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     imessage: IMessageConfig = Field(default_factory=IMessageConfig)
+    web: WebConfig = Field(default_factory=WebConfig)
 
     @property
     def config_path(self) -> Path:

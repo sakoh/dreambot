@@ -105,7 +105,7 @@ def test_an_unreachable_telegram_does_not_block_setup_or_leak_the_token(
 
 def test_setup_knows_its_frontends(home: Path):
     result = runner.invoke(cli.app, ["setup", "whatsapp"])
-    assert result.exit_code == 2 and "telegram, discord, imessage" in said(result)
+    assert result.exit_code == 2 and "telegram, discord, imessage, web" in said(result)
 
 
 def test_setup_skips_everything_on_enter_and_never_opens_messages(
@@ -117,10 +117,10 @@ def test_setup_skips_everything_on_enter_and_never_opens_messages(
         raise AssertionError("the Messages database was opened")
 
     monkeypatch.setattr(chatdb.ChatDB, "open", forbidden)
-    result = runner.invoke(cli.app, ["setup"], input="\n\n\n")
+    result = runner.invoke(cli.app, ["setup"], input="\n\n\n\n")
     assert result.exit_code == 0, result.output
     assert not (home / "config.toml").exists()
-    for heading in ("Telegram", "Discord", "iMessage", "Start it"):
+    for heading in ("Telegram", "Discord", "iMessage", "Web app", "Start it"):
         assert heading in said(result)
 
 
@@ -305,3 +305,16 @@ def test_a_restart_waits_for_running_jobs_unless_told_not_to(home: Path, monkeyp
     result = runner.invoke(cli.app, ["service", "restart"])
     assert "restarting anyway" in said(result) and "Restarted." in said(result)
     store.close()
+
+
+def test_setup_web_switches_the_web_app_on_and_off(home: Path):
+    result = runner.invoke(cli.app, ["setup", "web"], input="\n")
+    assert result.exit_code == 0 and not (home / "config.toml").exists(), "Enter changes nothing"
+    result = runner.invoke(cli.app, ["setup", "web"], input="yes\n")
+    assert "Switched on" in said(result) and "http://127.0.0.1:7373/" in said(result)
+    assert "enabled = true" in (home / "config.toml").read_text()
+    result = runner.invoke(cli.app, ["setup", "web"], input="\n")
+    assert "It is on" in said(result) and "enabled = true" in (home / "config.toml").read_text()
+    result = runner.invoke(cli.app, ["setup", "web"], input="off\n")
+    assert "Switched off" in said(result) and "enabled = false" in (home / "config.toml").read_text()
+    assert "Web app: off" in said(runner.invoke(cli.app, ["doctor"]))

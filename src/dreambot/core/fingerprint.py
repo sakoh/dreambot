@@ -753,7 +753,8 @@ def from_code(code: int | str) -> StyleFingerprint:
         mood=_MOODS[mood],
         swatches=swatches,
         tone=_tone_from_swatches(swatches),
-        name=f"{short} {media[medium][1]}",
+        # Mood, palette, medium: three words that tell most styles apart at a glance.
+        name=f"{_MOODS[mood].split()[0].title()} {short} {media[medium][1]}",
     )
 
 
