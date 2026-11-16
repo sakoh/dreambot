@@ -15,14 +15,15 @@ from __future__ import annotations
 import math
 import random
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
 from dreambot.config import Config
-from dreambot.core import enhance, styles
+from dreambot.core import enhance, fingerprint, lookbook, styles
+from dreambot.core.fingerprint import StyleFingerprint
 from dreambot.core.imaging import Canvas, Tile
 from dreambot.core.params import MAX_SEED, LoraRef, Params
 from dreambot.core.prompt import ParsedPrompt
@@ -41,6 +42,11 @@ CREATIVE_UPSCALE_NOISE = 0.45
 #: The same, when standing in for a dedicated upscaler that is not installed.
 FALLBACK_UPSCALE_NOISE = 0.3
 MAX_UPSCALED_SIDE = 3072
+#: Style versions (``--sv``): how a style reference becomes a look. 1 is the original (a code
+#: is a fixed recipe, an image is only shown to an edit model); 2 blends fingerprints and shows
+#: the pictures as well where a model can take them; 3 uses the fingerprint's words alone.
+STYLE_LEGACY, STYLE_BLEND, STYLE_WORDS = 1, 2, 3
+DEFAULT_STYLE_VERSION = STYLE_BLEND
 
 
 class PlanError(Exception):
@@ -113,6 +119,26 @@ class Catalog:
 # --------------------------------------------------------------------------------------
 
 
+#: Stands in a prompt's list of style images for a board that has not been cut yet.
+BOARD = "<style board>"
+
+
+@dataclass(frozen=True)
+class Board:
+    """A sheet of swatches cut from style pictures, for a model that takes reference images.
+
+    Shown a style picture whole, an edit model puts what is in it into the result — a hand, a
+    caption. A board of shuffled pieces keeps what makes the style (colour, line, texture,
+    light) and loses what the pictures were of. Each picture gets pieces in proportion to its
+    weight, so a blend of references is a blend on the board too, in one reference slot.
+    """
+
+    #: (picture, weight) for every picture that contributes.
+    tiles: tuple[tuple[str, float], ...]
+    #: Makes the cut reproducible.
+    seed: int
+
+
 @dataclass
 class Render:
     """One engine request, producing one image per seed for the listed slots."""
@@ -139,10 +165,19 @@ class Render:
     quantize: int | None = None
     stop_at: float | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    #: A style board to cut and show the model after ``images`` (see :class:`Board`).
+    board: Board | None = None
 
     def request(
-        self, *, request_id: str, out_dir: str, basename: str, preview_every: int = 0
+        self,
+        *,
+        request_id: str,
+        out_dir: str,
+        basename: str,
+        preview_every: int = 0,
+        board: str | None = None,
     ) -> GenerateRequest:
+        """The engine request. ``board`` is the file a style board was cut to, if the render has one."""
         return GenerateRequest(
             id=request_id,
             model=self.model,
@@ -157,7 +192,7 @@ class Render:
             image=self.image,
             strength=self.strength,
             noise=self.noise,
-            images=self.images,
+            images=[*self.images, board] if board else self.images,
             image_weights=self.image_weights,
             mask=self.mask,
             loras=self.loras,
@@ -208,6 +243,62 @@ class Plan:
         return sum(len(render.seeds) for render in self.renders)
 
 
+def style_version(value: int | None, notes: list[str] | None = None) -> int:
+    """The style version a ``--sv`` value selects."""
+    if value is None:
+        return DEFAULT_STYLE_VERSION
+    if value in (STYLE_LEGACY, STYLE_BLEND, STYLE_WORDS):
+        return value
+    if notes is not None:
+        notes.append(
+            f"`--sv {value}` is a Midjourney style version. Dreambot has 1 (the original), 2 (blended, "
+            f"the default) and 3 (words only); using {DEFAULT_STYLE_VERSION}."
+        )
+    return DEFAULT_STYLE_VERSION
+
+
+@dataclass
+class StyleSource:
+    """One weighted ingredient of a prompt's style: a reference image, a style code, a saved style
+    or a Lookbook."""
+
+    #: ``image`` | ``code`` | ``saved`` | ``look``
+    kind: str
+    #: How it is named to the person: "image 1", "style 4821", "Lookbook Dunes".
+    label: str
+    weight: float = 1.0
+    print: StyleFingerprint | None = None
+    #: Pictures a style board may be cut from for this ingredient.
+    pictures: list[str] = field(default_factory=list)
+    #: Cache key of the picture, for ingredients whose words come from the vision model.
+    key: str | None = None
+    #: A style code, or the code of the Lookbook version used.
+    code: str | None = None
+    #: Whether ``code`` was drawn for ``--sref random``.
+    drawn: bool = False
+    #: The pictures of a Lookbook, each with its own fingerprint.
+    members: list[lookbook.Member] = field(default_factory=list)
+
+
+@dataclass
+class Look:
+    """The style one image is given."""
+
+    print: StyleFingerprint | None
+    #: The words added to the prompt.
+    phrases: list[str]
+    #: What a model that takes reference images is shown.
+    board: Board | None = None
+
+
+def _scaled(tiles: Sequence[tuple[str, float]], total: float) -> list[tuple[str, float]]:
+    """``tiles`` with their weights rescaled to add up to ``total``."""
+    have = sum(weight for _, weight in tiles)
+    if have <= 0 or total <= 0:
+        return []
+    return [(path, weight * total / have) for path, weight in tiles]
+
+
 @dataclass
 class ResolvedRefs:
     """Reference images of a prompt, downloaded and normalised to local files."""
@@ -224,10 +315,37 @@ class ResolvedRefs:
     style: list[str] = field(default_factory=list)
     #: ``--sref`` codes, with the ``random`` ones already drawn.
     style_codes: list[str] = field(default_factory=list)
+    #: Every style ingredient in the order given, with its weight (style version 2 and up).
+    #: Left empty, it is derived from ``style`` and ``style_codes`` at equal weights.
+    sources: list[StyleSource] = field(default_factory=list)
 
     @property
     def images(self) -> list[str]:
         return [*self.edit, *self.subject, *self.image_prompts, *self.style]
+
+    @property
+    def content_images(self) -> list[str]:
+        """The images that say what the picture is of, as opposed to how it looks."""
+        return [*self.edit, *self.subject, *self.image_prompts]
+
+    def style_sources(self) -> list[StyleSource]:
+        if not self.sources:
+            self.sources = [
+                *(
+                    StyleSource("image", f"image {number}", pictures=[path])
+                    for number, path in enumerate(self.style, start=1)
+                ),
+                *(StyleSource("code", f"style {code}", code=code) for code in self.style_codes),
+            ]
+        for source in self.sources:
+            if source.kind == "look":
+                source.print = lookbook.consensus(source.members)
+            elif source.print is None:
+                if source.code is not None:
+                    source.print = fingerprint.from_code(source.code)
+                elif source.pictures:
+                    source.print = fingerprint.measure(source.pictures[0])
+        return self.sources
 
 
 def _join(numbers: Sequence[int], total: int) -> str:
@@ -238,8 +356,20 @@ def _join(numbers: Sequence[int], total: int) -> str:
     return "images " + ", ".join(map(str, numbers[:-1])) + f" and {numbers[-1]}"
 
 
-def reference_instruction(text: str, refs: ResolvedRefs, params: Params) -> str:
-    """Word a prompt for a reference-capable edit model, naming each image's role."""
+def reference_instruction(
+    text: str,
+    refs: ResolvedRefs,
+    params: Params,
+    *,
+    strength: int | None = None,
+    board: bool = False,
+) -> str:
+    """Word a prompt for a reference-capable edit model, naming each image's role.
+
+    ``refs.style`` holds what the model is shown for style: the reference pictures themselves in
+    the original style version, or — with ``board`` — one board of swatches cut from them.
+    ``strength`` is how insistently the style is asked for (0-1000); it defaults to ``--sw``.
+    """
     total = len(refs.images)
     cursor = 0
     clauses: list[str] = []
@@ -275,7 +405,7 @@ def reference_instruction(text: str, refs: ResolvedRefs, params: Params) -> str:
             clauses.append(f"Take inspiration for composition, subject and mood from {which}.")
     if refs.style:
         which = _join(take(refs.style), total)
-        weight = 100 if params.sw is None else params.sw
+        weight = strength if strength is not None else (100 if params.sw is None else params.sw)
         # Edit models copy what they are shown unless told otherwise, so every wording says
         # outright that the reference's content must not appear (verified on FLUX.2 klein).
         if weight <= 0:
@@ -283,6 +413,16 @@ def reference_instruction(text: str, refs: ResolvedRefs, params: Params) -> str:
         elif weight < 50:
             clauses.append(
                 f"Borrow a little of the visual style of {which}, but show nothing that is depicted in it."
+            )
+        elif board:
+            clauses.append(
+                f"{which[0].upper()}{which[1:]} is a board of style swatches cut from other pictures, not part "
+                "of the scene: show nothing that appears on it, and do not lay the picture out as a grid. "
+                + (
+                    "Reproduce its medium, color palette, line, texture, lighting and mood exactly."
+                    if weight >= 400
+                    else "Take only its visual look: color palette, line, texture, lighting and mood."
+                )
             )
         elif weight >= 400:
             clauses.append(
@@ -421,15 +561,18 @@ class Planner:
         base: Render,
         prompts: list[str],
         seeds: list[int],
+        boards: Sequence[Board | None] | None = None,
     ) -> list[Render]:
-        """Split one render into as few requests as possible when images have different prompts."""
-        groups: dict[str, Render] = {}
-        for slot, (prompt, seed) in enumerate(zip(prompts, seeds, strict=True), start=1):
-            if prompt not in groups:
-                render = Render(**{**base.__dict__, "prompt": prompt, "seeds": [], "slots": []})
-                groups[prompt] = render
-            groups[prompt].seeds.append(seed)
-            groups[prompt].slots.append(slot)
+        """Split one render into as few requests as possible when images differ in prompt or style board."""
+        groups: dict[tuple[str, Board | None], Render] = {}
+        for index, (prompt, seed) in enumerate(zip(prompts, seeds, strict=True)):
+            board = boards[index] if boards else None
+            if (prompt, board) not in groups:
+                groups[prompt, board] = Render(
+                    **{**base.__dict__, "prompt": prompt, "seeds": [], "slots": [], "board": board}
+                )
+            groups[prompt, board].seeds.append(seed)
+            groups[prompt, board].slots.append(index + 1)
         return list(groups.values())
 
     # ----------------------------------------------------------------- imagine ----
@@ -461,14 +604,35 @@ class Planner:
         for name in parsed.planned:
             notes.append(f"`--{name}` isn't available yet and was ignored.")
 
-        op, spec = self._imagine_model(typed, params, settings, refs, notes)
+        version = style_version(params.sv, notes)
+        style_weight = 100 if params.sw is None else params.sw
+        stylize = params.stylize if params.stylize is not None else settings.stylize
         count = params.count or settings.count
+        seeds = list(seeds) if seeds else self._seeds(params, count)
+
+        # From style version 2 every style ingredient is a fingerprint first. What a model that
+        # takes reference images is shown is a board of swatches cut from the pictures, never
+        # the pictures themselves: shown whole, their content leaks into the result.
+        styled = version != STYLE_LEGACY and bool(refs.sources or refs.style or refs.style_codes)
+        sources: list[StyleSource] = []
+        looks: list[Look] = []
+        overall = Look(None, [], None)
+        shown, choosing = refs, typed
+        if styled:
+            sources = refs.style_sources()
+            boarded, choosing = self._board_model(typed, settings, refs, sources, version, notes)
+            looks, overall = self._looks(sources, seeds[0], count, style_weight, stylize, boarded)
+            shown = replace(refs, style=[BOARD] if overall.board is not None else [])
+
+        op, spec = self._imagine_model(choosing, params, settings, shown, notes)
         steps, quality_scale = self._steps(spec, params, notes)
         scale = quality_scale * (0.5 if params.draft else 1.0)
 
-        if params.aspect is None and op is not Op.TXT2IMG and refs.images:
+        # A style lends its look, not its shape (in the original style version it did both).
+        shaping = shown.content_images if styled else shown.images
+        if params.aspect is None and op is not Op.TXT2IMG and shaping:
             # Like Midjourney's edit model: follow the first image's shape unless told otherwise.
-            with Image.open(refs.images[0]) as first:
+            with Image.open(shaping[0]) as first:
                 width, height = working_size(
                     first.width, first.height, native=spec.native, multiple=spec.multiple
                 )
@@ -476,21 +640,18 @@ class Planner:
         else:
             width, height = dimensions(params.aspect, multiple=spec.multiple, scale=scale, native=spec.native)
 
-        seeds = list(seeds) if seeds else self._seeds(params, count)
         guidance = self._guidance(spec, params)
         negative, guidance, without = self._avoid(
             spec, parsed.negative_terms, params.negative, guidance, notes
         )
         location, quantize = self._weights(spec)
 
-        style_weight = 100 if params.sw is None else params.sw
-        style_codes = [(code, style_weight) for code in refs.style_codes]
-        stylize = params.stylize if params.stylize is not None else settings.stylize
+        style_codes = [] if styled else [(code, style_weight) for code in refs.style_codes]
         raw = bool(params.raw)
         chaos, weird, exp = params.chaos or 0, params.weird or 0, params.exp or 0
 
         brief: enhance.Brief | None = None
-        if settings.enhance and op is Op.TXT2IMG and not refs.images:
+        if settings.enhance and op is Op.TXT2IMG and not shown.images:
             # Only a plain text prompt is art-directed. With images attached the text is an
             # instruction, or a description that has to agree with a picture the model cannot see.
             candidate = enhance.Brief(
@@ -500,8 +661,9 @@ class Planner:
                 chaos=chaos,
                 weird=weird,
                 exp=exp,
-                style=tuple(
-                    phrase for code, weight in style_codes for phrase in styles.style_recipe(code, weight)
+                style=(
+                    *(overall.phrases if styled else ()),
+                    *(phrase for code, weight in style_codes for phrase in styles.style_recipe(code, weight)),
                 ),
                 avoid=tuple(parsed.negative_terms),
             )
@@ -521,6 +683,7 @@ class Planner:
                     count=count,
                     raw=True,
                     style_codes=style_codes,
+                    style=looks[index].phrases if looks else (),
                 )
             else:
                 prompt = styles.direct(
@@ -534,6 +697,7 @@ class Planner:
                     stylize=stylize,
                     raw=raw,
                     style_codes=style_codes,
+                    style=looks[index].phrases if looks else (),
                 )
             directed.append(_closing(prompt, without))
         text = _closing(text, without)
@@ -554,9 +718,18 @@ class Planner:
             quantize=quantize,
             stop_at=params.stop / 100 if params.stop is not None and params.stop < 100 else None,
         )
-        if op is Op.EDIT:
-            base.images = refs.images
-            directed = [reference_instruction(prompt, refs, params) for prompt in directed]
+        boards: list[Board | None] | None = None
+        if op is Op.EDIT and styled:
+            base.images = shown.content_images
+            boards = [look.board for look in looks]
+            strength = style_weight if any(source.kind != "look" for source in sources) else stylize
+            directed = [
+                reference_instruction(prompt, shown, params, strength=strength, board=look.board is not None)
+                for prompt, look in zip(directed, looks, strict=True)
+            ]
+        elif op is Op.EDIT:
+            base.images = shown.images
+            directed = [reference_instruction(prompt, shown, params) for prompt in directed]
         elif op is Op.REDUX:
             base.images = refs.image_prompts
             # Redux strengths run 0..1; --iw above 1 cannot push past "follow the image fully".
@@ -584,13 +757,162 @@ class Planner:
             width=width,
             height=height,
             seeds=seeds,
-            renders=self._grouped(base, directed, seeds),
+            renders=self._grouped(base, directed, seeds, boards),
             brief=None if directions else brief,
             notes=notes,
         )
+        if styled and (detail := self._style_detail(sources, overall, version, style_weight, stylize)):
+            plan.detail["style"] = detail
         if params.hd:
             self._add_hd(plan)
         return plan
+
+    # ------------------------------------------------------------------- style ----
+
+    def _board_model(
+        self,
+        typed: Params,
+        settings: ResolvedSettings,
+        refs: ResolvedRefs,
+        sources: list[StyleSource],
+        version: int,
+        notes: list[str],
+    ) -> tuple[bool, Params]:
+        """Whether the model that will run a prompt can be shown a style board.
+
+        Returns that, and the typed parameters to choose the model with. A style goes along with
+        the model a person chose — typed, or as their default — rather than moving their job to
+        another one: where that model cannot take a reference image, the style is applied in
+        words alone.
+        """
+        pictured = any(source.weight > 0 and (source.pictures or source.members) for source in sources)
+        if version != STYLE_BLEND or not pictured:
+            return False, typed
+        content = refs.content_images
+        pinned = typed
+        chosen = self.catalog.registry.find(settings.model) if settings.model else None
+        if typed.model is not None:
+            spec = self.catalog.lookup(typed.model)
+            if not spec.supports(Op.EDIT):
+                notes.append(
+                    f"{spec.title} can't be shown reference images, so the style is applied in words."
+                )
+                return False, typed
+        elif not content and chosen is not None and self.catalog.is_installed(chosen):
+            if not chosen.supports(Op.EDIT):
+                return False, typed
+            spec, pinned = chosen, replace(typed, model=chosen.id)
+        else:
+            found = self.catalog.pick(self.config.prefer.edit, Op.EDIT) or next(
+                iter(self.catalog.installed(Op.EDIT)), None
+            )
+            if found is None:
+                notes.append(
+                    "The style is applied in words. An edit model can be shown its pictures as well: "
+                    "`dreambot models pull flux2-klein-4b`."
+                )
+                return False, typed
+            spec = found
+        limit = spec.variants[Op.EDIT].max_refs
+        if len(content) + 1 > limit:
+            if len(content) <= limit:
+                notes.append(
+                    f"{spec.title} takes {limit} reference image(s) and the others fill them, so the style "
+                    "is applied in words."
+                )
+            return False, typed
+        return True, pinned
+
+    def _looks(
+        self,
+        sources: list[StyleSource],
+        seed: int,
+        count: int,
+        style_weight: int,
+        stylize: int,
+        boarded: bool,
+    ) -> tuple[list[Look], Look]:
+        """The look of each image of a grid, and the look of the job as a whole.
+
+        Style references (``--sref``) give every image the same look, scaled by ``--sw``. A
+        Lookbook gives each image its own: one of its pictures leads (see
+        :func:`dreambot.core.lookbook.cast`), scaled by ``--stylize``. With both, the reference
+        decides the medium and the Lookbook colours it.
+        """
+        references = [s for s in sources if s.kind != "look" and s.weight > 0 and s.print is not None]
+        books = [s for s in sources if s.kind == "look" and s.weight > 0 and s.members]
+        if style_weight <= 0:
+            references = []
+        if stylize <= 0:
+            books = []
+        reference_blend = fingerprint.blend([(source.print, source.weight) for source in references])
+        reference_tiles = [
+            (path, source.weight / len(source.pictures)) for source in references for path in source.pictures
+        ]
+
+        def look_of(book_parts: list[fingerprint.Part], book_tiles: list[tuple[str, float]]) -> Look:
+            book_blend = fingerprint.blend(book_parts)
+            if reference_blend is not None:
+                phrases = [
+                    *fingerprint.phrases(reference_blend, style_weight),
+                    *fingerprint.accents(book_blend, stylize),
+                ]
+            else:
+                phrases = fingerprint.phrases(book_blend, stylize)
+            seen: set[str] = set()
+            phrases = [
+                phrase for phrase in phrases if not (phrase.lower() in seen or seen.add(phrase.lower()))
+            ]
+            board: Board | None = None
+            # Between a style reference and a Lookbook, the stronger dial gets more of the board.
+            tiles = [*_scaled(reference_tiles, style_weight), *_scaled(book_tiles, stylize)]
+            if boarded and tiles:
+                board = Board(tuple(tiles), seed)
+            return Look(reference_blend if reference_blend is not None else book_blend, phrases, board)
+
+        looks: list[Look] = []
+        for index in range(count):
+            parts: list[fingerprint.Part] = []
+            tiles: list[tuple[str, float]] = []
+            for book in books:
+                weights = lookbook.cast(len(book.members), seed, index)
+                scale = book.weight / sum(weights)
+                for member, weight in zip(book.members, weights, strict=True):
+                    parts.append((member.print, weight * scale))
+                    tiles.append((member.path, weight * scale))
+            looks.append(look_of(parts, tiles))
+        overall = look_of(
+            [(member.print, book.weight / len(book.members)) for book in books for member in book.members],
+            [(member.path, book.weight / len(book.members)) for book in books for member in book.members],
+        )
+        return looks, overall
+
+    @staticmethod
+    def _style_detail(
+        sources: list[StyleSource], overall: Look, version: int, style_weight: int, stylize: int
+    ) -> dict[str, Any]:
+        """What a job records about its style, for `info` and the web app."""
+        if overall.print is None:
+            return {}
+        total = sum(source.weight for source in sources if source.weight > 0) or 1.0
+        return {
+            "version": version,
+            "name": overall.print.name,
+            "summary": fingerprint.summary(overall.print),
+            "weight": style_weight,
+            "stylize": stylize,
+            "swatches": [swatch.hex for swatch in overall.print.swatches],
+            "sources": [
+                {
+                    "kind": source.kind,
+                    "label": source.label,
+                    "share": round(max(0.0, source.weight) / total, 3),
+                    **({"code": source.code} if source.code else {}),
+                }
+                for source in sources
+            ],
+            "board": overall.board is not None,
+        }
 
     def _imagine_model(
         self, typed: Params, params: Params, settings: ResolvedSettings, refs: ResolvedRefs, notes: list[str]

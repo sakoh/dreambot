@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from dreambot.config import Config
-from dreambot.core import enhance, styles
+from dreambot.core import enhance, fingerprint, styles
 from dreambot.core.commands import Commands
 from dreambot.core.enhance import Brief
 from dreambot.core.jobs import EventType, JobKind, JobStatus
@@ -305,8 +305,14 @@ def test_the_planner_briefs_plain_text_prompts_only(tmp_path: Path, sample_image
     ):
         assert brief_of(p, FOX, ON, refs) is None, "with an image attached the text is used as written"
 
+    legacy = brief_of(p, f"{FOX} --sref 4821 --sv 1", ON, ResolvedRefs(style_codes=["4821"]))
+    assert legacy.style == tuple(styles.style_recipe("4821", 100)) and legacy.style
     code = brief_of(p, f"{FOX} --sref 4821", ON, ResolvedRefs(style_codes=["4821"]))
-    assert code.style == tuple(styles.style_recipe("4821", 100)) and code.style
+    assert code.style == tuple(fingerprint.phrases(fingerprint.from_code("4821"), 100)) and code.style
+    worded = brief_of(p, f"{FOX} --sref --sv 3", ON, ResolvedRefs(style=[picture]))
+    assert worded is not None and worded.style, "a style applied in words leaves the text a description"
+    assert "every image is a photograph" not in enhance.request(code), "a style names its own medium"
+    assert "every image is a photograph" in enhance.request(brief)
 
 
 def test_directions_become_per_image_prompts(tmp_path: Path):
@@ -354,7 +360,7 @@ def test_an_image_without_direction_keeps_the_rule_based_emulation(tmp_path: Pat
 
 def test_style_codes_and_things_to_avoid_survive_direction(tmp_path: Path):
     p = planner(tmp_path, "z-image-turbo", "qwen-image")
-    recipe = ", ".join(styles.style_recipe("4821", 100))
+    recipe = ", ".join(fingerprint.phrases(fingerprint.from_code("4821"), 100))
     coded = p.imagine(
         parse_prompt(f"{FOX} --sref 4821 --n 1 --stylize 750"),
         ON,

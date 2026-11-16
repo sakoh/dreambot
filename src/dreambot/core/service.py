@@ -18,24 +18,35 @@ import re
 import shutil
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from dreambot.config import Config
-from dreambot.core import enhance, imaging, styles
+from dreambot.core import enhance, fingerprint, imaging, lookbook
 from dreambot.core.access import Access
 from dreambot.core.actions import GENERATIVE, PAN_DIRECTIONS, Action, ActionKind
 from dreambot.core.fetch import FetchError, fetch_image
+from dreambot.core.fingerprint import StyleFingerprint
 from dreambot.core.imaging import ImageError
-from dreambot.core.jobs import EventType, Job, JobEvent, JobImage, JobKind, JobStatus
+from dreambot.core.jobs import EventType, Job, JobEvent, JobImage, JobKind, JobStatus, new_job_id
 from dreambot.core.params import Params, PromptError, Ref
-from dreambot.core.planner import Catalog, Plan, PlanError, Planner, Render, ResolvedRefs
+from dreambot.core.planner import (
+    STYLE_LEGACY,
+    Catalog,
+    Plan,
+    PlanError,
+    Planner,
+    Render,
+    ResolvedRefs,
+    StyleSource,
+    style_version,
+)
 from dreambot.core.prompt import MAX_PERMUTATIONS, ParsedPrompt, expand_permutations, parse_prompt
 from dreambot.core.settings import ResolvedSettings, UserSettings
 from dreambot.core.sizes import working_size
-from dreambot.core.store import Store
+from dreambot.core.store import Store, style_slug
 from dreambot.core.text import SHORTEN_INSTRUCTION, heuristic_shorten, parse_numbered
 from dreambot.engine.client import Engine, EngineCancelled, EngineError, new_request_id
 from dreambot.engine.protocol import (
@@ -132,6 +143,10 @@ class Dreambot:
         self._current: Job | None = None
         self._current_request: str | None = None
         self._closing = False
+        #: Work that can wait for a quiet moment on the GPU (reading the style of a Lookbook's
+        #: pictures). The queue runs one whenever no job is waiting.
+        self._chores: list[Callable[[], Awaitable[None]]] = []
+        self._chore_running = False
 
     # ----------------------------------------------------------------- lifecycle ----
 
@@ -223,9 +238,27 @@ class Dreambot:
         await self._emit(JobEvent(EventType.QUEUED, job, position=position))
         self._wake.set()
 
+    @property
+    def idle(self) -> bool:
+        """Whether nothing is running or waiting to run, chores included."""
+        return not (self._queue or self._chores or self._chore_running or self._current is not None)
+
     async def _work(self) -> None:
         while not self._closing:
             if not self._queue:
+                if self._chores:
+                    chore = self._chores.pop(0)
+                    self._chore_running = True
+                    try:
+                        await chore()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception("a background chore failed")
+                    finally:
+                        self._chore_running = False
+                        self._current_request = None
+                    continue
                 self._wake.clear()
                 await self._wake.wait()
                 continue
@@ -335,10 +368,15 @@ class Dreambot:
         except ImageError as exc:
             raise DreambotError(str(exc)) from exc
 
-        planned: list[tuple[Job, Plan, Callable[..., Plan]]] = []
+        planned: list[tuple[Job, Plan, Callable[..., Plan], ResolvedRefs | None]] = []
         for parsed in parsed_prompts:
-            refs, ref_notes = await self._resolve_refs(parsed, prepared, scratch, allow_paths=allow_paths)
-            for _ in range(parsed.params.repeat or 1):
+            refs, ref_notes = await self._resolve_refs(
+                parsed, prepared, scratch, user=user, settings=settings, allow_paths=allow_paths
+            )
+            for turn in range(parsed.params.repeat or 1):
+                if turn:
+                    # As in Midjourney, every repeat of `--sref random` draws a style of its own.
+                    refs, ref_notes = self._redraw_styles(refs, ref_notes)
                 try:
                     plan = self.planner.imagine(parsed, settings, refs)
                 except (PlanError, PromptError) as exc:
@@ -360,21 +398,45 @@ class Dreambot:
                     params=parsed.params,
                 )
                 job.inputs = {"attachments": prepared}
-                planned.append((job, plan, replan))
-        for job, plan, replan in planned:
-            await self._enqueue(job, self._runner(plan, replan))
-        return [job for job, _, _ in planned]
+                # Words for a style come from the vision model, which has to wait its turn on
+                # the GPU like everything else: the job asks for them when it runs.
+                waiting = self._style_pending(parsed, refs)
+                planned.append((job, plan, replan, refs if waiting else None))
+        for job, plan, replan, waiting_refs in planned:
+            await self._enqueue(job, self._runner(plan, replan, waiting_refs))
+        return [job for job, _, _, _ in planned]
 
     def _display_prompt(self, parsed: ParsedPrompt, refs: ResolvedRefs) -> str:
-        """The prompt as it should be shown and re-run: `--sref random` pinned to the code drawn."""
+        """The prompt as it should be shown and re-run.
+
+        `--sref random` is pinned to the code that was drawn, and a Lookbook named by name is
+        pinned to the code of the version used — as Midjourney turns a moodboard's id into a
+        code on submit — so that running the prompt again later gives the same look.
+        """
         text = parsed.canonical()
-        if refs.style_codes and "random" in text:
-            for code in refs.style_codes:
-                text = re.sub(r"(--sref[^-]*?)\brandom\b", rf"\g<1>{code}", text, count=1)
+        for source in refs.sources:
+            if source.drawn and source.code:
+                # The value of a parameter runs to the next " --"; names in it may contain hyphens.
+                text = re.sub(r"(--sref\b(?:(?!\s--).)*?)\brandom\b", rf"\g<1>{source.code}", text, count=1)
+        books = [source for source in refs.sources if source.kind == "look" and source.code]
+        if books and parsed.params.personalize is not None:
+            pinned = " ".join(
+                source.code if source.weight == 1 else f"{source.code}::{source.weight:g}" for source in books
+            )
+            text = re.sub(
+                r"--personalize\b(?:(?!\s--).)*", lambda _: f"--personalize {pinned}", text, count=1
+            )
         return text
 
     async def _resolve_refs(
-        self, parsed: ParsedPrompt, attachments: list[str], scratch: Path, *, allow_paths: bool
+        self,
+        parsed: ParsedPrompt,
+        attachments: list[str],
+        scratch: Path,
+        *,
+        user: str,
+        settings: ResolvedSettings,
+        allow_paths: bool,
     ) -> tuple[ResolvedRefs, list[str]]:
         """Download and normalise every image a prompt refers to."""
         params = parsed.params
@@ -426,19 +488,493 @@ class Dreambot:
         subject_refs = [*params.oref, *params.cref]
         resolved.subject = await many(subject_refs, "oref" if params.oref else "cref")
         resolved.subject_kind = "character" if params.cref and not params.oref else "subject"
-        style_images = [ref for ref in params.sref if ref.kind not in ("code", "random")]
-        resolved.style = await many(style_images, "sref")
-        for ref in params.sref:
-            if ref.kind == "code":
-                resolved.style_codes.append(ref.value)
-            elif ref.kind == "random":
-                code = styles.random_style_code()
-                resolved.style_codes.append(code)
-                notes.append(f"`--sref random` picked style `{code}`. Reuse it with `--sref {code}`.")
+        # Style ingredients keep the order and the weight they were given. Explicit ones are
+        # resolved first, so that a bare `--sref` takes the attachments nobody else named.
+        found: dict[int, list[StyleSource]] = {}
+        for position, ref in sorted(
+            enumerate(params.sref), key=lambda item: item[1].kind == "attachment" and item[1].value == "*"
+        ):
+            found[position] = await self._style_sources(ref, user, one, notes)
+        resolved.sources = [source for position in sorted(found) for source in found[position]]
+        pictured = 0
+        for source in resolved.sources:
+            if source.kind == "image":
+                pictured += 1
+                source.label = f"image {pictured}"
+                resolved.style.extend(source.pictures)
+            elif source.code is not None:
+                resolved.style_codes.append(source.code)
+        resolved.sources.extend(await asyncio.to_thread(self._look_sources, params, user, settings))
         resolved.image_prompts = await many(parsed.image_prompts, "image prompt")
         # Attached images nobody claimed are image prompts, as in Midjourney.
         resolved.image_prompts.extend(path for i, path in enumerate(attachments) if i not in claimed)
         return resolved, notes
+
+    # -------------------------------------------------------------------- styles ----
+
+    async def _style_sources(
+        self,
+        ref: Ref,
+        user: str,
+        fetch: Callable[[Ref, str], Awaitable[list[str]]],
+        notes: list[str],
+    ) -> list[StyleSource]:
+        """The style ingredients one ``--sref`` token stands for."""
+        if ref.kind == "code":
+            return [StyleSource("code", f"style {ref.value}", ref.weight, code=ref.value)]
+        if ref.kind == "random":
+            code = fingerprint.random_code()
+            notes.append(f"`--sref random` picked style `{code}`. Reuse it with `--sref {code}`.")
+            return [StyleSource("code", f"style {code}", ref.weight, code=code, drawn=True)]
+        if ref.kind == "saved":
+            kept = self.store.get_style(user, ref.value)
+            if kept is None or not kept["data"]:
+                raise DreambotError(
+                    f"I don't know a style called `{ref.value}`. `--sref` takes image links, `@1`-style "
+                    "attachment numbers, style codes, `random`, or the name of a style you saved."
+                )
+            data = kept["data"]
+            return [
+                StyleSource(
+                    "saved",
+                    f"style {kept['name'] or kept['code']}",
+                    ref.weight,
+                    print=StyleFingerprint.from_dict(data.get("print") or {}),
+                    pictures=[path for path in data.get("pictures", []) if Path(path).is_file()],
+                )
+            ]
+        sources: list[StyleSource] = []
+        for path in await fetch(ref, "sref"):
+            key = await asyncio.to_thread(fingerprint.image_key, path)
+            print_ = await asyncio.to_thread(self._print_of, path, key)
+            sources.append(StyleSource("image", "image", ref.weight, print=print_, pictures=[path], key=key))
+        return sources
+
+    def style_of(self, path: str | Path) -> tuple[str, StyleFingerprint]:
+        """A picture's content key and what is known about its style so far."""
+        key = fingerprint.image_key(path)
+        return key, self._print_of(path, key)
+
+    def study_picture(self, path: str | Path) -> bool:
+        """Have the vision model read a picture's style when the GPU is next free.
+
+        Returns whether there is anything to wait for.
+        """
+        key, known = self.style_of(path)
+        if known.worded or self.catalog.vision_model() is None:
+            return False
+
+        async def read() -> None:
+            now = self.store.get_fingerprint(key)
+            if not (now and now.get("medium")) and Path(path).is_file():
+                await self._read_style(str(path), key, self._print_of(path, key))
+
+        self._chores.append(read)
+        self._wake.set()
+        return True
+
+    def _print_of(self, path: str | Path, key: str) -> StyleFingerprint:
+        """What is known about a picture's style: its measured colours, and its words once read."""
+        known = self.store.get_fingerprint(key)
+        if known:
+            return StyleFingerprint.from_dict(known)
+        measured = fingerprint.measure(path)
+        self.store.save_fingerprint(key, measured.to_dict())
+        return measured
+
+    async def _read_style(self, path: str, key: str | None, known: StyleFingerprint) -> StyleFingerprint:
+        """Ask the vision model to put a picture's style into words, and remember the answer."""
+        vision = self.catalog.vision_model()
+        if vision is None:
+            return known
+        request = DescribeRequest(
+            id=new_request_id(),
+            image=path,
+            count=len(fingerprint.WORD_FIELDS),
+            weights=vision,
+            instruction=fingerprint.EXTRACT_INSTRUCTION,
+            max_tokens=40,
+            seed=0,
+        )
+        self._current_request = request.id
+        try:
+            lines = await self.engine.describe(request)
+        except EngineCancelled:
+            raise
+        except EngineError as exc:
+            log.warning("could not read the style of %s (%s)", Path(path).name, exc)
+            return known
+        words = fingerprint.parse_words(lines)
+        if not words.get("medium"):
+            log.warning("the vision model's account of the style of %s was unusable", Path(path).name)
+            return known
+        read = fingerprint.with_words(known, words)
+        if key:
+            self.store.save_fingerprint(key, read.to_dict())
+        return read
+
+    def _style_pending(self, parsed: ParsedPrompt, refs: ResolvedRefs) -> bool:
+        """Whether a job should ask the vision model about its style before it renders."""
+        if not refs.sources or style_version(parsed.params.sv) == STYLE_LEGACY:
+            return False
+        if self.catalog.vision_model() is None:
+            return False
+        return any(
+            (source.kind == "image" and source.print is not None and not source.print.worded)
+            or any(not member.print.worded for member in source.members)
+            for source in refs.sources
+        )
+
+    def _redraw_styles(self, refs: ResolvedRefs, notes: list[str]) -> tuple[ResolvedRefs, list[str]]:
+        """``refs`` with every `--sref random` drawn afresh."""
+        if not any(source.drawn for source in refs.sources):
+            return refs, notes
+        notes = [note for note in notes if not note.startswith("`--sref random` picked")]
+        sources: list[StyleSource] = []
+        for source in refs.sources:
+            if source.drawn:
+                code = fingerprint.random_code()
+                notes.append(f"`--sref random` picked style `{code}`. Reuse it with `--sref {code}`.")
+                source = StyleSource("code", f"style {code}", source.weight, code=code, drawn=True)
+            sources.append(source)
+        codes = [source.code for source in sources if source.code is not None]
+        return replace(refs, sources=sources, style_codes=codes), notes
+
+    async def _describe_styles(self, job: Job, refs: ResolvedRefs) -> None:
+        """Have the vision model put a job's style into words (see :mod:`dreambot.core.fingerprint`).
+
+        Like the prompt enhancer this refines a job and is never a reason for one to fail:
+        without the words a style is still applied through its colours and, where a model
+        takes them, its pictures.
+        """
+        if self.catalog.vision_model() is None:
+            return
+        announced = False
+        for source in refs.sources:
+            if source.kind != "image" or source.print is None or source.print.worded or not source.pictures:
+                continue
+            known = self.store.get_fingerprint(source.key) if source.key else None
+            if known and known.get("medium"):
+                source.print = StyleFingerprint.from_dict(known)  # another job read it in the meantime
+                continue
+            if not announced:
+                announced = True
+                await self._emit(JobEvent(EventType.THINKING, job))
+            source.print = await self._read_style(source.pictures[0], source.key, source.print)
+
+        # A Lookbook's pictures are usually read while the GPU is idle (see `study_lookbook`);
+        # whatever is still unread when a job needs the book is read here.
+        for source in refs.sources:
+            for position, member in enumerate(source.members):
+                if member.print.worded:
+                    continue
+                known = self.store.get_fingerprint(member.key)
+                if known and known.get("medium"):
+                    read = StyleFingerprint.from_dict(known)
+                else:
+                    if not announced:
+                        announced = True
+                        await self._emit(JobEvent(EventType.THINKING, job))
+                    read = await self._read_style(member.path, member.key, member.print)
+                source.members[position] = lookbook.Member(member.key, member.path, read)
+
+    def save_style(
+        self,
+        *,
+        user: str,
+        name: str,
+        print_: StyleFingerprint,
+        pictures: Sequence[str | Path] = (),
+        recipe: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Keep a style under a name, to be used as ``--sref <name>``.
+
+        Midjourney cannot make a style code from your own image or blend; this is how Dreambot
+        does. The style's pictures are copied, so it outlives the files it was made from.
+        """
+        name = re.sub(r"\s+", " ", name).strip()
+        slug = style_slug(name)
+        if not slug or not slug[0].isalpha():
+            raise DreambotError("Give the style a name that starts with a letter, e.g. `dusty noir`.")
+        if print_.empty:
+            raise DreambotError("There is no style to save yet.")
+        existing = self.store.get_style(user, slug)
+        code = existing["code"] if existing and existing["data"] else f"s{new_job_id().lower()}"
+        folder = self.config.home / "styles" / code
+        folder.mkdir(parents=True, exist_ok=True)
+        kept: list[str] = []
+        for number, picture in enumerate(pictures, start=1):
+            source = Path(picture)
+            if source.is_file():
+                target = folder / f"{number}{source.suffix.lower() or '.png'}"
+                if source.resolve() != target.resolve():
+                    shutil.copyfile(source, target)
+                kept.append(str(target))
+        named = replace(print_, name=name)
+        data = {"print": named.to_dict(), "pictures": kept, "recipe": recipe or []}
+        self.store.save_style(user, code, name=name, data=data, liked=bool(existing and existing["liked"]))
+        return {"code": code, "name": name, "slug": slug, "data": data}
+
+    # ----------------------------------------------------------------- lookbooks ----
+
+    #: The most pictures one Lookbook holds.
+    MAX_LOOKBOOK_IMAGES = 60
+
+    def _book(self, lookbook_id: str) -> dict[str, Any]:
+        book = self.store.get_lookbook(lookbook_id)
+        if book is None or book["deleted"]:
+            raise DreambotError("I can't find that Lookbook.")
+        return book
+
+    def find_lookbook(self, token: str) -> dict[str, Any] | None:
+        """A Lookbook by its id, or by its name (as written, or as the one word typed after ``--p``)."""
+        wanted = token.strip().lower()
+        books = self.store.list_lookbooks()
+        for book in books:
+            if book["id"].lower() == wanted:
+                return book
+        for book in books:
+            if lookbook.slug(book["name"]) == lookbook.slug(wanted):
+                return book
+        return None
+
+    def _check_book_name(self, name: str, keeping: str | None = None) -> str:
+        name = lookbook.clean_name(name)
+        slug = lookbook.slug(name)
+        if not slug:
+            raise DreambotError("Give the Lookbook a name, e.g. `Autumn diner`.")
+        if slug in (lookbook.DEFAULT, lookbook.LIKED):
+            raise DreambotError(f"`{name}` already means something after `--p`; choose another name.")
+        other = self.find_lookbook(slug)
+        if other is not None and other["id"] != keeping:
+            raise DreambotError(f"There is already a Lookbook called `{other['name']}`.")
+        return name
+
+    def _members(self, images: Sequence[dict[str, Any]]) -> list[lookbook.Member]:
+        return [
+            lookbook.Member(image["key"], image["path"], self._print_of(image["path"], image["key"]))
+            for image in images
+            if Path(image["path"]).is_file()
+        ]
+
+    def describe_lookbook(self, book: dict[str, Any], user: str | None = None) -> dict[str, Any]:
+        """A Lookbook as frontends show it: its pictures, its code, and what Dreambot makes of it."""
+        images = self.store.lookbook_images(book["id"])
+        members = self._members(images)
+        prints = {member.key: member.print for member in members}
+        blend = lookbook.consensus(members)
+        code = self._freeze(book["id"], book["name"], images) if images else None
+        return {
+            "id": book["id"],
+            "name": book["name"],
+            "slug": lookbook.slug(book["name"]),
+            "code": code,
+            "count": len(images),
+            "updated": book["updated"],
+            "default": bool(user and book["id"] in self.settings(user).looks),
+            "unread": sum(1 for member in members if not member.print.worded),
+            "style": style_card(blend),
+            "images": [
+                {
+                    "id": image["id"],
+                    "path": image["path"],
+                    "source": image["source"],
+                    "style": style_card(prints.get(image["key"])),
+                }
+                for image in images
+            ],
+        }
+
+    def lookbooks(self, user: str | None = None) -> list[dict[str, Any]]:
+        return [self.describe_lookbook(book, user) for book in self.store.list_lookbooks()]
+
+    def create_lookbook(self, *, user: str, name: str) -> dict[str, Any]:
+        book = self.store.create_lookbook(new_job_id().lower(), user, self._check_book_name(name))
+        return self.describe_lookbook(book, user)
+
+    def rename_lookbook(self, *, user: str, lookbook_id: str, name: str) -> dict[str, Any]:
+        book = self._book(lookbook_id)
+        self.store.update_lookbook(lookbook_id, name=self._check_book_name(name, keeping=book["id"]))
+        return self.describe_lookbook(self._book(lookbook_id), user)
+
+    def delete_lookbook(self, *, lookbook_id: str) -> None:
+        """Remove a Lookbook from the list. The codes it has been used under keep working."""
+        book = self._book(lookbook_id)
+        images = self.store.lookbook_images(lookbook_id)
+        if images:
+            self._freeze(lookbook_id, book["name"], images)
+        self.store.update_lookbook(lookbook_id, deleted=True)
+
+    def _freeze(self, lookbook_id: str, name: str, images: Sequence[dict[str, Any]]) -> str:
+        """The code of a Lookbook as it is now, recorded so that it can be used again later."""
+        code = lookbook.version_code(lookbook_id, [image["key"] for image in images])
+        self.store.save_lookbook_code(
+            code,
+            lookbook_id,
+            {"name": name, "images": [{"key": image["key"], "path": image["path"]} for image in images]},
+        )
+        return code
+
+    async def add_to_lookbook(
+        self, *, user: str, lookbook_id: str, source: str | Path, origin: str = "upload"
+    ) -> dict[str, Any]:
+        """Add a picture to a Lookbook: a file on this Mac, or a link to one.
+
+        The picture is copied into Dreambot's own folder, so the Lookbook does not depend on the
+        file it came from. Adding a picture the book already holds changes nothing.
+        """
+        book = self._book(lookbook_id)
+        images = self.store.lookbook_images(lookbook_id)
+        if len(images) >= self.MAX_LOOKBOOK_IMAGES:
+            raise DreambotError(f"A Lookbook holds at most {self.MAX_LOOKBOOK_IMAGES} pictures.")
+        scratch = self._scratch()
+        try:
+            if isinstance(source, str) and re.match(r"https?://", source, re.IGNORECASE):
+                origin = f"link:{source}"[:300]
+                source = await asyncio.to_thread(fetch_image, source, scratch)
+            prepared = await asyncio.to_thread(imaging.prepare_input, source, scratch, max_side=2048)
+        except (FetchError, ImageError) as exc:
+            raise DreambotError(str(exc)) from exc
+        key = await asyncio.to_thread(fingerprint.image_key, prepared)
+        if not any(image["key"] == key for image in images):
+            image_id = new_job_id().lower()
+            folder = self.config.home / "lookbooks" / lookbook_id
+            folder.mkdir(parents=True, exist_ok=True)
+            target = folder / f"{image_id}{Path(prepared).suffix.lower() or '.png'}"
+            shutil.copyfile(prepared, target)
+            self.store.add_lookbook_image(image_id, lookbook_id, str(target), key, origin)
+            await asyncio.to_thread(self._print_of, target, key)
+            self.study_lookbook(lookbook_id)
+        return self.describe_lookbook(self._book(book["id"]), user)
+
+    def remove_from_lookbook(self, *, user: str, lookbook_id: str, image_id: str) -> dict[str, Any]:
+        """Take a picture out of a Lookbook. Its file stays: an earlier code may still stand for it."""
+        book = self._book(lookbook_id)
+        images = self.store.lookbook_images(lookbook_id)
+        if images:
+            self._freeze(lookbook_id, book["name"], images)  # the state being left stays usable
+        if not self.store.remove_lookbook_image(lookbook_id, image_id):
+            raise DreambotError("That picture isn't in this Lookbook.")
+        return self.describe_lookbook(self._book(lookbook_id), user)
+
+    def _look_sources(self, params: Params, user: str, settings: ResolvedSettings) -> list[StyleSource]:
+        """The Lookbooks a prompt asks for with ``--p``, each as a style ingredient.
+
+        A token is the code of a version, the id or name of a Lookbook (its current version),
+        ``default`` for the person's chosen Lookbooks, or ``liked`` for their favourites.
+        """
+        tokens = params.personalize
+        # With the Personalize switch on, every prompt uses the defaults — but a person who has
+        # not set any up yet is not told so on every single prompt.
+        insist = tokens is not None
+        if tokens is None:
+            if not settings.personalize:
+                return []
+            tokens = [lookbook.DEFAULT]
+        sources: list[StyleSource] = []
+        for token in tokens:
+            name, weight = lookbook.parse_token(token)
+            if weight <= 0:
+                continue
+            wanted = name.lower()
+            if wanted == lookbook.DEFAULT:
+                chosen = [book for book in map(self.store.get_lookbook, settings.looks) if book]
+                found = [
+                    source
+                    for book in chosen
+                    if not book["deleted"] and (source := self._book_source(book, weight, quiet=True))
+                ]
+                liked = None if found else self._liked_source(weight)
+                if not found and liked is None and insist:
+                    raise DreambotError(
+                        "You have no default Lookbook yet. Make one in the web app (`dreambot web`) and "
+                        "choose it there or with `/looks default <name>`, or name one: `--p <name>`. "
+                        "Once you have favourited some pictures, `--p` uses those."
+                    )
+                sources.extend(found or ([liked] if liked else []))
+            elif wanted == lookbook.LIKED:
+                liked = self._liked_source(weight)
+                if liked is None:
+                    raise DreambotError(
+                        "You haven't favourited any pictures yet, so there is no `liked` look."
+                    )
+                sources.append(liked)
+            elif frozen := (
+                self.store.get_lookbook_code(wanted) if lookbook.looks_like_code(wanted) else None
+            ):
+                members = self._members(frozen.get("images", []))
+                if not members:
+                    raise DreambotError(f"The pictures behind the Lookbook code `{wanted}` are gone.")
+                label = f"Lookbook {frozen.get('name') or wanted}"
+                sources.append(StyleSource("look", label, weight, code=wanted, members=members))
+            else:
+                book = self.find_lookbook(name)
+                if book is None:
+                    known = ", ".join(f"`{lookbook.slug(b['name'])}`" for b in self.store.list_lookbooks())
+                    raise DreambotError(
+                        f"I don't know a Lookbook called `{name}`."
+                        + (f" You have: {known}." if known else " Make one in the web app: `dreambot web`.")
+                    )
+                source = self._book_source(book, weight)
+                assert source is not None
+                sources.append(source)
+        return sources
+
+    def _book_source(self, book: dict[str, Any], weight: float, *, quiet: bool = False) -> StyleSource | None:
+        images = self.store.lookbook_images(book["id"])
+        members = self._members(images)
+        if not members:
+            if quiet:
+                return None
+            raise DreambotError(f"The Lookbook `{book['name']}` has no pictures in it yet.")
+        code = self._freeze(book["id"], book["name"], images)
+        return StyleSource("look", f"Lookbook {book['name']}", weight, code=code, members=members)
+
+    def _liked_source(self, weight: float) -> StyleSource | None:
+        """The pictures a person has favourited, as a Lookbook."""
+        images = []
+        for _job, image in self.store.favorite_images(lookbook.LIKED_LIMIT):
+            if Path(image.path).is_file():
+                images.append({"key": fingerprint.image_key(image.path), "path": image.path})
+        if not images:
+            return None
+        code = self._freeze(lookbook.LIKED, "Liked", images)
+        return StyleSource("look", "Lookbook Liked", weight, code=code, members=self._members(images))
+
+    def set_default_lookbooks(self, *, user: str, lookbook_ids: Sequence[str]) -> list[str]:
+        """Choose the Lookbooks a bare ``--p`` stands for."""
+        known = {book["id"] for book in self.store.list_lookbooks()}
+        chosen = [book_id for book_id in dict.fromkeys(lookbook_ids) if book_id in known]
+        settings = self.settings(user)
+        settings.looks = chosen
+        self.store.save_settings(user, settings.to_dict())
+        return chosen
+
+    def study_lookbook(self, lookbook_id: str) -> int:
+        """Have the vision model read a Lookbook's pictures when the GPU is next free.
+
+        Returns how many are waiting to be read. A job that uses the book before then reads what
+        it needs itself, so this only ever saves time.
+        """
+        if self.catalog.vision_model() is None:
+            return 0
+        waiting = 0
+        for image in self.store.lookbook_images(lookbook_id):
+            known = self.store.get_fingerprint(image["key"])
+            if known and known.get("medium"):
+                continue
+            waiting += 1
+
+            async def read(path: str = image["path"], key: str = image["key"]) -> None:
+                now = self.store.get_fingerprint(key)
+                if (now and now.get("medium")) or not Path(path).is_file():
+                    return
+                await self._read_style(path, key, self._print_of(path, key))
+
+            self._chores.append(read)
+        if waiting:
+            self._wake.set()
+        return waiting
 
     # ------------------------------------------------------------------- actions ----
 
@@ -505,6 +1041,25 @@ class Dreambot:
             )
         if kind is ActionKind.INFO:
             return ActionResult(jobs=[], job=job, image=image, message=describe_job(job, image))
+        if kind is ActionKind.LOOK:
+            name = lookbook.clean_name(action.prompt or "")
+            if not name:
+                raise DreambotError("Name the Lookbook to add this to, e.g. `look 2: autumn diner`.")
+            book = self.find_lookbook(name)
+            started = book is None
+            if book is None:
+                book = self.store.create_lookbook(new_job_id().lower(), user, self._check_book_name(name))
+            kept = await self.add_to_lookbook(
+                user=user, lookbook_id=book["id"], source=image.path, origin=f"job:{job.id}:{image.index}"
+            )
+            opening = (
+                f"Started the Lookbook `{kept['name']}` with this picture."
+                if started
+                else f"Added to the Lookbook `{kept['name']}`, which now has {kept['count']} pictures."
+            )
+            return ActionResult(
+                jobs=[], job=job, image=image, message=f"{opening} Use it with `--p {kept['slug']}`."
+            )
         assert kind in GENERATIVE
         self._check_room(user, 1)
         try:
@@ -814,12 +1369,30 @@ class Dreambot:
         )
 
     def _runner(
-        self, plan: Plan, replan: Callable[..., Plan] | None = None
+        self,
+        plan: Plan,
+        replan: Callable[..., Plan] | None = None,
+        style_refs: ResolvedRefs | None = None,
     ) -> Callable[[Job], Awaitable[None]]:
+        """What the queue calls to carry a plan out.
+
+        ``style_refs`` are the references of a job whose style still has to be put into words:
+        the vision model is asked first, and the job is planned again with what it said.
+        """
+
         async def run(job: Job) -> None:
             final = plan
-            if plan.brief is not None and replan is not None:
-                final = await self._enhance(job, plan, replan)
+            if style_refs is not None and replan is not None:
+                await self._describe_styles(job, style_refs)
+                try:
+                    final = replan()
+                except (PlanError, PromptError) as exc:
+                    log.warning("job %s: could not plan with the style's words (%s)", job.id, exc)
+                else:
+                    if "style" in final.detail:
+                        job.detail["style"] = _jsonable(final.detail["style"])
+            if final.brief is not None and replan is not None:
+                final = await self._enhance(job, final, replan)
             await self._run_plan(job, final)
 
         return run
@@ -904,11 +1477,21 @@ class Dreambot:
         try:
             pieces: dict[int, str] = {}
             for number, render in enumerate(plan.renders):
+                board: str | None = None
+                if render.board is not None:
+                    cut = await asyncio.to_thread(
+                        imaging.style_board,
+                        render.board.tiles,
+                        render.board.seed,
+                        work_dir / f"board{number}.png",
+                    )
+                    board = str(cut)
                 request = render.request(
                     request_id=new_request_id(),
                     out_dir=str(work_dir),
                     basename=f"r{number}",
                     preview_every=self.config.engine.preview_every,
+                    board=board,
                 )
                 self._current_request = request.id
                 base = done
@@ -1025,11 +1608,27 @@ def _explain(error: EngineError) -> str:
     return str(error)
 
 
+def style_card(print_: StyleFingerprint | None) -> dict[str, Any] | None:
+    """A fingerprint as frontends show it."""
+    if print_ is None or print_.empty:
+        return None
+    return {
+        "name": print_.name or fingerprint.name_of(print_),
+        "summary": fingerprint.summary(print_),
+        "words": print_.words(),
+        "swatches": [{"hex": swatch.hex, "share": swatch.share} for swatch in print_.swatches],
+        "read": print_.worded,
+    }
+
+
 def describe_job(job: Job, image: JobImage | None = None) -> str:
     """Seed, id and settings of a job (Midjourney's envelope reaction)."""
     lines = [f"Job {job.id} · {job.kind.value} · {job.model or 'n/a'}"]
     if job.prompt:
         lines.append(f"Prompt: {job.prompt}")
+    if style := job.detail.get("style"):
+        mix = ", ".join(f"{part['label']} {round(part['share'] * 100)}%" for part in style.get("sources", []))
+        lines.append(f"Style: {style.get('summary', '')}" + (f" ({mix})" if "," in mix else ""))
     if image is not None:
         lines.append(f"Image {image.index}: seed {image.seed} · {image.width}x{image.height}")
         if image.prompt:

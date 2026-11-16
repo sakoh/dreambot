@@ -7,8 +7,10 @@ Masks follow one convention everywhere in Dreambot: **white is repainted, black 
 from __future__ import annotations
 
 import math
+import random
 import subprocess
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -473,4 +475,63 @@ def region_overlay(
             )
     out.parent.mkdir(parents=True, exist_ok=True)
     Image.alpha_composite(image.convert("RGBA"), overlay).convert("RGB").save(out, quality=90)
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# Style boards
+# --------------------------------------------------------------------------------------
+
+
+def style_board(
+    tiles: Sequence[tuple[str | Path, float]], seed: int, out: Path, *, grid: int = 5, side: int = 1020
+) -> Path:
+    """Cut a board of style swatches from pictures, for a model that takes reference images.
+
+    ``tiles`` are (picture, weight). The board is ``grid`` x ``grid`` square pieces, shuffled;
+    each picture gets pieces in proportion to its weight and at least one, cut from random
+    places in it. What a picture was *of* does not survive that, but its colour, line, texture
+    and light do, which is the point: see :class:`dreambot.core.planner.Board`. The same tiles
+    and seed always give the same board.
+    """
+    cells = grid * grid
+    # Heaviest first, and no more pictures than there are pieces to give them.
+    wanted = sorted(
+        ((Path(path), weight) for path, weight in tiles if weight > 0), key=lambda item: -item[1]
+    )[:cells]
+    if not wanted:
+        raise ImageError("There is no style picture to cut a board from.")
+    total = sum(weight for _, weight in wanted)
+    spare = cells - len(wanted)
+    quotas = [weight / total * spare for _, weight in wanted]
+    counts = [1 + int(quota) for quota in quotas]
+    # The pieces left over by rounding down go to the largest remainders.
+    by_remainder = sorted(range(len(quotas)), key=lambda index: (int(quotas[index]) - quotas[index], index))
+    for index in by_remainder[: cells - sum(counts)]:
+        counts[index] += 1
+
+    rng = random.Random(f"board|{seed}")
+    piece = side // grid
+    pieces: list[Image.Image] = []
+    for (path, _), count in zip(wanted, counts, strict=True):
+        try:
+            with Image.open(path) as opened:
+                picture = flatten(opened)
+        except (OSError, ValueError) as exc:
+            raise ImageError(f"I couldn't read the style picture {path.name}.") from exc
+        scale = side / min(picture.size)
+        picture = picture.resize(
+            (max(piece, round(picture.width * scale)), max(piece, round(picture.height * scale))),
+            Image.LANCZOS,
+        )
+        for _ in range(count):
+            left = rng.randrange(picture.width - piece + 1)
+            top = rng.randrange(picture.height - piece + 1)
+            pieces.append(picture.crop((left, top, left + piece, top + piece)))
+    rng.shuffle(pieces)
+    board = Image.new("RGB", (piece * grid, piece * grid))
+    for position, cut in enumerate(pieces):
+        board.paste(cut, ((position % grid) * piece, (position // grid) * piece))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    board.save(out)
     return out

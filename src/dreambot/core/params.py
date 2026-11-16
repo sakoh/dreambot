@@ -83,7 +83,8 @@ class ParamSpec:
 class Ref:
     """One image reference inside a parameter such as ``--sref`` or ``--edit``."""
 
-    #: ``url`` | ``attachment`` (1-based index into the message's attachments) | ``code`` | ``random`` | ``path``
+    #: ``url`` | ``attachment`` (1-based index into the message's attachments) | ``code`` | ``random`` |
+    #: ``path`` | ``saved`` (a style kept under a name, ``--sref`` only)
     kind: str
     value: str
     weight: float = 1.0
@@ -318,9 +319,10 @@ PARAMS: tuple[ParamSpec, ...] = (
         "sref",
         Kind.REFS,
         support=_E,
-        summary="Style reference: image(s), a style code, or `random`.",
-        how="Images are passed to a reference-capable edit model as style guides; codes pick a "
-        "reproducible style recipe from Dreambot's own style space (not Midjourney's codes).",
+        summary="Style reference: images, style codes, saved styles or `random`, each with an optional `::weight`.",
+        how="Every reference becomes a style fingerprint (medium, rendering, palette, light, texture, mood) "
+        "and they are blended by weight; an edit model is shown the pictures as well. Codes are "
+        "Dreambot's own, not Midjourney's.",
     ),
     ParamSpec(
         "sw",
@@ -336,8 +338,10 @@ PARAMS: tuple[ParamSpec, ...] = (
         Kind.INT,
         minimum=1,
         maximum=7,
-        support=_A,
-        summary="Style reference version (no effect locally).",
+        support=_E,
+        summary="Style version: 1 original, 2 blended (default), 3 words only.",
+        how="1 keeps the original recipes for codes; 2 blends style fingerprints and shows an edit model "
+        "the pictures; 3 applies the fingerprint in words on your chosen model.",
     ),
     ParamSpec(
         "cref",
@@ -380,9 +384,11 @@ PARAMS: tuple[ParamSpec, ...] = (
     ParamSpec(
         "personalize",
         Kind.OPTIONAL_VALUE,
-        aliases=("p", "profile"),
-        support=_P,
-        summary="Apply your personalization profile or a moodboard.",
+        aliases=("p", "profile", "look"),
+        support=_E,
+        summary="Apply Lookbooks: your defaults, or ones named by name or code, each with an optional `::weight`.",
+        how="A Lookbook is a set of pictures (Midjourney's moodboard). Each image of a grid leans on a "
+        "different picture of it; `--stylize` sets how strongly it is applied.",
     ),
     # ---------------------------------------------------------- model selection ----
     ParamSpec(
@@ -572,8 +578,9 @@ def parse_refs(spec: ParamSpec, raw: str) -> list[Ref]:
     """Parse the value of a reference parameter.
 
     Accepted tokens: ``https://...`` URLs, ``@1`` (the first image attached to the message),
-    file paths, ``random``, numeric style codes; each may end in ``::weight``. An empty value
-    means "use the images attached to this message" and yields no refs here.
+    file paths, ``random``, numeric style codes and, for ``--sref``, the name of a saved style;
+    each may end in ``::weight``. An empty value means "use the images attached to this
+    message" and yields no refs here.
     """
     refs: list[Ref] = []
     for token in raw.split():
@@ -593,6 +600,8 @@ def parse_refs(spec: ParamSpec, raw: str) -> list[Ref]:
             refs.append(Ref("code", token, weight))
         elif token.startswith(("/", "~/", "./")):
             refs.append(Ref("path", token, weight))
+        elif spec.name == "sref" and re.fullmatch(r"[A-Za-z][\w.\-]*", token):
+            refs.append(Ref("saved", token, weight))  # looked up when the prompt is run
         else:
             raise PromptError(
                 f"`--{spec.name}` takes image links, `@1`-style attachment numbers, style codes or `random`; "

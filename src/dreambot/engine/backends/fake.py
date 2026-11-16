@@ -148,6 +148,18 @@ class FakeBackend:
             raise BackendError(f"Input image not found: {req.image}", ErrorKind.INVALID)
         with Image.open(req.image) as image:
             width, height = image.size
+            red, green, blue = image.convert("RGB").resize((1, 1)).getpixel((0, 0))
+        if req.instruction and "medium:" in req.instruction:
+            # A request for a style fingerprint: answer in kind, differently for different pictures.
+            media = ("gouache illustration", "35mm film photograph", "linocut print", "pencil drawing")
+            return [
+                f"medium: {media[(red + green + blue) % len(media)]}",
+                "rendering: placeholder rendering",
+                "palette: placeholder colors",
+                "light: soft placeholder light",
+                "texture: placeholder texture",
+                "mood: placeholder mood",
+            ][: req.count]
         return [f"a placeholder description #{i + 1} of a {width}x{height} image" for i in range(req.count)]
 
     def text(self, req: TextRequest, ctx: JobContext) -> list[str]:

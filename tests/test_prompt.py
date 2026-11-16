@@ -132,7 +132,7 @@ def test_canonical_form_round_trips():
         ("x --motion fast", "must be one of"),
         ("x --model", "single name"),
         ("x --no", "at least one item"),
-        ("x --sref banana", "don't understand `banana`"),
+        ("x --oref banana", "don't understand `banana`"),
         ("x --lora", "needs a LoRA name"),
     ],
 )

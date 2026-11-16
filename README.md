@@ -1,8 +1,8 @@
 # Dreambot
 
 A free, open-source alternative to Midjourney that runs **completely locally and privately on your Mac**.
-Text it from **iMessage**, **Discord** or **Telegram**; it answers with images made on your own GPU by
-[MLX](https://github.com/ml-explore/mlx) models.
+Text it from **iMessage**, **Discord** or **Telegram**, or open its **web app**; it answers with images made
+on your own GPU by [MLX](https://github.com/ml-explore/mlx) models.
 
 ```
 you:       a red fox in the snow, golden hour --ar 16:9 --chaos 20
@@ -17,13 +17,14 @@ app you choose to talk to it with.
 
 > **Status: early (0.1).** The core, the command line and the image pipeline are verified on real models,
 > and all three bots (Telegram, Discord and iMessage) have been used on the live services. Not every
-> button and command has been pressed on each of them yet. See [what is verified](#what-is-verified).
+> button and command has been pressed on each of them yet. The web app has been driven end to end in
+> WebKit. See [what is verified](#what-is-verified).
 
 ## Contents
 
 - [Requirements](#requirements) · [Install](#install) · [Quick start](#quick-start)
-- [Models](#models) · [Prompts and parameters](#prompts-and-parameters) · [The prompt enhancer](#the-prompt-enhancer) · [Working with results](#working-with-results)
-- [Chat frontends](#chat-frontends): [Telegram](#telegram) · [Discord](#discord) · [iMessage](#imessage)
+- [Models](#models) · [Prompts and parameters](#prompts-and-parameters) · [The prompt enhancer](#the-prompt-enhancer) · [Styles and Lookbooks](#styles-and-lookbooks) · [Working with results](#working-with-results)
+- [Web app](#web-app) · [Chat frontends](#chat-frontends): [Telegram](#telegram) · [Discord](#discord) · [iMessage](#imessage)
 - [Privacy](#privacy) · [How it works](#how-it-works) · [Midjourney parity](#midjourney-parity) · [Development](#development)
 
 ## Requirements
@@ -47,6 +48,7 @@ Everything below is shown as `dreambot ...`; inside the checkout that is `uv run
 ```sh
 dreambot models pull z-image-turbo        # ~11 GB; skip if you already use mflux with it
 dreambot imagine "an astronaut tending a rooftop garden above a neon city at dusk --ar 16:9"
+dreambot web                              # the web app, in your browser
 dreambot chat                             # the full chat experience in your terminal
 ```
 
@@ -106,9 +108,9 @@ a lighthouse at dusk, oil painting --ar 3:2 --stylize 250 --no people --seed 42
 | --- | --- |
 | **Native** — same behaviour, done by the local model | `--ar` `--seed` `--sameseed` `--repeat` `--stop` `--raw` `--no` `--edit` |
 | **Art direction** — done by [the prompt enhancer](#the-prompt-enhancer) | `--stylize` `--chaos` `--weird` `--exp` |
-| **Approximated** — Midjourney's version lives inside its own model | `--quality` `--hd` `--draft` `--iw` `--sref` `--sw` `--cref` `--cw` `--oref` `--ow` `--niji` |
-| **Accepted, no effect locally** | `--v` `--sv` `--fast` `--relax` `--turbo` `--stealth` `--public` `--preview` |
-| **Planned** | `--tile` `--p` (personalization) `--video` `--motion` `--loop` `--end` `--bs` |
+| **Approximated** — Midjourney's version lives inside its own model | `--quality` `--hd` `--draft` `--iw` `--sref` `--sw` `--sv` `--p` `--cref` `--cw` `--oref` `--ow` `--niji` |
+| **Accepted, no effect locally** | `--v` `--fast` `--relax` `--turbo` `--stealth` `--public` `--preview` |
+| **Planned** | `--tile` `--video` `--motion` `--loop` `--end` `--bs` |
 | **Dreambot extensions** | `--model` `--steps` `--cfg` `--strength` `--lora` `--neg` `--n` |
 
 Also supported: permutations (`a {red, blue} bird --ar {1:1, 16:9}` makes four jobs), multi-prompts with
@@ -124,7 +126,8 @@ dash that iPhones substitute for `--`.
 | `a cottage on a cliff --sref` | borrow the image's style, not its content |
 | `a castle` (image attached, no flag) | use it as an image prompt |
 
-With several attachments, `@1`, `@2` pick which is which: `... --oref @1 --sref @2`.
+With several attachments, `@1`, `@2` pick which is which: `... --oref @1 --sref @2`. Styles blend by
+weight — see [Styles and Lookbooks](#styles-and-lookbooks).
 
 ## The prompt enhancer
 
@@ -161,6 +164,84 @@ graphics such as logos and icons, and anything with an image attached. It needs 
 back to simple rule-based phrases. It is on by default on Macs with 24 GB of memory or more — switch
 it with `/settings enhance on|off`.
 
+## Styles and Lookbooks
+
+Midjourney takes a picture's *style* from several places at once — reference images, style codes,
+moodboards — and mixes them by weight inside its own model. Open models have no such input, so Dreambot
+reduces every source of style to one description, a **style fingerprint**, and does the mixing on that:
+
+| Part | What it is | Where it comes from |
+| --- | --- | --- |
+| Words | medium, rendering, palette, light, texture, mood | the local vision model, asked how a picture is made and never what it shows; or decoded from a style code |
+| Numbers | the dominant colours and the tonal balance | measured from the pixels |
+
+A fingerprint never says what a picture is *of*, which is what lets it be applied to a prompt about
+something else.
+
+```
+a cottage on a cliff --sref @1                    one reference image
+a cottage on a cliff --sref @1::3 @2::1           two, three parts to one
+a cottage on a cliff --sref 4821 @1 --sw 300      a style code and an image, applied strongly
+a cottage on a cliff --sref random --repeat 4     four jobs, each with a style of its own
+a cottage on a cliff --sref dusty-noir            a style you saved under a name
+```
+
+**Blending.** The colours and the tonal balance are a true weighted mix. Words cannot be averaged, so
+the heaviest style sets the medium, the rendering and the light; a style holding at least 30% of the
+weight adds its texture and mood; and when no style clearly leads, the medium is named as a cross of
+the two heaviest.
+
+**What the model is shown.** The words go into the prompt, so a style works on any model. A model that
+takes reference images (FLUX.2 klein, Qwen-Image 2.1) is also shown a *swatch board*: a sheet of
+shuffled pieces cut from the style pictures, each picture getting pieces in proportion to its weight.
+It is never shown the pictures whole. That is the result of testing, not taste — see
+[what is verified](#what-is-verified): shown whole, a reference put its own content into the result
+(a hand, a caption) and on its own barely carried its style over.
+
+| | |
+| --- | --- |
+| `--sw 0…1000` | How much of the fingerprint is applied. Under 50 a hint; from 50 the medium, rendering, palette and light; from 200 the texture and mood too; from 500 it is insisted on. |
+| `--sv 1` | The original behaviour: a code is a fixed recipe, and an image is shown whole to an edit model. Codes from before keep their look. |
+| `--sv 2` | Words and swatch board. The default. |
+| `--sv 3` | Words only, staying on the model you chose. |
+
+A style goes along with the model you chose, typed or as your default, rather than moving the job to
+another one: on a model that cannot take reference images it is applied in words.
+
+**Style codes** are Dreambot's own: a number from 1 to 4,294,967,295 that decodes to one of 5.4 million
+styles. They are shareable between Dreambot users and mean nothing to Midjourney. The web app's Styles
+page lets you browse, search ("anime pastel", "film grain"), like and try them.
+
+### Lookbooks
+
+A Lookbook is a named set of pictures that stands for a look — Midjourney's moodboard. Make one in the
+web app (upload, paste a link, or pick from your own images), or from a chat by replying to a picture
+with `look: autumn diner`.
+
+```
+a harbour at dawn --p autumn-diner                that Lookbook
+a harbour at dawn --p autumn-diner::2 noir        two, blended two to one
+a harbour at dawn --p                             your default Lookbooks
+a harbour at dawn --p --stylize 400               ...applied strongly
+```
+
+- Where `--sref` is one look applied as it is, a Lookbook is a range: each image of a grid is led by a
+  different picture of the book (60% that picture, 40% the rest), so a varied book gives varied results
+  and a tight one consistent results. The same seed gives the same leads.
+- `--stylize` sets how strongly it applies; `--sw` is for style references and leaves it alone. With
+  both, the style reference decides the medium and the Lookbook colours it.
+- Every state of a Lookbook has a **code**. A prompt that names a book is recorded with the code of the
+  version used, and that code keeps meaning those pictures after you change or delete the book, so an
+  old prompt can always be run again.
+- `/looks` lists them. `/looks default autumn-diner` chooses what a bare `--p` means, and
+  `/settings personalize on` (the **P** button in the web app) adds it to every prompt.
+- Pictures you favourite form a `liked` Lookbook: `--p liked`, and what a bare `--p` uses until you
+  choose a default.
+
+`--profile` and `--personalize` are the same parameter, as in Midjourney; `--look` is Dreambot's name
+for it. Lookbooks and saved styles belong to the whole Dreambot, so one made in the web app works from
+iMessage too.
+
 ## Working with results
 
 Under a grid, Discord and Telegram show Midjourney's buttons. Everywhere — and on iMessage, which has no
@@ -179,14 +260,44 @@ buttons — you can type the same things:
 | `region B2-D4: a red balloon` | repaint part of the image (send `region` to see the cell grid) |
 | `region the sky: an aurora` | …or describe the part instead |
 | `edit: make it night` | change the whole image by instruction |
+| `look: autumn diner` | add the image to that Lookbook (and start it, if it is new) |
 | `fav`, `info`, `cancel` | favourite, show seed and job id, cancel |
 
 Add a number when a job has several images (`upscale 2`). Replying to a specific picture targets that
 picture, and replying with plain words edits it.
 
 Commands: `/imagine`, `/describe` (image → four prompts), `/blend` (2–5 images), `/edit`, `/shorten`,
-`/settings`, `/prefer suffix`, `/prefer option set|list`, `/prefer remix`, `/prefer variability`, `/show`,
-`/info`, `/models`, `/params`, `/cancel`, `/help`.
+`/settings`, `/looks`, `/prefer suffix`, `/prefer option set|list`, `/prefer remix`, `/prefer variability`,
+`/show`, `/info`, `/models`, `/params`, `/cancel`, `/help`.
+
+## Web app
+
+```sh
+dreambot web                 # start it and open it in your browser
+dreambot setup web           # have `dreambot run` and the background service host it too
+```
+
+Midjourney's website, for one Mac: <http://127.0.0.1:7373/>.
+
+| Page | What is there |
+| --- | --- |
+| **Create** | The prompt bar, with drop zones for an image prompt, a style reference and a subject reference; an uploads library; settings (shape, model, stylize, variety, weirdness, raw, HD); the **P** button. Below it, everything that has been made, newest first, with jobs drawing themselves as they run. |
+| **Lightbox** | Click an image: vary (subtle, strong, remix), upscale (subtle, creative), zoom, pan, make square, edit, rerun, describe; copy the prompt, seed or job id; download; like; file it in a folder or a Lookbook; use it in the next prompt. ← → move through the feed. |
+| **Organize** | Every image, to search and to filter by liked, model, kind of job, Lookbook, folder and day. Select many (shift-click for a range) to like, trash, file or download as a zip. Trash only hides. |
+| **Lookbooks** | Make, fill, rename and delete Lookbooks; choose your defaults; see what Dreambot reads in a book. |
+| **Styles** | Explore style codes (shuffle, search, like, the styles one step away, try one on your latest prompt), your saved styles, and the **blend bench**: put codes, pictures and Lookbooks together, set their weights, read what the blend comes to before anything is rendered, then try it or save it under a name. |
+
+Pictures made from iMessage, Discord and Telegram appear in it too: there is one database. When the
+background service hosts the web app they appear as they are made; a separate `dreambot web` shows them
+when the page is reloaded.
+
+**Who can reach it.** It listens on `127.0.0.1` and has no accounts: whoever opens it is at the Mac. A
+local web server can still be reached by any web page open in the same browser, so the app checks that
+a request is addressed to it by its own name (which stops another site pointing its own name at your
+Mac), requires a session cookie that only its own page is given and that no other site's request
+carries, and accepts changes only from its own page. Images are served by id, never by file path.
+It is not built to be put on a network: it has no password, and using it from a phone is not supported
+yet.
 
 ## Chat frontends
 
@@ -276,7 +387,10 @@ one attachment per message.
 - The only network access Dreambot starts on its own is `dreambot models pull`, and fetching an image
   *you* reference by link (links to private/local addresses are refused).
 - Bot tokens live in the macOS Keychain. Jobs and settings live in a SQLite file under
-  `~/Library/Application Support/Dreambot/`. Images live in `~/Pictures/Dreambot/`.
+  `~/Library/Application Support/Dreambot/`, next to the pictures you put in Lookbooks and saved
+  styles. Images live in `~/Pictures/Dreambot/`.
+- The web app listens on `127.0.0.1` only and has no accounts: it is for the person at the Mac.
+  Other web pages open in the same browser are kept out of it (see [Web app](#web-app)).
 - No telemetry.
 - Your prompts and results do pass through whichever chat service you use (Telegram, Discord, Apple), as
   any message does. `dreambot chat` and `dreambot imagine` involve no service at all.
@@ -286,8 +400,9 @@ one attachment per message.
 ```
  iMessage ─┐
  Discord  ─┼─► frontends ─► commands ─► service ─► planner ─► engine client ══► worker process
- Telegram ─┘   (thin)       (text UI)   (queue,     (which model,              (MLX: mflux, mlx-vlm;
- terminal ─┘                             jobs)       which operation)           models stay loaded)
+ Telegram ─┤   (thin)       (text UI)   (queue,     (which model,              (MLX: mflux, mlx-vlm;
+ terminal ─┤                    ▲        jobs)       which operation)           models stay loaded)
+ web app  ─┴────────────────────┘ (buttons are the same actions as chat buttons)
 ```
 
 - **Worker process.** All MLX inference happens in a subprocess that keeps models loaded between jobs. The
@@ -296,8 +411,8 @@ one attachment per message.
 - **Planner.** Maps each request to an operation — text-to-image, variation, edit, inpaint, upscale — and to
   the best installed model for it, falling back gracefully (for example outpainting through an edit model
   when no inpainting model is installed) and telling you what it did.
-- **One codebase for three platforms.** Platform adapters only send, edit and delete messages; everything
-  else is shared, so the bots cannot drift apart.
+- **One codebase for every platform.** Platform adapters only send, edit and delete messages, and the web
+  app sends the same actions a chat button does; everything else is shared, so they cannot drift apart.
 
 Configuration is optional: `~/Library/Application Support/Dreambot/config.toml`.
 
@@ -315,6 +430,10 @@ weights = "~/models/my-klein-finetune"
 
 [engine]
 idle_unload_seconds = 900
+
+[web]
+enabled = true              # `dreambot run` and the background service host the web app
+port = 7373
 ```
 
 ## Midjourney parity
@@ -323,11 +442,14 @@ idle_unload_seconds = 900
 
 - **Works:** `/imagine` grids, U/V/reroll, variations (subtle/strong, remix), upscales, zoom out, pan, make
   square, vary region, instruction edits, image/style/character references, `/blend`, `/describe`,
-  `/shorten`, `/settings`, `/prefer`, permutations, repeat, seeds (exactly reproducible), job history.
+  `/shorten`, `/settings`, `/prefer`, permutations, repeat, seeds (exactly reproducible), job history, and
+  a web app with the create page, lightbox, gallery, folders and trash.
 - **Approximated:** the aesthetic dials (`--stylize`, `--chaos`, `--weird`, `--exp`), which steer
-  Midjourney's proprietary model; here a local language model art-directs the prompt instead. Style codes
-  work, but they are Dreambot's own, not Midjourney's.
-- **Not yet:** video (Animate), personalization profiles and moodboards, `--tile`, a web gallery.
+  Midjourney's proprietary model; here a local language model art-directs the prompt instead. Style
+  references blend by weight, moodboards exist as Lookbooks and there is a style explorer — all by
+  Dreambot's own mechanism, and its style codes are its own, not Midjourney's.
+- **Not yet:** video (Animate), personalization by ranking images, the Style Creator, the Editor canvas,
+  `--tile`.
 
 ## What is verified
 
@@ -337,6 +459,12 @@ idle_unload_seconds = 900
 | Z-Image Turbo, FLUX.2 klein 4B, Qwen-Image 2512, Qwen-Image 2.1, Ming-Image, SeedVR2 3B | real weights, in `tests/test_mlx_engine.py` |
 | Variations, upscales (SeedVR2 and tiled), `--hd`, edits, references, zoom/pan/square, region edits, describe | real weights, results inspected by eye |
 | The prompt enhancer | real language model (Qwen2.5-VL 7B) and real images, compared with and without |
+| Style references (`--sref`) | real weights (Z-Image Turbo, FLUX.2 klein 4B; Qwen-Image 2.1 for one comparison) and the real vision model, results inspected by eye. Three prompts across the three style versions with one reference: shown the picture whole (`--sv 1`), none of the three took its style and one had the reference's hand and gun in it; with words and a swatch board (`--sv 2`) and with words alone (`--sv 3`), all three took the style and none took its content. **Two reference pictures in all**, both generated images: photographs and pictures with a lot of text in them have not been tried |
+| Blending by weight | real weights, two prompts: the same two references at 3:1, 1:1 and 1:3 give a visible progression from one style to the other; a style code with a picture gives a plausible mix. More than two references: automated tests only |
+| What the vision model says about a style | nine real images. It names a medium and five short phrases, drops the labels about half the time (the parser then reads by position), and calls most generated images "digital painting". Asked to fuse two styles into one, it joined their phrases with "and" or copied the worked example, so blending is done by rule |
+| Lookbooks | real weights: a four-picture book gave each image of a grid a different lead and a visibly different look; a one-picture book at `--stylize` 0, 20, 100 and 400 gave no look, a touch, the look, and more of it. With a book whose lead was photograph-like the three strengths looked alike, because the look was already close to the model's own. Larger books, several books at once, the `liked` book: automated tests only |
+| Web app | every route against the real service on the stand-in backend (automated, including who is let in); the pages driven end to end in WebKit, the engine Safari uses, on the stand-in backend, and one real job with a Lookbook. **Not tried** in Safari itself, Chrome or Firefox, nor on a phone |
+| `/looks` and `look: <name>` from the chat apps | automated tests through the shared command layer; **not run on the live services** |
 | The other 46 models | class paths, arguments and defaults checked against mflux; **not run** (weights not installed during development) |
 | Telegram | **live**: pairing, prompts with the enhancer, grids with buttons, variations, `/describe` with a photo. The other actions: real library objects against a simulated API |
 | Discord | **live**: adding the bot to a server, `/pair`, `/imagine` with the enhancer, variation buttons. The other commands and buttons: the real command tree and views, with stand-ins for Discord's interactions and channels |
@@ -348,14 +476,16 @@ idle_unload_seconds = 900
 
 ```sh
 uv sync
-uv run pytest                 # ~540 tests, no model weights needed (about a minute)
+uv run pytest                 # ~650 tests, no model weights needed (about a minute)
 uv run pytest -m mlx -s       # real inference with whatever models are installed
 uv run ruff check . && uv run ruff format .
 DREAMBOT_BACKEND=fake uv run dreambot chat    # try everything without any weights
+DREAMBOT_BACKEND=fake uv run dreambot web     # ...or in the browser
 ```
 
 `src/dreambot/engine` is the model layer (registry, worker, wire protocol), `core` is platform-independent
-behaviour, and `frontends` are the chat adapters. `tests/test_registry.py` pins the model table to the
+behaviour, and `frontends` are the chat adapters and the web app. The web app has no build step: its pages
+are plain ES modules in `frontends/web/static`, and the one library they use is vendored there. `tests/test_registry.py` pins the model table to the
 installed mflux, so an mflux upgrade that adds or renames a model fails a test rather than silently going
 unsupported.
 

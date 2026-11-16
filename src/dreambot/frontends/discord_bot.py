@@ -675,6 +675,14 @@ class DiscordFrontend(ChatFrontend):
         simple("models", "List the installed models")
         simple("help", "How to use Dreambot")
         simple("params", "Every prompt parameter and how it works locally")
+
+        @tree.command(name="looks", description="Your Lookbooks: sets of pictures used with --p")
+        @app_commands.describe(default="Names of the Lookbooks a bare --p should use, or `none`")
+        async def looks(interaction: discord.Interaction, default: str | None = None) -> None:
+            await self._run_text(
+                interaction, f"/looks default {default}" if default else "/looks", private=True
+            )
+
         simple("cancel", "Cancel your running jobs here")
         for name in ("fast", "relax", "turbo", "stealth", "public"):
             simple(name, "Not needed on a local Dreambot (explains why)")

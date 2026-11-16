@@ -21,6 +21,8 @@ from dreambot.core.store import Store
 PAIRING_TTL_SECONDS = 15 * 60
 #: The Mac's own iMessage account: messages its owner sends from their own devices.
 LOCAL_IMESSAGE_USER = "me"
+#: Who the web app acts as. It listens on this Mac only, so whoever reaches it is at the Mac.
+LOCAL_WEB_USER = "web:local"
 OWNER = "owner"
 MEMBER = "member"
 
@@ -57,8 +59,13 @@ class Access:
     def role(self, user: str) -> str | None:
         """``"owner"``, ``"member"`` or ``None`` (not allowed)."""
         user = normalize_user(user)
-        # The terminal on the Mac, and the Mac's own iMessage account, are the owner by definition.
-        if user.startswith("console:") or user == f"imessage:{LOCAL_IMESSAGE_USER}" or user in self.owners():
+        # The terminal on the Mac, its own iMessage account and its web app (which only answers
+        # this Mac) are the owner by definition.
+        if (
+            user.startswith("console:")
+            or user in (f"imessage:{LOCAL_IMESSAGE_USER}", LOCAL_WEB_USER)
+            or user in self.owners()
+        ):
             return OWNER
         if user in self.members() or self._config.access.open:
             return MEMBER

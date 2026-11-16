@@ -272,7 +272,10 @@ def test_edit_model_handles_every_kind_of_reference(tmp_path: Path, picture: str
 
     many = ResolvedRefs(subject=[picture], style=[picture] * 4)
     with pytest.raises(PlanError, match="at most 4"):
-        imagine(p, "x", many)
+        imagine(p, "x --sv 1", many)
+    # From style version 2 the four style pictures are cut into one board, which takes one slot.
+    fitted = imagine(p, "x", ResolvedRefs(subject=[picture], style=[picture] * 4))
+    assert fitted.renders[0].images == [picture] and len(fitted.renders[0].board.tiles) == 4
 
     redux = planner(tmp_path, "z-image-turbo", "dev-redux")
     blended = imagine(redux, "a castle --iw 0.5", ResolvedRefs(image_prompts=[picture, picture]))
