@@ -457,6 +457,7 @@ class WebApp:
             for spec in service.catalog.installed()
         ]
         settings = service.settings(self.user)
+        retexturing = set(service.planner.retexture_loras())
         return JSONResponse(
             {
                 "version": __version__,
@@ -472,6 +473,8 @@ class WebApp:
                         # LoRAs for one family of models can be used together; others cannot.
                         "family": base.family if (base := service.catalog.registry.find(entry.base)) else "",
                         "trigger": entry.trigger,
+                        # Whether a picture can be drawn again in its look (Retexture).
+                        "retexture": entry.name in retexturing,
                     }
                     for entry in service.planner.loras.entries()[0]
                 ],

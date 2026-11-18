@@ -1,5 +1,6 @@
 // The lightbox: one image large, everything known about it, and every action Midjourney puts
-// under an image — vary, upscale, rerun, remix, zoom, pan, square, edit — plus where to keep it.
+// under an image — vary, upscale, rerun, remix, retexture, zoom, pan, square, edit — plus where
+// to keep it.
 
 import { html, useEffect, useRef, useState } from "./vendor/preact-htm.js";
 import { api, thumb } from "./api.js";
@@ -58,10 +59,56 @@ function Inline({ placeholder, action, value = "", onSubmit, onCancel, multiline
   </form>`;
 }
 
+/**
+ * What to draw a picture as when it is retextured: a LoRA, words of its own, or both.
+ * `loras` are the LoRAs that can be used, `usual` the name of the person's own one (or "").
+ */
+function Retexture({ loras, usual, onSubmit, onCancel }) {
+  const [lora, setLora] = useState(loras.some((each) => each.name === usual) ? usual : loras.length ? loras[0].name : "");
+  const [text, setText] = useState("");
+  const [hold, setHold] = useState("");
+  const submit = (event) => {
+    event.preventDefault();
+    const typed = text.trim();
+    // The choices are sent the way they are typed, "No LoRA" included; what is typed by hand wins.
+    const named = /(^|\s)--loras?(\s|$)/i.test(typed) ? "" : `--lora ${lora || "none"}`;
+    const held = hold && !/(^|\s)--strength(\s|$)/i.test(typed) ? `--strength ${hold}` : "";
+    onSubmit([typed, named, held].filter(Boolean).join(" "));
+  };
+  return html`<form class="inline" onSubmit=${submit}>
+    <label class="inline-lora" title="The look it is drawn in. A LoRA is one fine-tuned look; add more with dreambot loras add.">
+      <span>Draw it as</span>
+      <select autofocus value=${lora} onChange=${(event) => setLora(event.target.value)}>
+        ${loras.map((each) => html`<option value=${each.name}>${each.title}</option>`)}
+        <option value="">No LoRA</option>
+      </select>
+    </label>
+    <label class="inline-lora" title="How much of the picture is kept. The more of its layout is held, the less room the new look has.">
+      <span>Keep</span>
+      <select value=${hold} onChange=${(event) => setHold(event.target.value)}>
+        <option value="0.35">Less of the picture, more of the look</option>
+        <option value="">The layout (balanced)</option>
+        <option value="0.7">More of the picture, less of the look</option>
+      </select>
+    </label>
+    <textarea
+      rows="2"
+      placeholder="Optional: a prompt of its own, e.g. the same scene as a watercolour. Empty keeps its own."
+      value=${text}
+      onInput=${(event) => setText(event.target.value)}
+      onKeyDown=${(event) => event.key === "Enter" && !event.shiftKey && submit(event)}
+    ></textarea>
+    <div class="row end">
+      <button type="button" class="button" onClick=${onCancel}>Cancel</button>
+      <button type="submit" class="button is-primary">Retexture</button>
+    </div>
+  </form>`;
+}
+
 export function Lightbox() {
   const { lightbox, jobs, order, lookbooks, folders, app } = useStore();
   const [detail, setDetail] = useState(null);
-  const [asking, setAsking] = useState(null); // "edit" | "remix" | "zoom" | "folder" | "lookbook"
+  const [asking, setAsking] = useState(null); // "edit" | "remix" | "retexture" | "zoom" | "folder" | "lookbook"
   const root = useRef(null);
   const jobId = lightbox && lightbox.job;
   const job = jobId ? jobs.get(jobId) : null;
@@ -285,11 +332,19 @@ export function Lightbox() {
           onCancel=${() => setAsking(null)}
           onSubmit=${(prompt) => run(asking === "remix" ? "vary_strong" : asking, { prompt })}
         />`}
+        ${asking === "retexture" &&
+        html`<${Retexture}
+          loras=${((app && app.loras) || []).filter((lora) => lora.retexture)}
+          usual=${((app && app.settings.loras[0]) || "").split(":")[0]}
+          onCancel=${() => setAsking(null)}
+          onSubmit=${(prompt) => run("retexture", { prompt })}
+        />`}
 
         <${Group} title="Vary">
           <${Action} label="Subtle" icon="wand" onClick=${() => vary("vary_subtle")} />
           <${Action} label="Strong" icon="refresh" onClick=${() => vary("vary_strong")} />
           <${Action} label="Remix…" icon="edit" title="Variations that follow a new prompt" onClick=${() => setAsking("remix")} />
+          <${Action} label="Retexture…" icon="styles" title="Draw it again in another look, keeping its layout" onClick=${() => setAsking("retexture")} />
         <//>
         <${Group} title="Upscale">
           <${Action} label="Subtle" icon="expand" title="Twice the size, faithful to the pixel" onClick=${() => run("upscale_subtle")} />

@@ -113,6 +113,16 @@ class Preferences(_Section):
         ]
     )
     upscale: list[str] = Field(default_factory=lambda: ["seedvr2-3b", "seedvr2-7b"])
+    #: Drawing a picture again in another look while following its structure (retexture).
+    retexture: list[str] = Field(
+        default_factory=lambda: [
+            "z-image-turbo-controlnet-union-2.1",
+            "qwen-image-2.1-turbo-controlnet-union",
+            "krea-2-controlnet-depth",
+            "qwen-image-2.1-controlnet-union",
+            "dev-depth",
+        ]
+    )
     #: Blending image prompts.
     blend: list[str] = Field(default_factory=lambda: ["dev-redux"])
     #: Image-to-image fallbacks when a job's own model cannot do variations.

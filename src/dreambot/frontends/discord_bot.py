@@ -479,6 +479,19 @@ class DiscordFrontend(ChatFrontend):
                 )
             ]
             return _TextModal(self, action, "Edit", fields)
+        if kind is ActionKind.RETEXTURE:
+            names = self.service.planner.retexture_loras()
+            fields = [
+                (
+                    "Draw it as (a LoRA, a new prompt, or both)",
+                    ui.TextInput(
+                        style=paragraph,
+                        placeholder=f"--lora {names[0] if names else 'pixel-art'}",
+                        max_length=1500,
+                    ),
+                )
+            ]
+            return _TextModal(self, action, "Retexture", fields)
         if kind is ActionKind.ZOOM:
             fields = [
                 ("Zoom out by (1.0 - 2.0)", ui.TextInput(default="1.5", max_length=5)),

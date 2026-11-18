@@ -44,6 +44,11 @@ CREATIVE_UPSCALE_NOISE = 0.45
 #: The same, when standing in for a dedicated upscaler that is not installed.
 FALLBACK_UPSCALE_NOISE = 0.3
 MAX_UPSCALED_SIDE = 3072
+#: The share of a retexture's steps that follow the picture's structure, unless ``--strength``
+#: says otherwise. A picture's layout is settled in its first steps and its surface in the
+#: later ones: held for all of them, the structure is exact and the new look is ironed flat;
+#: held for a quarter, the look is at its strongest and small things in the picture are lost.
+RETEXTURE_HOLD = 0.5
 #: Style versions (``--sv``): how a style reference becomes a look. 1 is the original (a code
 #: is a fixed recipe, an image is only shown to an edit model); 2 blends fingerprints and shows
 #: the pictures as well where a model can take them; 3 uses the fingerprint's words alone.
@@ -661,6 +666,20 @@ class Planner:
                 )
         return kept
 
+    def _itself(self, spec: ModelSpec | None, op: Op) -> ModelSpec | None:
+        """``spec``, or the same model without its ControlNet when only that can do ``op``.
+
+        A retextured picture was drawn by a model with a ControlNet, which does nothing else.
+        What is made from that picture next is made by the model itself: the two share their
+        weights, so it is the same hand.
+        """
+        if spec is None or spec.supports(op):
+            return spec
+        for other in self.catalog.registry:
+            if other.repo == spec.repo and other.supports(op) and self.catalog.is_installed(other):
+                return other
+        return spec
+
     def _require(self, spec: ModelSpec, op: Op) -> None:
         if not spec.supports(op):
             capable = ", ".join(s.id for s in self.catalog.installed(op)) or "none installed"
@@ -1203,7 +1222,7 @@ class Planner:
         """
         params = params or Params()
         notes: list[str] = []
-        spec = self.catalog.registry.find(model)
+        spec = self._itself(self.catalog.registry.find(model), Op.IMG2IMG)
         if spec is None or not spec.supports(Op.IMG2IMG) or not self.catalog.is_installed(spec):
             fallback = self.catalog.any_with(Op.IMG2IMG, self.config.prefer.variation)
             if fallback is None:
@@ -1327,7 +1346,7 @@ class Planner:
                 "No dedicated upscaler is installed, so fine detail was re-rendered rather than strictly "
                 "preserved. `dreambot models pull seedvr2-3b` adds a faithful upscaler."
             )
-        spec = self.catalog.registry.find(model)
+        spec = self._itself(self.catalog.registry.find(model), Op.IMG2IMG)
         if spec is None or not spec.supports(Op.IMG2IMG) or not self.catalog.is_installed(spec):
             spec = self.catalog.any_with(Op.IMG2IMG, self.config.prefer.variation)
         if spec is None:
@@ -1547,6 +1566,175 @@ class Planner:
             source=source,
             notes=notes,
         )
+
+    # --------------------------------------------------------------- retexture ----
+
+    def retexture(
+        self,
+        *,
+        source: str,
+        text: str,
+        count: int,
+        settings: ResolvedSettings,
+        negative: str | None = None,
+        params: Params | None = None,
+        allow_paths: bool = False,
+    ) -> Plan:
+        """Draw a picture again in another look, keeping its structure (Midjourney's Retexture).
+
+        A model with a ControlNet follows the picture's depth while the layout is settled, and
+        draws the surface from ``text`` and the LoRAs alone. So the look comes from those: the
+        LoRAs named with it, or the person's usual ones. This is how a LoRA's look is put on a
+        picture that already exists; an edit model cannot take a LoRA it was not trained with,
+        and redrawing a picture from itself keeps the look it had.
+        """
+        params = params or Params()
+        if params.loras or not settings.loras:
+            return self._retexture(source, text, count, negative, params, params.loras, allow_paths)
+        try:
+            usual = parse_loras(" ".join(settings.loras))
+            return self._retexture(source, text, count, negative, params, usual, False)
+        except PlanError as exc:
+            plan = self._retexture(source, text, count, negative, params, [], allow_paths)
+            plan.notes.append(f"Your default LoRA was left out of this one. ({exc})")
+            return plan
+
+    def _retexture(
+        self,
+        source: str,
+        text: str,
+        count: int,
+        negative: str | None,
+        params: Params,
+        loras: Sequence[LoraRef],
+        allow_paths: bool,
+    ) -> Plan:
+        notes: list[str] = []
+        fitted = self._loras(loras, allow_paths)
+        spec = self._retexture_model(fitted, params, notes)
+        if not text.strip():
+            raise PlanError(
+                "Retexturing needs words for what the picture shows, e.g. `retexture 2: a lighthouse at dusk`."
+            )
+        with Image.open(source) as image:
+            width, height = working_size(
+                image.width, image.height, native=spec.native, multiple=spec.multiple
+            )
+        seeds = self._seeds(params, count)
+        location, quantize = self._weights(spec)
+        # Z-Image's ControlNet is steered by the share of the steps it holds the structure for.
+        # The others take a strength of their own, and are left at it unless one is asked for.
+        staged = spec.variants[Op.CONTROL].adapter == "zimage_control"
+        hold = params.strength if params.strength is not None else RETEXTURE_HOLD
+        render = Render(
+            op=Op.CONTROL,
+            model=spec.id,
+            prompt=triggered(text, fitted),
+            seeds=seeds,
+            slots=list(range(1, count + 1)),
+            width=width,
+            height=height,
+            steps=self._steps(spec, params, notes)[0],
+            guidance=self._guidance(spec, params),
+            negative=negative if spec.cfg else None,
+            image=source,
+            strength=None if staged else params.strength,
+            loras=[lora.lora for lora in fitted],
+            weights=location,
+            quantize=quantize,
+            extra={"control": "depth", "until": hold} if staged else {},
+        )
+        detail: dict[str, Any] = {"hold": hold if staged else params.strength}
+        if fitted:
+            detail["loras"] = [lora.record() for lora in fitted]
+        return Plan(
+            model=spec.id,
+            op=Op.CONTROL,
+            text=text,
+            negative=render.negative,
+            width=width,
+            height=height,
+            seeds=seeds,
+            renders=[render],
+            source=source,
+            notes=notes,
+            detail=detail,
+        )
+
+    def retexture_loras(self) -> list[str]:
+        """The LoRAs of the library a retexture can use: those of a family with such a model installed."""
+        families = {
+            spec.family
+            for spec in self.catalog.registry
+            if spec.supports(Op.CONTROL) and self.catalog.is_installed(spec)
+        }
+        return [
+            entry.name
+            for entry in self.loras.entries()[0]
+            if (base := self.catalog.registry.find(entry.base)) is not None and base.family in families
+        ]
+
+    def _retexture_model(self, loras: Sequence[Fitted], params: Params, notes: list[str]) -> ModelSpec:
+        """The model a retexture runs on: one that follows a picture's structure.
+
+        With LoRAs it has to be of their family, since a LoRA only works on the model it was
+        trained on; within the family, the one built on the LoRA's own model comes first.
+        ``--model`` may name such a model or the model it is built on.
+        """
+        registry = self.catalog.registry
+        preferred = [spec for name in self.config.prefer.retexture if (spec := registry.find(name))]
+        able = list({spec.id: spec for spec in [*preferred, *registry] if spec.supports(Op.CONTROL)}.values())
+        if params.model is not None:
+            asked = self.catalog.lookup(params.model)
+            family = sorted(
+                (spec for spec in able if spec.family == asked.family),
+                key=lambda spec: (spec.id != asked.id, spec.repo != asked.repo),
+            )
+            if not family:
+                capable = ", ".join(spec.id for spec in able if self.catalog.is_installed(spec))
+                raise PlanError(
+                    f"{asked.title} can't retexture: no model of its family follows a picture's structure. "
+                    f"Models that can: {capable or 'none installed'}."
+                )
+            ready = next((spec for spec in family if self.catalog.is_installed(spec)), None)
+            if ready is None:
+                raise PlanError(
+                    f"To retexture on {asked.title}, install {family[0].title}: "
+                    f"`dreambot models pull {family[0].id}`."
+                )
+            self._fitting(ready, loras, notes, strict=True)
+            return ready
+        known = [(lora, base) for lora in loras if lora.base and (base := registry.find(lora.base))]
+        if not known:
+            ready = next((spec for spec in able if self.catalog.is_installed(spec)), None)
+            if ready is None:
+                raise PlanError(
+                    "Retexturing needs a model that follows a picture's structure. Install one with "
+                    "`dreambot models pull z-image-turbo-controlnet-union-2.1`."
+                )
+            return ready
+        (first, model), *others = known
+        for lora, base in others:
+            if base.family != model.family:
+                raise PlanError(
+                    f"`{first.name}` and `{lora.name}` were trained on different models ({model.title} and "
+                    f"{base.title}), so they can't be used together."
+                )
+        family = sorted(
+            (spec for spec in able if spec.family == model.family), key=lambda spec: spec.repo != model.repo
+        )
+        if not family:
+            raise PlanError(
+                f"`{first.name}` is a LoRA for {model.title}, and no model of its family follows a picture's "
+                "structure, so it can't be used to retexture one."
+            )
+        ready = next((spec for spec in family if self.catalog.is_installed(spec)), None)
+        if ready is None:
+            raise PlanError(
+                f"`{first.name}` is a LoRA for {model.title}. To retexture with it, install "
+                f"{family[0].title}: `dreambot models pull {family[0].id}`."
+            )
+        return ready
 
     # -------------------------------------------------------------------- edit ----
 

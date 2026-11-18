@@ -279,6 +279,14 @@ async def test_buttons_that_need_text_open_a_modal(server: Server):
     await server.settle()
     assert server.service.store.recent_jobs(limit=1)[0].detail["factor"] == 1.4
 
+    # Retexture asks for the look: a LoRA, a prompt of its own, or both.
+    look = (await server.press(single, "Retexture")).response.modal
+    assert look.title == "Retexture" and look.fields[0][1].placeholder.startswith("--lora ")
+    await server.front._on_modal(FakeInteraction(server.log), look.action, ["a fox, as a woodcut"])
+    await server.settle()
+    made = server.service.store.recent_jobs(limit=1)[0]
+    assert made.kind is JobKind.RETEXTURE and made.text == "a fox, as a woodcut" and made.parent == job.id
+
 
 async def test_remix_modal_is_prefilled_with_the_prompt(server: Server):
     await server.slash("prefer remix")

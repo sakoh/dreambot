@@ -717,6 +717,8 @@ async def test_the_web_app_offers_the_library(bot):  # noqa: F811
         await client.get("/")
         state = (await client.get("/api/state")).json()
         # What the prompt bar's LoRA menu is drawn from: each LoRA, and the family of models it is for.
+        # `retexture` says whether a picture can be drawn again in its look (tests/test_retexture.py).
+        assert all(lora.pop("retexture") is (lora["family"] != "") for lora in state["loras"])
         assert state["loras"] == [
             {
                 "name": "anime",

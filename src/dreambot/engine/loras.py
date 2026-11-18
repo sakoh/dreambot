@@ -129,6 +129,28 @@ def worded(trigger: str, prompt: str) -> str:
     return f"{words} {text}" if words[-1] in ".!?:," else f"{words}, {text}"
 
 
+def unworded(trigger: str, prompt: str) -> str:
+    """``prompt`` without a LoRA's trigger words, where :func:`worded` put them.
+
+    For drawing a picture again in another look: the words of the look it had would argue with
+    the new one.
+    """
+    words = trigger.strip()
+    text = prompt.strip()
+    if not words or not text:
+        return prompt
+    if PLACEHOLDER in words:
+        before, _, after = (part.strip() for part in words.partition(PLACEHOLDER))
+        lowered = text.lower()
+        if lowered.startswith(before.lower()) and lowered.endswith(after.lower()):
+            inner = text[len(before) : len(text) - len(after)] if after else text[len(before) :]
+            return inner.strip(" ,;:") or prompt
+        return prompt
+    opening = re.compile(re.escape(words.rstrip(" ,.;:!?")) + r"[\s,.;:!?]*", re.IGNORECASE)
+    match = opening.match(text)
+    return text[match.end() :] if match and text[match.end() :].strip() else prompt
+
+
 # --------------------------------------------------------------------------------------
 # The library
 # --------------------------------------------------------------------------------------

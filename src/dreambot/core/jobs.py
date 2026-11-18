@@ -34,6 +34,7 @@ class JobKind(StrEnum):
     ZOOM = "zoom"
     PAN = "pan"
     EDIT = "edit"
+    RETEXTURE = "retexture"
     BLEND = "blend"
     DESCRIBE = "describe"
     SHORTEN = "shorten"

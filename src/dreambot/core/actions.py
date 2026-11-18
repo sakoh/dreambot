@@ -29,6 +29,9 @@ class ActionKind(StrEnum):
     VARY_REGION = "vary_region"
     #: Apply a written instruction to the whole image. ``prompt`` is the instruction.
     EDIT = "edit"
+    #: Draw the image again in another look, keeping its structure. ``prompt`` is what to
+    #: draw it as: a prompt with parameters such as ``--lora``, or nothing (its own prompt).
+    RETEXTURE = "retexture"
     REROLL = "reroll"
     UPSCALE_SUBTLE = "upscale_subtle"
     UPSCALE_CREATIVE = "upscale_creative"
@@ -53,6 +56,7 @@ GENERATIVE = frozenset(
         ActionKind.VARY_STRONG,
         ActionKind.VARY_REGION,
         ActionKind.EDIT,
+        ActionKind.RETEXTURE,
         ActionKind.REROLL,
         ActionKind.UPSCALE_SUBTLE,
         ActionKind.UPSCALE_CREATIVE,
@@ -94,6 +98,7 @@ _CODES = {
     ActionKind.VARY_STRONG: "vg",
     ActionKind.VARY_REGION: "vr",
     ActionKind.EDIT: "e",
+    ActionKind.RETEXTURE: "rt",
     ActionKind.REROLL: "r",
     ActionKind.UPSCALE_SUBTLE: "us",
     ActionKind.UPSCALE_CREATIVE: "uc",
@@ -169,6 +174,7 @@ _PATTERNS: list[tuple[re.Pattern[str], ActionKind]] = [
 #   region 2 B2-D4: a red balloon      (cells, then what to paint)
 #   region 2 the sky: an aurora        (a description, then what to paint)
 #   edit 2: make it night
+#   retexture 2: an oil painting --lora inkwash     (or `retexture 2 --lora pixel-art`, or `retexture 2`)
 #   look 2: autumn diner               (add the image to that Lookbook)
 # They are matched against the text as typed, to keep a prompt's capitals, so they ignore case
 # themselves: a phone capitalises the first word, and "Edit: make it night" is still an edit.
@@ -176,6 +182,9 @@ _REGION = re.compile(
     rf"(?:region|vary\s+region)\s+(?:{_INDEX}\s+)?(?P<where>[^:]+?)\s*:\s*(?P<prompt>.+)", re.S | re.I
 )
 _EDIT = re.compile(rf"edit\s*(?:{_INDEX})?\s*:\s*(?P<prompt>.+)", re.S | re.I)
+# Its words come after a colon; parameters alone may follow directly. Anything else after the
+# word ("retexture the walls of a cave") is a prompt, not this.
+_RETEXTURE = re.compile(rf"retexture\s*(?:{_INDEX})?\s*(?:(?::\s*|(?=--))(?P<prompt>.+))?", re.S | re.I)
 _LOOK = re.compile(rf"(?:lookbook|look)\s*(?:{_INDEX})?\s*:\s*(?P<name>[^\n]+)", re.I)
 
 
@@ -204,6 +213,11 @@ def parse_action(text: str) -> Action | None:
     if match := _EDIT.fullmatch(body):
         index = int(match.group("index")) if match.group("index") else None
         return Action(ActionKind.EDIT, index=index, prompt=match.group("prompt").strip())
+    if match := _RETEXTURE.fullmatch(body):
+        index = int(match.group("index")) if match.group("index") else None
+        if index is not None and index < 1:
+            return None
+        return Action(ActionKind.RETEXTURE, index=index, prompt=(match.group("prompt") or "").strip() or None)
     if match := _LOOK.fullmatch(body):
         index = int(match.group("index")) if match.group("index") else None
         return Action(ActionKind.LOOK, index=index, prompt=match.group("name").strip())

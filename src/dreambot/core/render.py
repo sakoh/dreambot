@@ -13,6 +13,7 @@ KIND_LABELS = {
     JobKind.ZOOM: "Zoomed out",
     JobKind.PAN: "Panned",
     JobKind.EDIT: "Edited",
+    JobKind.RETEXTURE: "Retextured",
     JobKind.BLEND: "Blend",
     JobKind.DESCRIBE: "Describe",
     JobKind.SHORTEN: "Shorten",
@@ -127,7 +128,11 @@ def image_actions(job: Job, image: JobImage) -> list[list[tuple[str, Action]]]:
             ("⬇️", a(ActionKind.PAN, "down")),
         ],
     ]
-    last = [("❤️", a(ActionKind.FAVORITE)), ("Edit", a(ActionKind.EDIT))]
+    last = [
+        ("❤️", a(ActionKind.FAVORITE)),
+        ("Edit", a(ActionKind.EDIT)),
+        ("Retexture", a(ActionKind.RETEXTURE)),
+    ]
     if image.width != image.height:
         last.insert(0, ("Make Square", a(ActionKind.SQUARE)))
     rows.append(last)
@@ -155,6 +160,7 @@ With one image picked (add its number when replying to a grid):
   region B2-D4: a red balloon     repaint part of it (send `region` alone to see the cells)
   region the sky: an aurora       ...or describe the part instead
   edit: make it night       change it by instruction
+  retexture --lora <name>   redraw it in that look
   look: autumn diner        add it to that Lookbook (a set of pictures used with --p)
   fav · info · cancel"""
 
