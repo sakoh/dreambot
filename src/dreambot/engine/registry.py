@@ -1071,7 +1071,7 @@ def _specs() -> list[ModelSpec]:
             id="moss-image-base",
             title="MOSS-Image Base",
             family="moss",
-            summary="The MOSS-Image base checkpoint.",
+            summary="The MOSS-Image base model.",
             mflux_key="moss-image-base",
             repo="OpenMOSS-Team/MOSS-Image-Base",
             variants={Op.TXT2IMG: _v(_MOSS, _L_MOSS)},
@@ -1106,7 +1106,7 @@ def _specs() -> list[ModelSpec]:
             id="anima-aesthetic",
             title="Anima Aesthetic",
             family="anima",
-            summary="Anima's aesthetic-tuned anime checkpoint (30 steps, CFG).",
+            summary="Anima's aesthetic-tuned anime model (30 steps, CFG).",
             mflux_key="anima-aesthetic",
             repo="circlestone-labs/Anima",
             files=(
@@ -1126,7 +1126,7 @@ def _specs() -> list[ModelSpec]:
             id="anima-base",
             title="Anima Base",
             family="anima",
-            summary="The Anima base anime checkpoint (30 steps, CFG).",
+            summary="The Anima base anime model (30 steps, CFG).",
             mflux_key="anima-base",
             repo="circlestone-labs/Anima",
             files=(
