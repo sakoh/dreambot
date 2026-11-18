@@ -134,7 +134,7 @@ Tapbacks and reactions on an image: ❤️ favourite, 👍 upscale, ‼️ / �
 | --- | --- | --- |
 | Erase and repaint a region | 🟡 | `region …` |
 | Move / resize / outpaint | ✅ | Zoom, pan and square cover it. |
-| Retexture | 🟡 | `edit: repaint it as a watercolor, keep the composition`. Dedicated depth/edge ControlNets are in the model table but have no command yet. |
+| Retexture | ✅ | `retexture 2: the same scene as a watercolour`, `retexture 2 --lora pixel-art`, and **Retexture…** in the web app's lightbox. A ControlNet follows the picture's depth while the layout is settled; the look comes from the prompt and from LoRAs. Verified on Z-Image Turbo's ControlNet; the layout is kept, colours are not. |
 | Editing your own uploaded images | ✅ | Attach an image with `--edit`, or `/edit`. |
 | Layers, smart select, drawing tools | ⏳ | These need a canvas. The web app has none yet: its lightbox has the same edit, zoom, pan and square actions as the chat buttons, and no way to paint a region. |
 

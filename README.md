@@ -71,7 +71,7 @@ licenses; the families are:
 
 | Family | Models | Used for |
 | --- | --- | --- |
-| Z-Image | turbo, base, ControlNet union | default text-to-image, variations |
+| Z-Image | turbo, base, ControlNet union | default text-to-image, variations, **retexture** |
 | FLUX.2 klein | 4B, 9B, 9B-KV, base | text-to-image, **edits and image references** |
 | FLUX 3 klein | distilled, base | text-to-image, edits with up to 10 references |
 | Qwen-Image | 2512, Edit 2509/2511, 2.1, 2.1 Turbo, 2.1 ControlNet | text rendering, edits, **mask inpainting** |
@@ -92,7 +92,8 @@ dreambot models pull describe        # the vision model behind /describe and /sh
 ```
 
 A good starting set is **`z-image-turbo`** (generation), **`flux2-klein-4b`** (edits, references, zoom and pan)
-and **`seedvr2-3b`** (upscaling): about 27 GB together, all Apache-2.0.
+and **`seedvr2-3b`** (upscaling): about 27 GB together, all Apache-2.0. **`z-image-turbo-controlnet-union-2.1`**
+(15 GB, Apache-2.0) adds [Retexture](#retexture).
 
 **Licenses.** Dreambot is MIT, but each model has its own license, and many are non-commercial
 (`dreambot models list --all` marks them). Every operation has at least one Apache/MIT option.
@@ -136,6 +137,9 @@ page says; `--base` and `--trigger` say them outright. After that:
 Variations and creative upscales of a picture are made with the LoRA it was made with. A LoRA means nothing
 on a model it was not trained on, so `--lora pixel-art --model dev` is refused with the reason; and where your
 usual LoRA cannot go — an edit runs on an edit model — the job runs without it and says so.
+
+To put a LoRA's look on a picture that already exists, **retexture** it: `retexture 2 --lora pixel-art` draws
+the picture again in that look and keeps its layout. See [Retexture](#retexture).
 
 **Which ones are worth adding.** These models already follow the name of a medium: typing "anime" or
 "coloring book page" gets most of the way there, and a LoRA for such a look adds little. A LoRA earns its
@@ -332,6 +336,7 @@ buttons — you can type the same things:
 | `region B2-D4: a red balloon` | repaint part of the image (send `region` to see the cell grid) |
 | `region the sky: an aurora` | …or describe the part instead |
 | `edit: make it night` | change the whole image by instruction |
+| `retexture --lora pixel-art` | draw it again in another look, keeping its layout ([Retexture](#retexture)) |
 | `look: autumn diner` | add the image to that Lookbook (and start it, if it is new) |
 | `fav`, `info`, `cancel` | favourite, show seed and job id, cancel |
 
@@ -341,6 +346,44 @@ picture, and replying with plain words edits it.
 Commands: `/imagine`, `/describe` (image → four prompts), `/blend` (2–5 images), `/edit`, `/shorten`,
 `/settings`, `/looks`, `/prefer suffix`, `/prefer option set|list`, `/prefer remix`, `/prefer variability`,
 `/show`, `/info`, `/models`, `/params`, `/cancel`, `/help`.
+
+### Retexture
+
+Retexture draws a picture again in another look and follows its layout: the same lighthouse on the same
+cliff, as pixel art. It is how a LoRA's look is put on a picture that already exists.
+
+![One picture of a lighthouse, its keeper and his dog, and seven retextures of it: with the pixel-art, airbrush, anime and child's-drawing LoRAs, as a watercolour from words alone, and with the pixel-art LoRA holding less and more of the picture](docs/screenshots/retexture.jpg)
+
+| Type | What happens |
+| --- | --- |
+| `retexture 2 --lora pixel-art` | image 2 again, in that LoRA's look |
+| `retexture 2: the same cliff as a woodcut` | …from words of your own: a whole prompt, with or without `--lora` |
+| `retexture 2` | …in the look of your usual LoRA (`/settings lora`), or the model's own |
+| `retexture 2 --lora anime --strength 0.3` | …with more of the look and less of the picture (0.5 unless you say; up to 1) |
+
+In the web app it is **Retexture…** in the lightbox: choose a LoRA and how much of the picture to keep, and
+write a prompt if you want one. Discord and Telegram have a **Retexture** button under an image, which asks
+for the look.
+
+It needs a model that follows a picture's structure: `dreambot models pull z-image-turbo-controlnet-union-2.1`
+(15 GB, Apache-2.0). That is Z-Image Turbo with a ControlNet, so the LoRAs it takes are the ones for Z-Image
+Turbo. Variations and upscales of a retextured picture go back to Z-Image Turbo itself, with the same LoRA.
+
+![The lightbox with the Retexture box open: a LoRA to draw the picture as, how much of it to keep, and an optional prompt](docs/screenshots/retexture-box.jpg)
+
+**What is kept is the layout, not the picture.** The large shapes land where they were: the lighthouse, the
+cliff, the horizon. Small things are kept most of the time and now and then move or go missing: in ten tries
+with the pixel-art LoRA the lighthouse was there every time and its keeper in eight. Colours are not kept;
+they are drawn afresh from the prompt and the LoRA, so a pale sunset can come back with a blue sea. Each
+image of the grid is a different take: pick the one that kept what you wanted, raise `--strength`, or say
+what matters in the prompt (`retexture 2: a lighthouse at an orange sunset --lora pixel-art`).
+
+**How.** The model is shown the picture's depth for the first half of its steps, while the layout is being
+settled, and draws the rest from the prompt and the LoRA alone. `--strength` is that share of the steps:
+lower for more of the look, higher for more of the picture. Shown the depth for every step (`--strength 1`),
+it keeps the layout exactly and irons the look flat: the pixel-art LoRA then draws a smooth painting. Shown
+it for a quarter of them, it draws crisp pixel art and loses the small things: the lighthouse stays, the
+keeper goes.
 
 ## Web app
 
@@ -354,7 +397,7 @@ Midjourney's website, for one Mac: <http://127.0.0.1:7373/>.
 | Page | What is there |
 | --- | --- |
 | **Create** | The prompt bar, with drop zones for an image prompt, a style reference and a subject reference; an uploads library; settings (shape, model, stylize, variety, weirdness, raw, HD); the **P** button; the **LoRA** button, to give every prompt a fine-tuned look. Below it, everything that has been made, newest first, with jobs drawing themselves as they run. |
-| **Lightbox** | Click an image: vary (subtle, strong, remix), upscale (subtle, creative), zoom, pan, make square, edit, rerun, describe; copy the prompt, seed or job id; download; like; file it in a folder or a Lookbook; use it in the next prompt. ← → move through the feed. |
+| **Lightbox** | Click an image: vary (subtle, strong, remix), retexture (the same picture in a LoRA's look), upscale (subtle, creative), zoom, pan, make square, edit, rerun, describe; copy the prompt, seed or job id; download; like; file it in a folder or a Lookbook; use it in the next prompt. ← → move through the feed. |
 | **Organize** | Every image, to search and to filter by liked, model, kind of job, Lookbook, folder and day. Select many (shift-click for a range) to like, trash, file or download as a zip. Trash only hides. |
 | **Lookbooks** | Make, fill, rename and delete Lookbooks; choose your defaults; see what Dreambot reads in a book. |
 | **Styles** | Explore style codes (shuffle, search, like, the styles one step away, try one on your latest prompt), your saved styles, and the **blend bench**: put codes, pictures and Lookbooks together, set their weights, read what the blend comes to before anything is rendered, then try it or save it under a name. |
@@ -520,7 +563,7 @@ port = 7373
 [docs/PARITY.md](docs/PARITY.md) goes through Midjourney's feature list item by item. In short:
 
 - **Works:** `/imagine` grids, U/V/reroll, variations (subtle/strong, remix), upscales, zoom out, pan, make
-  square, vary region, instruction edits, image/style/character references, `/blend`, `/describe`,
+  square, vary region, retexture, instruction edits, image/style/character references, `/blend`, `/describe`,
   `/shorten`, `/settings`, `/prefer`, permutations, repeat, seeds (exactly reproducible), job history, and
   a web app with the create page, lightbox, gallery, folders and trash.
 - **Approximated:** the aesthetic dials (`--stylize`, `--chaos`, `--weird`, `--exp`), which steer
@@ -539,6 +582,7 @@ port = 7373
 | Variations, upscales (SeedVR2 and tiled), `--hd`, edits, references, zoom/pan/square, region edits, describe | real weights, results inspected by eye |
 | The prompt enhancer | real language model (Qwen2.5-VL 7B) and real images, compared with and without |
 | Style references (`--sref`) | real weights (Z-Image Turbo, FLUX.2 klein 4B; Qwen-Image 2.1 for one comparison) and the real vision model, results inspected by eye. Three prompts across the three style versions with one reference: shown the picture whole (`--sv 1`), none of the three took its style and one had the reference's hand and gun in it; with words and a swatch board (`--sv 2`) and with words alone (`--sv 3`), all three took the style and none took its content. **Two reference pictures in all**, both generated images: photographs and pictures with a lot of text in them have not been tried |
+| Retexture | real weights (Z-Image Turbo ControlNet Union 2.1 at q8), through the service and through the web app's lightbox: one picture retextured with the pixel-art, airbrush, anime, child's-drawing and claymation LoRAs and from words alone (a watercolour), each with a seed that was not the picture's own. The layout was followed in all; the claymation look was faint. With the pixel-art LoRA at the usual strength, ten seeds: the lighthouse every time, its keeper in eight. A variation of a retextured picture ran on Z-Image Turbo with the same LoRA. How the structure is held was settled by trying the alternatives on the same picture: held for every step it flattened the look; held more weakly for every step it lost the layout and the look both; a heavier LoRA (1.4) only added noise; redrawing the picture from itself without a ControlNet left a photograph a photograph; matching the colours to the source afterwards bleached faces and was dropped. **Not run on real weights**: retexture on any other model (FLUX.1 Depth, Krea 2 and Qwen-Image 2.1 with their ControlNets), where only the planning is tested; edges or pose instead of depth. The chat button and Discord's text box: automated tests only |
 | LoRAs | real weights and the real Hugging Face: eleven published LoRAs for Z-Image Turbo added with `dreambot loras add` (model and trigger words read from each page; one repository with two files, one file name with brackets), then one prompt and one seed without a LoRA and with each. All eleven loaded. Five changed the picture completely with no help; six changed little or nothing until the prompt named their medium, and of those the pencil sketch was the one that then clearly did more than the words alone. Asked for on FLUX.1 dev a LoRA was refused before anything ran; given to FLUX.2 klein 4B as a bare file it was refused by the engine, in plain words. The web app's LoRA button, its strength chips and its menu: driven in a browser on the stand-in backend. **Not run on real weights**: variations and upscales that carry a LoRA, several LoRAs at once, LoRAs on any model but Z-Image Turbo. Discord's LoRA menu: automated tests only |
 | Blending by weight | real weights, two prompts: the same two references at 3:1, 1:1 and 1:3 give a visible progression from one style to the other; a style code with a picture gives a plausible mix. More than two references: automated tests only |
 | What the vision model says about a style | nine real images. It names a medium and five short phrases, drops the labels about half the time (the parser then reads by position), and calls most generated images "digital painting". Asked to fuse two styles into one, it joined their phrases with "and" or copied the worked example, so blending is done by rule |

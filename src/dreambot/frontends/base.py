@@ -238,6 +238,14 @@ class ChatFrontend:
             )
         if kind is ActionKind.EDIT:
             return "What should change? Reply with an instruction, like: make it night"
+        if kind is ActionKind.RETEXTURE:
+            names = self.service.planner.retexture_loras()
+            example = names[0] if names else "pixel-art"
+            listing = f"\nLoRAs: {', '.join(names)}" if names else ""
+            return (
+                "Retexture draws it again in another look and keeps its layout. Reply with the look: "
+                f"a LoRA like `--lora {example}`, a new prompt, or both.{listing}"
+            )
         if kind is ActionKind.ZOOM and action.value == "custom":
             return "How far out? Reply with a number between 1 and 2 (for example 1.3). You can add a new prompt after it."
         if (

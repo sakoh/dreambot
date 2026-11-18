@@ -50,7 +50,7 @@ from dreambot.core.sizes import working_size
 from dreambot.core.store import Store, style_slug
 from dreambot.core.text import SHORTEN_INSTRUCTION, heuristic_shorten, parse_numbered
 from dreambot.engine.client import Engine, EngineCancelled, EngineError, new_request_id
-from dreambot.engine.loras import LoraError
+from dreambot.engine.loras import LoraError, unworded
 from dreambot.engine.protocol import (
     DescribeRequest,
     ErrorKind,
@@ -76,7 +76,7 @@ ENHANCE_HINT = (
     "This note appears only once."
 )
 #: Operations whose prompt describes the picture (rather than instructing a change to one).
-_SCENE_OPS = (Op.TXT2IMG, Op.IMG2IMG, Op.REDUX)
+_SCENE_OPS = (Op.TXT2IMG, Op.IMG2IMG, Op.REDUX, Op.CONTROL)
 
 
 class DreambotError(Exception):
@@ -1108,14 +1108,23 @@ class Dreambot:
         assert kind in GENERATIVE
         self._check_room(user, 1)
         try:
-            new_job, plan = self._plan_action(action, job, image, user=user, channel=channel)
+            new_job, plan = self._plan_action(
+                action, job, image, user=user, channel=channel, allow_paths=allow_paths
+            )
         except (PlanError, PromptError, ImageError, ValueError) as exc:
             raise DreambotError(str(exc)) from exc
         await self._enqueue(new_job, self._runner(plan))
         return ActionResult(jobs=[new_job])
 
     def _plan_action(
-        self, action: Action, job: Job, image: JobImage, *, user: str, channel: str
+        self,
+        action: Action,
+        job: Job,
+        image: JobImage,
+        *,
+        user: str,
+        channel: str,
+        allow_paths: bool = False,
     ) -> tuple[Job, Plan]:
         settings = self.resolved_settings(user)
         kind = action.kind
@@ -1247,6 +1256,28 @@ class Dreambot:
             prompt = wanted
             detail["instruction"] = True
             new_kind = JobKind.EDIT
+        elif kind is ActionKind.RETEXTURE:
+            # The picture as it is described, without the words of the look it was made in:
+            # it is about to be given another.
+            text = self._without_triggers(image.prompt or self._scene_text(job), job)
+            given: list[str] = []
+            if action.prompt:
+                # What to draw it as: a prompt of its own, parameters for this one, or both.
+                parsed = parse_prompt(action.prompt, option_sets=settings.option_sets)
+                text = parsed.positive_text or text
+                negative = ", ".join(parsed.negative_terms) or negative
+                params, given = parsed.params, parsed.given
+            plan = self.planner.retexture(
+                source=image.path,
+                text=text,
+                count=params.count or settings.count,
+                settings=settings,
+                negative=negative,
+                params=params,
+                allow_paths=allow_paths,
+            )
+            prompt = " ".join([text, *given]).strip()
+            new_kind = JobKind.RETEXTURE
         elif kind is ActionKind.EDIT:
             if not action.prompt:
                 raise DreambotError("Say what to change, e.g. `edit 2: make it night`.")
@@ -1267,6 +1298,27 @@ class Dreambot:
         new_job.parent, new_job.parent_index = job.id, image.index
         new_job.inputs = {"source": image.path}
         return new_job, plan
+
+    def _without_triggers(self, text: str, job: Job) -> str:
+        """``text`` without the trigger words of the LoRAs ``job``'s pictures were made with."""
+        triggers: list[str] = []
+        for record in job.detail.get("loras", []):
+            try:
+                entry = self.planner.loras.find(str(record.get("name", "")))
+            except LoraError:
+                entry = None
+            if entry is not None and entry.trigger:
+                triggers.append(entry.trigger)
+        # They were put in front one after another, in an order that is not kept: take off
+        # whichever is in front until none is.
+        changed = True
+        while changed:
+            changed = False
+            for trigger in triggers:
+                plain = unworded(trigger, text)
+                if plain != text:
+                    text, changed = plain, True
+        return text
 
     @staticmethod
     def _instruction(text: str, notes: list[str]) -> str:

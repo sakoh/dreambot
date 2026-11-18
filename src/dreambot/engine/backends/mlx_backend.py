@@ -19,6 +19,8 @@ import os
 import re
 import time
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -365,7 +367,8 @@ class MlxBackend:
                     ErrorKind.INVALID,
                 )
             finish = adapter(kwargs, req, spec, accepted)
-        result = fn(**kwargs)
+        with _structure_until(model, req.extra.get("until"), kwargs.get("num_inference_steps")):
+            result = fn(**kwargs)
         if finish is not None:
             result.image = finish(result.image)
         return result
@@ -718,6 +721,49 @@ def _adapt_flux_upscale(kwargs: dict, req: GenerateRequest, spec: ModelSpec, acc
             kwargs["width"] = _snap(source.width * scale, spec.multiple)
             kwargs["height"] = _snap(source.height * scale, spec.multiple)
     kwargs.setdefault("controlnet_strength", 0.4)  # mflux's default for this model
+
+
+class _Until:
+    """A model's ControlNet for the first steps of a picture, and nothing from then on."""
+
+    def __init__(self, controlnet: Any, last: int):
+        self._controlnet, self._last = controlnet, last
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._controlnet, name)
+
+    def __call__(self, **kwargs: Any) -> Any:
+        # ``t`` counts the steps from 0. With no residuals the step is drawn free of the ControlNet.
+        if int(kwargs["t"]) >= self._last:
+            return {}
+        return self._controlnet(**kwargs)
+
+
+@contextmanager
+def _structure_until(model: Any, share: Any, steps: Any) -> Iterator[None]:
+    """Let ``model``'s ControlNet steer only the first ``share`` of the steps.
+
+    A ControlNet that steers every step holds a picture's structure exactly and irons out the
+    surface with it: a pixel-art LoRA under full depth control draws a smooth painting. The
+    layout of a picture is settled in its first steps and its surface in the later ones, so
+    the ControlNet is given the first and the LoRA is left alone with the rest.
+
+    Nothing happens without a ``share`` below 1, or on a model that keeps no ControlNet of its
+    own (mflux's Z-Image ControlNet does, and calls it once per step with the step's number).
+    """
+    try:
+        wanted = float(share) if share is not None else 1.0
+        controlnet = model["controlnet"] if isinstance(model, dict) and "controlnet" in model else None
+    except (TypeError, ValueError):
+        wanted, controlnet = 1.0, None
+    if controlnet is None or wanted >= 1.0 or not steps:
+        yield
+        return
+    model["controlnet"] = _Until(controlnet, max(1, round(int(steps) * max(0.0, wanted))))
+    try:
+        yield
+    finally:
+        model["controlnet"] = controlnet  # the model is kept for the next request
 
 
 def _adapt_zimage_control(kwargs: dict, req: GenerateRequest, spec: ModelSpec, accepted: Any) -> None:
