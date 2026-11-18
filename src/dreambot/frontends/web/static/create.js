@@ -590,6 +590,7 @@ function JobSide({ job }) {
     <div class="job-meta small muted">
       <span>${job.kind}</span>
       ${job.model && html`<span>${job.model}</span>`}
+      ${(job.loras || []).map((lora) => html`<span title="LoRA">${lora.name}${lora.scale === 1 ? "" : ` ×${lora.scale}`}</span>`)}
       ${job.seconds != null && html`<span>${Math.round(job.seconds)}s</span>`}
       ${!job.user.startsWith("web:") && html`<span title="Made from a chat app">${job.user.split(":")[0]}</span>`}
       <span>#${job.id}</span>
