@@ -28,6 +28,11 @@ app = typer.Typer(
 )
 models_app = typer.Typer(help="See, download and inspect models.", no_args_is_help=False)
 app.add_typer(models_app, name="models")
+loras_app = typer.Typer(
+    help="LoRAs: small fine-tunes that give a model one look (anime, pixel art, ...).",
+    no_args_is_help=False,
+)
+app.add_typer(loras_app, name="loras")
 service_app = typer.Typer(help="Run Dreambot in the background (starts at login).", no_args_is_help=True)
 app.add_typer(service_app, name="service")
 access_app = typer.Typer(help="Control who may use your Dreambot.", no_args_is_help=False)
@@ -410,6 +415,206 @@ def models_info(model: Annotated[str, typer.Argument(help="Model name.")]) -> No
             + (f" ({level})" if level else "")
         )
     console.print("Verified by Dreambot's tests: " + ("yes" if spec.verified else "not yet"))
+
+
+# --------------------------------------------------------------------------------------
+# loras
+# --------------------------------------------------------------------------------------
+
+
+@loras_app.callback(invoke_without_command=True)
+def loras_default(ctx: typer.Context) -> None:
+    if ctx.invoked_subcommand is None:
+        loras_list()
+
+
+@loras_app.command("list")
+def loras_list() -> None:
+    """List the LoRAs in your library."""
+    from dreambot.core.planner import Catalog
+    from dreambot.engine.loras import Library
+    from dreambot.engine.registry import REGISTRY
+
+    config = _config()
+    catalog = Catalog(config)
+    found, problems = Library(config.lora_dir).entries()
+    if not found:
+        console.print("No LoRAs yet. A LoRA is a small fine-tune that gives a model one look. Add one with:")
+        console.print(
+            "  [bold]dreambot loras add tarn59/pixel_art_style_lora_z_image_turbo --name pixel-art[/bold]"
+        )
+        console.print("The source is a LoRA on Hugging Face, or a .safetensors file on this Mac.")
+    else:
+        table = Table(show_lines=False, header_style="bold")
+        for column in ("LoRA", "Trained on", "Trigger words", "Scale", "Size"):
+            table.add_column(column, overflow="fold")
+        for entry in found:
+            base = REGISTRY.find(entry.base) if entry.base else None
+            if base is None:
+                trained_on = "[dim]not known[/dim]"
+            elif catalog.is_installed(base):
+                trained_on = base.id
+            else:
+                trained_on = f"{base.id} [yellow](not installed)[/yellow]"
+            table.add_row(
+                f"[bold]{entry.name}[/bold]",
+                trained_on,
+                entry.trigger or "[dim]—[/dim]",
+                f"{entry.scale:g}",
+                f"{Path(entry.path).stat().st_size / 1000**2:.0f} MB",
+            )
+        console.print(table)
+        console.print(
+            "Use one in a prompt with [bold]--lora <name>[/bold], or always with `/settings lora <name>`."
+        )
+    for name, problem in sorted(problems.items()):
+        err.print(f"[yellow]{name}[/yellow] is left out: {problem}.")
+
+
+@loras_app.command("add")
+def loras_add(
+    source: Annotated[
+        str,
+        typer.Argument(
+            help="A LoRA on Hugging Face (owner/name, or its link), or a .safetensors file on this Mac."
+        ),
+    ],
+    name: Annotated[str | None, typer.Option("--name", "-n", help="What to call it, e.g. pixel-art.")] = None,
+    base: Annotated[
+        str | None,
+        typer.Option("--base", "-b", help="The model it was trained on. Default: what its page says."),
+    ] = None,
+    trigger: Annotated[
+        str | None,
+        typer.Option(
+            "--trigger",
+            "-t",
+            help="Words put in front of the prompt. With {prompt} in them, where the prompt goes. "
+            "Default: what its page says.",
+        ),
+    ] = None,
+    scale: Annotated[float, typer.Option("--scale", min=-4, max=4, help="How strongly it is applied.")] = 1.0,
+    file: Annotated[
+        str | None, typer.Option("--file", help="Which file, when a repository holds several.")
+    ] = None,
+    title: Annotated[str | None, typer.Option("--title", help="A name for people to read.")] = None,
+    replace: Annotated[
+        bool, typer.Option("--replace", help="Replace the LoRA that already has this name.")
+    ] = False,
+) -> None:
+    """Add a LoRA to your library.
+
+    Example: dreambot loras add tarn59/pixel_art_style_lora_z_image_turbo --name pixel-art
+    """
+    import json
+
+    from dreambot.core.planner import Catalog
+    from dreambot.engine.loras import Library
+    from dreambot.engine.registry import REGISTRY
+
+    config = _config()
+    folder = config.lora_dir
+    before = {path.name: path.stat().st_mtime_ns for path in folder.glob("*.toml")} if folder.is_dir() else {}
+    request = {
+        "source": source,
+        "name": name,
+        "base": base,
+        "title": title,
+        "trigger": trigger,
+        "scale": scale,
+        "file": file,
+        "replace": replace,
+    }
+    env = {**os.environ, "HF_HUB_DISABLE_TELEMETRY": "1", "DO_NOT_TRACK": "1"}
+    env.pop("HF_HUB_OFFLINE", None)
+    args = [sys.executable, "-m", "dreambot.engine.prepare", "lora", str(folder), json.dumps(request)]
+    code = subprocess.run(args, env=env, check=False).returncode
+    if code != 0:
+        raise typer.Exit(code)
+    library = Library(folder)
+    for notes in sorted(folder.glob("*.toml")):
+        if before.get(notes.name) == notes.stat().st_mtime_ns:
+            continue
+        entry = library.find(notes.stem)
+        if entry is None:
+            continue
+        if entry.trigger:
+            console.print(f"Trigger words, put in front of the prompt: [bold]{entry.trigger}[/bold]")
+        else:
+            console.print(
+                "[dim]No trigger words are known for it. If its page names some, write them into "
+                f'{notes} as `trigger = "..."`.[/dim]'
+            )
+        trained_on = REGISTRY.find(entry.base) if entry.base else None
+        if trained_on is not None and not trained_on.permissive:
+            console.print(
+                f"[yellow]{trained_on.title} is licensed {trained_on.license}[/yellow], and so is what is made with it."
+            )
+        if trained_on is not None and not Catalog(config).is_installed(trained_on):
+            console.print(
+                f"[yellow]It was trained on {trained_on.id}, which is not installed:[/yellow] "
+                f"dreambot models pull {trained_on.id}"
+            )
+        console.print(f'Try it:  [bold]dreambot imagine "a fox in a forest --lora {entry.name}"[/bold]')
+        console.print(
+            f"For every prompt: `/settings lora {entry.name}` in chat, or the LoRA button by the prompt "
+            "in the web app."
+        )
+
+
+@loras_app.command("info")
+def loras_info(name: Annotated[str, typer.Argument(help="The LoRA's name.")]) -> None:
+    """Show everything about one LoRA."""
+    from dreambot.engine.loras import Library, LoraError
+    from dreambot.engine.registry import REGISTRY
+
+    config = _config()
+    try:
+        entry = Library(config.lora_dir).find(name)
+    except LoraError as exc:
+        err.print(f"[red]{name} can't be used: {exc}.[/red]")
+        raise typer.Exit(2) from exc
+    if entry is None:
+        err.print(f"[red]There is no LoRA called {name}.[/red] See `dreambot loras`.")
+        raise typer.Exit(2)
+    console.print(f"[bold]{entry.title or entry.name}[/bold] ({entry.name})")
+    base = REGISTRY.find(entry.base) if entry.base else None
+    console.print(
+        f"Trained on: {f'{base.title} ({base.id})' if base else 'not known — it is tried on whichever model a prompt uses'}"
+    )
+    console.print(f"Trigger words: {entry.trigger or 'none'}")
+    console.print(f"Scale: {entry.scale:g}")
+    console.print(f"File: {entry.path}  [dim]({Path(entry.path).stat().st_size / 1000**2:.0f} MB)[/dim]")
+    if entry.source:
+        console.print(f"Source: {entry.source}")
+    console.print(
+        f"License: {entry.license or 'not stated'}"
+        + (f"; {base.title} itself is {base.license}" if base else "")
+    )
+
+
+@loras_app.command("remove")
+def loras_remove(
+    name: Annotated[str, typer.Argument(help="The LoRA's name.")],
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Do not ask first.")] = False,
+) -> None:
+    """Remove a LoRA from your library: its file and its notes."""
+    from dreambot.engine import loras
+
+    folder = _config().lora_dir
+    try:
+        name = loras.check_name(name)
+    except loras.LoraError as exc:
+        err.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+    there = [path for path in (folder / f"{name}.safetensors", folder / f"{name}.toml") if path.is_file()]
+    if not there:
+        err.print(f"[red]There is no LoRA called {name}.[/red]")
+        raise typer.Exit(2)
+    if not yes and not typer.confirm(f"Remove the LoRA {name} ({', '.join(path.name for path in there)})?"):
+        raise typer.Exit(1)
+    loras.remove(folder, name)
+    console.print(f"Removed {name}. Pictures made with it stay where they are.")
 
 
 # --------------------------------------------------------------------------------------

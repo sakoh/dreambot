@@ -31,10 +31,11 @@ from dreambot.core.fetch import FetchError, fetch_image
 from dreambot.core.fingerprint import StyleFingerprint
 from dreambot.core.imaging import ImageError
 from dreambot.core.jobs import EventType, Job, JobEvent, JobImage, JobKind, JobStatus, new_job_id
-from dreambot.core.params import Params, PromptError, Ref
+from dreambot.core.params import Params, PromptError, Ref, parse_loras
 from dreambot.core.planner import (
     STYLE_LEGACY,
     Catalog,
+    Fitted,
     Plan,
     PlanError,
     Planner,
@@ -49,6 +50,7 @@ from dreambot.core.sizes import working_size
 from dreambot.core.store import Store, style_slug
 from dreambot.core.text import SHORTEN_INSTRUCTION, heuristic_shorten, parse_numbered
 from dreambot.engine.client import Engine, EngineCancelled, EngineError, new_request_id
+from dreambot.engine.loras import LoraError
 from dreambot.engine.protocol import (
     DescribeRequest,
     ErrorKind,
@@ -59,6 +61,7 @@ from dreambot.engine.protocol import (
     Progress,
     TextRequest,
 )
+from dreambot.engine.registry import ModelSpec
 
 log = logging.getLogger(__name__)
 
@@ -209,7 +212,36 @@ class Dreambot:
                 settings.model = self.catalog.lookup(settings.model).id
             except PlanError as exc:
                 raise DreambotError(str(exc)) from exc
+        if settings.loras:
+            settings.loras = self._default_loras(settings.loras)
         self.store.save_settings(user, settings.to_dict())
+
+    def _default_loras(self, wanted: Sequence[str]) -> list[str]:
+        """LoRAs to give every prompt, checked: each is in the library, by name."""
+        try:
+            refs = parse_loras(" ".join(wanted))
+            entries = [(ref, self.planner.loras.find(ref.name)) for ref in refs]
+        except (PromptError, LoraError) as exc:
+            raise DreambotError(str(exc)) from exc
+        kept: list[str] = []
+        first: tuple[str, ModelSpec] | None = None
+        for ref, entry in entries:
+            if entry is None:
+                have = ", ".join(entry.name for entry in self.planner.loras.entries()[0])
+                raise DreambotError(
+                    f"I can't find a LoRA called `{ref.name}`."
+                    + (f" Available: {have}." if have else " None are installed on the Mac yet.")
+                )
+            base = self.catalog.registry.find(entry.base) if entry.base else None
+            if base is not None and first is not None and first[1].family != base.family:
+                raise DreambotError(
+                    f"`{first[0]}` and `{entry.name}` were trained on different models ({first[1].title} and "
+                    f"{base.title}), so they can't be used together."
+                )
+            if base is not None and first is None:
+                first = (entry.name, base)
+            kept.append(entry.name if ref.scale == 1 else f"{entry.name}:{ref.scale:g}")
+        return kept
 
     # --------------------------------------------------------------------- queue ----
 
@@ -378,13 +410,18 @@ class Dreambot:
                     # As in Midjourney, every repeat of `--sref random` draws a style of its own.
                     refs, ref_notes = self._redraw_styles(refs, ref_notes)
                 try:
-                    plan = self.planner.imagine(parsed, settings, refs)
+                    plan = self.planner.imagine(parsed, settings, refs, allow_paths=allow_paths)
                 except (PlanError, PromptError) as exc:
                     raise DreambotError(str(exc)) from exc
                 # The same request planned again, with the seeds already drawn, once the
                 # language model has written its direction.
                 replan = functools.partial(
-                    self.planner.imagine, parsed, settings, refs, seeds=list(plan.seeds)
+                    self.planner.imagine,
+                    parsed,
+                    settings,
+                    refs,
+                    seeds=list(plan.seeds),
+                    allow_paths=allow_paths,
                 )
                 plan.notes[:0] = ref_notes
                 if refs.edit:
@@ -1011,8 +1048,14 @@ class Dreambot:
             raise DreambotError("That image's file is no longer on disk.")
         return job, image
 
-    async def act(self, *, user: str, channel: str, action: Action) -> ActionResult:
-        """Carry out an action on an earlier job."""
+    async def act(
+        self, *, user: str, channel: str, action: Action, allow_paths: bool = False
+    ) -> ActionResult:
+        """Carry out an action on an earlier job.
+
+        ``allow_paths`` says the action was asked for on the Mac itself. Running a prompt again
+        is running it for whoever asks, so it is their word that counts, not the first asker's.
+        """
         kind = action.kind
         if kind is ActionKind.CANCEL:
             cancelled = await self.cancel(
@@ -1024,7 +1067,9 @@ class Dreambot:
             raise DreambotError("Turning images into video isn't available yet.")
         if kind is ActionKind.REROLL:
             job, _ = self._target(action, channel, need_image=False)
-            return ActionResult(jobs=await self._reroll(job, user=user, channel=channel))
+            return ActionResult(
+                jobs=await self._reroll(job, user=user, channel=channel, allow_paths=allow_paths)
+            )
 
         job, image = self._target(action, channel, need_image=True)
         assert image is not None
@@ -1105,6 +1150,8 @@ class Dreambot:
         detail: dict[str, Any] = {
             "action": {"kind": kind.value, "value": action.value, "prompt": action.prompt}
         }
+        # The LoRAs the picture was made with: what is drawn from it is drawn in the same look.
+        carried = [Fitted(**record) for record in job.detail.get("loras", [])]
 
         if kind in (ActionKind.VARY, ActionKind.VARY_SUBTLE, ActionKind.VARY_STRONG):
             mode = (
@@ -1125,6 +1172,7 @@ class Dreambot:
                 count=count,
                 negative=negative,
                 params=params,
+                loras=carried,
             )
             new_kind = JobKind.VARIATION
         elif kind in (ActionKind.UPSCALE_SUBTLE, ActionKind.UPSCALE_CREATIVE):
@@ -1140,6 +1188,7 @@ class Dreambot:
                 creative=creative,
                 enlarged=str(enlarged),
                 tiles=tiles,
+                loras=carried,
             )
             new_kind = JobKind.UPSCALE
         elif kind is ActionKind.ZOOM:
@@ -1189,17 +1238,23 @@ class Dreambot:
                 raise DreambotError(
                     "Say which part to change: cells like `B2-D4`, or a description like `the sky`."
                 )
+            said: list[str] = []
+            wanted = self._instruction(action.prompt, said)
             plan = self.planner.region(
-                source=image.path, mask=mask, text=action.prompt, where=where or None, count=count
+                source=image.path, mask=mask, text=wanted, where=where or None, count=count
             )
-            prompt = action.prompt
+            plan.notes[:0] = said
+            prompt = wanted
             detail["instruction"] = True
             new_kind = JobKind.EDIT
         elif kind is ActionKind.EDIT:
             if not action.prompt:
                 raise DreambotError("Say what to change, e.g. `edit 2: make it night`.")
-            plan = self.planner.edit(sources=[image.path], instruction=action.prompt, count=count)
-            prompt = action.prompt
+            said = []
+            wanted = self._instruction(action.prompt, said)
+            plan = self.planner.edit(sources=[image.path], instruction=wanted, count=count)
+            plan.notes[:0] = said
+            prompt = wanted
             detail["instruction"] = True
             new_kind = JobKind.EDIT
         else:  # pragma: no cover - GENERATIVE is exhaustive above
@@ -1212,6 +1267,34 @@ class Dreambot:
         new_job.parent, new_job.parent_index = job.id, image.index
         new_job.inputs = {"source": image.path}
         return new_job, plan
+
+    @staticmethod
+    def _instruction(text: str, notes: list[str]) -> str:
+        """What an edit tells its model, from what the person wrote.
+
+        An instruction is taken as written: unlike a prompt, it has no parameters. Left in,
+        `--lora pixel-art` would reach the edit model as words to draw from, and the person
+        would never learn that it did nothing. So parameters are taken out, and that is said.
+        """
+        try:
+            parsed = parse_prompt(text)
+        except PromptError:
+            return text  # not parameters after all: words with dashes in them
+        if not parsed.given or parsed.is_multi or parsed.image_prompts:
+            return text
+        left_out = ", ".join(f"`{parameter}`" for parameter in parsed.given)
+        if not parsed.positive_text:
+            raise DreambotError(
+                f"Say what to change in words. Parameters ({left_out}) aren't read in an edit's instruction."
+            )
+        note = f"An edit takes its instruction as written, so {left_out} was left out of it."
+        if parsed.params.loras:
+            note += (
+                " A LoRA only goes on the model it was trained on, and an edit runs on an edit model: "
+                "say the look in words instead, e.g. “in pixel art style”."
+            )
+        notes.append(note)
+        return parsed.positive_text
 
     def _scene_text(self, job: Job, depth: int = 0) -> str:
         """A description of what a job's images show, for jobs derived from them.
@@ -1228,14 +1311,14 @@ class Dreambot:
                 return self._scene_text(parent, depth + 1)
         return ""
 
-    async def _reroll(self, job: Job, *, user: str, channel: str) -> list[Job]:
+    async def _reroll(self, job: Job, *, user: str, channel: str, allow_paths: bool = False) -> list[Job]:
         """Run a job again with fresh seeds."""
         if job.kind is JobKind.IMAGINE:
             # Fresh seeds, and one job: rerolling one result of a `--repeat 4` runs it once, as in Midjourney.
             prompt = re.sub(r"\s--(?:seed|sameseed|repeat)\s+\d+", "", f" {job.prompt}").strip()
             attachments = [p for p in job.inputs.get("attachments", []) if Path(p).is_file()]
             return await self.imagine(
-                user=user, channel=channel, prompt=prompt, attachments=attachments, allow_paths=True
+                user=user, channel=channel, prompt=prompt, attachments=attachments, allow_paths=allow_paths
             )
         saved = job.detail.get("action")
         if not saved or job.parent is None:
@@ -1243,7 +1326,7 @@ class Dreambot:
         again = Action(
             ActionKind(saved["kind"]), job.parent, job.parent_index, saved.get("value"), saved.get("prompt")
         )
-        return (await self.act(user=user, channel=channel, action=again)).jobs
+        return (await self.act(user=user, channel=channel, action=again, allow_paths=allow_paths)).jobs
 
     # --------------------------------------------------------------------- blend ----
 
@@ -1629,6 +1712,8 @@ def describe_job(job: Job, image: JobImage | None = None) -> str:
     if style := job.detail.get("style"):
         mix = ", ".join(f"{part['label']} {round(part['share'] * 100)}%" for part in style.get("sources", []))
         lines.append(f"Style: {style.get('summary', '')}" + (f" ({mix})" if "," in mix else ""))
+    if used := job.detail.get("loras"):
+        lines.append("LoRA: " + ", ".join(f"{lora['name']} ({lora['scale']:g})" for lora in used))
     if image is not None:
         lines.append(f"Image {image.index}: seed {image.seed} · {image.width}x{image.height}")
         if image.prompt:

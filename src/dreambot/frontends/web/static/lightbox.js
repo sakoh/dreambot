@@ -255,7 +255,9 @@ export function Lightbox() {
           </span>
         </div>`}
         <div class="job-meta small muted">
-          <span>${job.kind}</span><span>${job.model}</span><span>${image.width}×${image.height}</span>
+          <span>${job.kind}</span><span>${job.model}</span>
+          ${(job.loras || []).map((lora) => html`<span title="LoRA">${lora.name}${lora.scale === 1 ? "" : ` ×${lora.scale}`}</span>`)}
+          <span>${image.width}×${image.height}</span>
           <span>seed ${image.seed}</span><span>#${job.id}</span>
           <span>${new Date(job.created * 1000).toLocaleString()}</span>
         </div>

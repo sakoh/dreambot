@@ -21,7 +21,7 @@ import {
   updateRef,
   useStore,
 } from "./store.js";
-import { Empty, Icon, IconButton, Menu, Swatches, copy, dayKey, dayLabel, pictures, splitPrompt } from "./ui.js";
+import { Dialog, Empty, Icon, IconButton, Menu, Swatches, copy, dayKey, dayLabel, pictures, splitPrompt } from "./ui.js";
 
 const RATIOS = ["1:1", "4:3", "3:2", "16:9", "2:1", "3:4", "2:3", "9:16"];
 const ROLES = {
@@ -307,8 +307,95 @@ function Personalize() {
   </div>`;
 }
 
+// The LoRAs every prompt is given are kept as `--lora` would name them: "pixel-art", "grain:0.5".
+const readLora = (token) => {
+  const [name, scale] = token.split(":");
+  return { name, scale: scale === undefined ? 1 : Number(scale) };
+};
+const writeLoras = (chosen) => chosen.map((lora) => (lora.scale === 1 ? lora.name : `${lora.name}:${lora.scale}`));
+
+/** The prompt bar's LoRA button: pick the fine-tuned looks that every prompt is made with. */
+function Loras() {
+  const { app } = useStore();
+  const [help, setHelp] = useState(false);
+  if (!app) return null;
+  const chosen = app.settings.loras.map(readLora);
+  const names = new Set(chosen.map((lora) => lora.name));
+  const flip = (entry) => {
+    if (names.has(entry.name)) return saveSettings({ loras: writeLoras(chosen.filter((lora) => lora.name !== entry.name)) });
+    // LoRAs trained on different models cannot share a picture: choosing one takes the place of the others.
+    const family = (name) => (app.loras.find((other) => other.name === name) || {}).family || "";
+    const together = chosen.filter((lora) => !entry.family || !family(lora.name) || family(lora.name) === entry.family);
+    return saveSettings({ loras: writeLoras([...together, { name: entry.name, scale: 1 }]) });
+  };
+  const label = chosen.length
+    ? `LoRA: ${chosen.map((lora) => lora.name).join(", ")} — on every prompt until you change it`
+    : "LoRA: give every prompt one fine-tuned look (pixel art, anime, …)";
+  return html`<${Menu}
+      icon="down"
+      text="LoRA"
+      label=${label}
+      cls=${`lora-menu ${chosen.length ? "is-on" : ""}`}
+      items=${() => [
+        ...app.loras.map((entry) => ({
+          label: entry.base ? `${entry.title} · ${entry.base}` : entry.title,
+          icon: "blend",
+          checked: names.has(entry.name),
+          onClick: () => flip(entry),
+        })),
+        ...(chosen.length ? ["divider", { label: "No LoRA", icon: "x", onClick: () => saveSettings({ loras: [] }) }] : []),
+        ...(app.loras.length ? ["divider"] : []),
+        { label: "Add a LoRA…", icon: "info", onClick: () => setHelp(true) },
+      ]}
+    />
+    ${help &&
+    html`<${Dialog} title="Add a LoRA" onClose=${() => setHelp(false)}>
+      <p>
+        A LoRA is a small fine-tune that gives a model one look: pixel art, anime, one illustrator's line. Thousands
+        are published on Hugging Face. Add one in Terminal on this Mac, and it appears in this menu:
+      </p>
+      <p><code>dreambot loras add owner/name --name pixel-art</code></p>
+      <p class="muted small">
+        <code>owner/name</code> is its Hugging Face page, or the path of a .safetensors file. In a prompt, a LoRA can
+        also be named by hand: <code>--lora pixel-art:0.6</code>.
+      </p>
+    <//>`}`;
+}
+
+/** A chosen LoRA under the prompt: what it is, how strongly it is applied, and a way to drop it. */
+function LoraChip({ lora, chosen }) {
+  const { app } = useStore();
+  const entry = app.loras.find((other) => other.name === lora.name) || { title: lora.name, base: "", trigger: "" };
+  const save = (next) => saveSettings({ loras: writeLoras(next) });
+  const about = [
+    entry.base ? `Runs on ${entry.base}, the model it was trained on.` : "Goes on whichever model the prompt runs on.",
+    entry.trigger ? `Every prompt starts with “${entry.trigger}”` : "",
+  ];
+  return html`<div class="ref-chip role-lora" title=${about.join(" ").trim()}>
+    <div class="ref-text">
+      <span class="ref-role">LoRA</span>
+      <span class="ref-name">${entry.title}</span>
+    </div>
+    <label class="ref-weight" title="Strength: 1 is as it was trained, less is subtler">
+      ×<input
+        type="number"
+        min="0.1"
+        max="2"
+        step="0.1"
+        value=${lora.scale}
+        aria-label=${`Strength of ${entry.title}`}
+        onChange=${(event) => {
+          const scale = Math.min(2, Math.max(0.1, Math.round((Number(event.target.value) || 1) * 100) / 100));
+          save(chosen.map((other) => (other.name === lora.name ? { ...other, scale } : other)));
+        }}
+      />
+    </label>
+    <${IconButton} icon="x" label="Stop using this LoRA" size=${14} onClick=${() => save(chosen.filter((other) => other.name !== lora.name))} />
+  </div>`;
+}
+
 export function PromptBar() {
-  const { draft } = useStore();
+  const { draft, app } = useStore();
   const [tray, setTray] = useState(false);
   const [panel, setPanel] = useState(false);
   const [role, setRole] = useState("image");
@@ -355,6 +442,7 @@ export function PromptBar() {
       addFiles(files);
     }
   };
+  const loras = app ? app.settings.loras.map(readLora) : [];
   const sticky = [
     draft.params.ar && `--ar ${draft.params.ar}`,
     Number(draft.params.chaos) > 0 && `--chaos ${draft.params.chaos}`,
@@ -384,14 +472,16 @@ export function PromptBar() {
       ></textarea>
       ${draft.text && html`<${IconButton} icon="x" label="Clear the prompt" onClick=${() => setDraft({ text: "" })} />`}
       <${Personalize} />
+      <${Loras} />
       <${IconButton} icon="sliders" label="Settings" active=${panel} onClick=${() => setPanel(!panel)} />
       <button type="button" class="button is-primary send" disabled=${busy} onClick=${() => submit(false)} title="Enter sends; ⌘Enter sends and keeps the prompt">
         Imagine
       </button>
     </div>
-    ${(draft.refs.length > 0 || sticky.length > 0) &&
+    ${(draft.refs.length > 0 || sticky.length > 0 || loras.length > 0) &&
     html`<div class="ref-row">
       ${draft.refs.map((item) => html`<${RefChip} key=${item.id} item=${item} />`)}
+      ${loras.map((lora) => html`<${LoraChip} key=${`lora-${lora.name}`} lora=${lora} chosen=${loras} />`)}
       ${sticky.map(
         (text) => html`<span class="chip is-param" title="Added to every prompt; change it in Settings">${text}</span>`,
       )}

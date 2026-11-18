@@ -16,6 +16,7 @@ import inspect
 import json
 import math
 import os
+import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -454,14 +455,11 @@ class MlxBackend:
 
         try:
             model = cls(**kwargs)
-        except FileNotFoundError as exc:
-            raise BackendError(
-                f"The weights for {spec.id} are not installed. Run `dreambot models pull {spec.id}`.",
-                ErrorKind.NOT_INSTALLED,
-                detail=str(exc),
-            ) from exc
         except Exception as exc:
-            if _is_offline_miss(exc):
+            if req.loras and (problem := _lora_problem(exc, spec)):
+                # mflux refuses an adapter it cannot apply in full rather than drawing without it.
+                raise BackendError(problem, ErrorKind.INVALID, detail=f"{type(exc).__name__}: {exc}") from exc
+            if isinstance(exc, FileNotFoundError) or _is_offline_miss(exc):
                 raise BackendError(
                     f"The weights for {spec.id} are not installed. Run `dreambot models pull {spec.id}`.",
                     ErrorKind.NOT_INSTALLED,
@@ -641,6 +639,22 @@ DESCRIBE_INSTRUCTION = (
     "Do not mention that it is an image or a prompt. Output exactly {count} lines numbered 1. to {count}. "
     "and nothing else."
 )
+
+
+def _lora_problem(exc: BaseException, spec: ModelSpec) -> str | None:
+    """What to tell the person when a model failed to load because of a LoRA, else ``None``."""
+    text = str(exc)
+    match = re.search(r"[\w.\-]+\.safetensors", text)
+    file = match.group(0) if match else "A LoRA"
+    if "No LoRA layers were applied" in text or "could not be applied" in text:
+        return f"{file} does not fit {spec.title}: it was trained on a different model."
+    if "DoRA" in text:
+        return f"{file} is a DoRA adapter, which is not supported."
+    if "LoRA" in text or "LoKr" in text:
+        if isinstance(exc, FileNotFoundError):
+            return "A LoRA this job needs is not on this Mac (pictures are made offline)."
+        return f"{file} could not be used as a LoRA on {spec.title}."
+    return None
 
 
 def _is_offline_miss(exc: BaseException) -> bool:

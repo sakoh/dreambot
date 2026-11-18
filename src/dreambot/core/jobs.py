@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 import time
 from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from typing import Any
+
+_OLD_LORA_NAME = re.compile(r"(?<!\S)--loras(?!\S)")
 
 # Crockford base32 without the look-alike characters, so ids survive being read aloud or typed
 # on a phone: no I, L, O or U.
@@ -122,6 +125,8 @@ class Job:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Job:
         values = dict(data)
+        # Prompts kept before `--lora` was written back the way it is typed say `--loras`.
+        values["prompt"] = _OLD_LORA_NAME.sub("--lora", values.get("prompt") or "")
         values["kind"] = JobKind(values["kind"])
         values["status"] = JobStatus(values["status"])
         values["images"] = [JobImage(**image) for image in values.get("images", [])]

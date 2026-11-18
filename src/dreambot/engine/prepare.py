@@ -10,15 +10,21 @@ Two cases:
 * Otherwise the weights live in the original upstream repository, which usually contains far
   more than is needed (several variants, other frameworks). mflux knows exactly which files it
   wants, so the model is constructed once here and mflux fetches just those.
+
+``python -m dreambot.engine.prepare lora <library folder> <request as JSON>`` adds a LoRA to
+the library the same way (see :mod:`dreambot.engine.loras`).
 """
 
 from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import sys
+from pathlib import Path
 
-from dreambot.engine import weights
+from dreambot.engine import loras, weights
+from dreambot.engine.loras import Card, LoraError
 from dreambot.engine.registry import REGISTRY, ModelSpec, UnknownModel
 
 
@@ -90,10 +96,65 @@ def _construct(spec: ModelSpec) -> None:
         raise
 
 
+class HuggingFace:
+    """Hugging Face and mflux, as adding a LoRA needs them (a :class:`dreambot.engine.loras.Hub`)."""
+
+    def card(self, repo: str) -> Card:
+        from huggingface_hub import HfApi
+
+        try:
+            info = HfApi().model_info(repo, files_metadata=True)
+        except Exception as exc:
+            kind = type(exc).__name__
+            if kind == "GatedRepoError":
+                raise LoraError(
+                    f"{repo} is gated. Accept its terms at https://huggingface.co/{repo} and sign in "
+                    "with `hf auth login`, then try again."
+                ) from exc
+            if kind in ("RepositoryNotFoundError", "HFValidationError"):
+                raise LoraError(f"There is no model called {repo} on Hugging Face.") from exc
+            raise LoraError(f"Hugging Face could not be reached for {repo} ({kind}: {exc}).") from exc
+        data = info.card_data.to_dict() if info.card_data else {}
+        base = data.get("base_model") or []
+        return Card(
+            repo=info.id or repo,
+            files=tuple((item.rfilename, item.size or 0) for item in info.siblings or ()),
+            base_models=tuple(map(str, [base] if isinstance(base, str) else base)),
+            trigger=str(data.get("instance_prompt") or "").strip(),
+            license=str(data.get("license") or ""),
+        )
+
+    def fetch_file(self, repo: str, filename: str, folder: Path) -> Path:
+        from huggingface_hub import hf_hub_download
+
+        return Path(hf_hub_download(repo_id=repo, filename=filename, local_dir=str(folder)))
+
+    def takes_loras(self, base: ModelSpec) -> bool:
+        """Whether mflux's class for the model accepts LoRAs at all (a few families do not)."""
+        if not base.variants:
+            return False
+        module_name, _, class_name = next(iter(base.variants.values())).cls.partition(":")
+        cls = getattr(importlib.import_module(module_name), class_name)
+        return "lora_paths" in inspect.signature(cls).parameters
+
+
+def add_lora(folder: Path, request: dict) -> int:
+    """Add a LoRA to the library and say what it is now called."""
+    try:
+        entry = loras.install(folder, loras.Wanted(**request), hub=HuggingFace())
+    except LoraError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    print(f"Added the LoRA {entry.name}" + (f", for {entry.base}." if entry.base else "."))
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print("usage: python -m dreambot.engine.prepare <model> [q3|q4|q5|q6|q8|bf16]", file=sys.stderr)
         return 2
+    if argv[0] == "lora" and len(argv) == 3:
+        return add_lora(Path(argv[1]), json.loads(argv[2]))
     if argv[0].lower() in ("describe", "vision"):
         from huggingface_hub import snapshot_download
 

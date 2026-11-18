@@ -65,6 +65,35 @@ from dreambot.engine.protocol import Op
 log = logging.getLogger(__name__)
 
 STATIC = Path(__file__).parent / "static"
+
+
+def _build() -> str:
+    """A short name for the page's own files as they are now. It changes exactly when one does."""
+    digest = hashlib.sha256()
+    for path in sorted(STATIC.rglob("*")):
+        if path.is_file():
+            digest.update(path.relative_to(STATIC).as_posix().encode())
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+class _Static(StaticFiles):
+    """The page's scripts and styles, checked with the server each time they are loaded.
+
+    With no word on caching a browser guesses, and goes on running last week's script next to
+    this week's server. Asked every time, it is told "not modified" unless Dreambot was updated.
+
+    That only helps a browser that asks. One that already holds a script from before, with
+    leave to keep it for hours, never does: so the page also loads its files from an address
+    with :func:`_build` in it, which no browser can have seen before an update.
+    """
+
+    async def get_response(self, path: str, scope: Any) -> Response:
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 COOKIE = "dreambot"
 CHANNEL = "web:main"
 THUMB_WIDTHS = (256, 512, 1024)
@@ -196,6 +225,8 @@ class WebApp:
         self.uploads = self.config.home / "uploads"
         self._previews: dict[str, int] = {}
         self._unsubscribe = service.subscribe(self._on_job_event)
+        #: Part of the address the page loads its scripts and styles from (see :class:`_Static`).
+        self.build = _build()
         web = self.config.web
         allowed = hosts or frozenset(
             {f"127.0.0.1:{web.port}", f"localhost:{web.port}", f"[::1]:{web.port}", f"{web.host}:{web.port}"}
@@ -247,7 +278,8 @@ class WebApp:
             get("/media/upload/{upload}", self.upload_image),
             get("/media/lookbook/{book}/{image}", self.lookbook_image),
             get("/media/style/{code}/{number:int}", self.style_image),
-            Mount("/static", StaticFiles(directory=STATIC), name="static"),
+            Mount(f"/static/{self.build}", _Static(directory=STATIC), name="built"),
+            Mount("/static", _Static(directory=STATIC), name="static"),
         ]
         self.app: ASGIApp = Guard(Starlette(routes=routes), hosts=allowed, token=self.token)
 
@@ -343,6 +375,7 @@ class WebApp:
             "notes": job.notes,
             "error": job.error,
             "style": job.detail.get("style"),
+            "loras": [{"name": lora["name"], "scale": lora["scale"]} for lora in job.detail.get("loras", [])],
             "enhanced": bool(job.detail.get("enhanced")),
             "instruction": bool(job.detail.get("instruction")),
             "count": len(job.seeds) or len(job.images),
@@ -398,7 +431,9 @@ class WebApp:
     # ---------------------------------------------------------------------- page ----
 
     async def index(self, request: Request) -> Response:
-        response = HTMLResponse((STATIC / "index.html").read_text())
+        # The page itself is never kept by the browser, and names its files by this build.
+        page = (STATIC / "index.html").read_text().replace('"/static/', f'"/static/{self.build}/')
+        response = HTMLResponse(page)
         response.set_cookie(COOKIE, self.token, httponly=True, samesite="strict", max_age=365 * 24 * 3600)
         response.headers["Content-Security-Policy"] = CSP
         response.headers["Cache-Control"] = "no-store"
@@ -428,10 +463,23 @@ class WebApp:
                 "backend": self.config.engine.backend,
                 "model": model,
                 "models": models,
+                # The LoRA library: fine-tuned looks a prompt can be given by name.
+                "loras": [
+                    {
+                        "name": entry.name,
+                        "title": entry.title or entry.name,
+                        "base": entry.base,
+                        # LoRAs for one family of models can be used together; others cannot.
+                        "family": base.family if (base := service.catalog.registry.find(entry.base)) else "",
+                        "trigger": entry.trigger,
+                    }
+                    for entry in service.planner.loras.entries()[0]
+                ],
                 "vision": service.catalog.vision_model() is not None,
                 "queue": service.queue_length,
                 "settings": {
                     "model": settings.model,
+                    "loras": list(resolved.loras),
                     "stylize": resolved.stylize,
                     "count": resolved.count,
                     "raw": resolved.raw,
@@ -454,6 +502,9 @@ class WebApp:
                 setattr(settings, key, bool(data[key]))
         if "model" in data:
             settings.model = str(data["model"]) if data["model"] else None
+        if "loras" in data:
+            wanted = data["loras"] if isinstance(data["loras"], list) else []
+            settings.loras = [str(name) for name in wanted if name]
         if "stylize" in data:
             settings.stylize = max(0, min(1000, int(data["stylize"])))
         if "count" in data:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import random
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -25,10 +26,11 @@ from dreambot.config import Config
 from dreambot.core import enhance, fingerprint, lookbook, styles
 from dreambot.core.fingerprint import StyleFingerprint
 from dreambot.core.imaging import Canvas, Tile
-from dreambot.core.params import MAX_SEED, LoraRef, Params
+from dreambot.core.params import MAX_SEED, LoraRef, Params, parse_loras
 from dreambot.core.prompt import ParsedPrompt
 from dreambot.core.settings import ResolvedSettings
 from dreambot.core.sizes import dimensions, snap, working_size
+from dreambot.engine import loras as lora_library
 from dreambot.engine import weights as weights_module
 from dreambot.engine.protocol import GenerateRequest, Lora, Op
 from dreambot.engine.registry import REGISTRY, ModelSpec, Registry, UnknownModel
@@ -137,6 +139,36 @@ class Board:
     tiles: tuple[tuple[str, float], ...]
     #: Makes the cut reproducible.
     seed: int
+
+
+@dataclass(frozen=True)
+class Fitted:
+    """One LoRA a job uses."""
+
+    #: What it is called: its name in the library, or what the person typed.
+    name: str
+    #: Its file, or a Hugging Face repository that is already in the cache.
+    path: str
+    scale: float = 1.0
+    #: Registry id of the model it was trained on, when that is known.
+    base: str = ""
+    #: The words it answers to, which go into the prompt.
+    trigger: str = ""
+
+    @property
+    def lora(self) -> Lora:
+        return Lora(path=self.path, scale=self.scale)
+
+    def record(self) -> dict[str, Any]:
+        """What a job keeps of it, so that variations and upscales of its pictures use it too."""
+        return {"name": self.name, "path": self.path, "scale": self.scale, "base": self.base}
+
+
+def triggered(prompt: str, loras: Sequence[Fitted]) -> str:
+    """``prompt`` with the trigger words of every LoRA it is rendered with, the first one's first."""
+    for lora in reversed(loras):
+        prompt = lora_library.worded(lora.trigger, prompt)
+    return prompt
 
 
 @dataclass
@@ -457,6 +489,7 @@ class Planner:
     def __init__(self, catalog: Catalog, config: Config, rng: random.Random | None = None):
         self.catalog = catalog
         self.config = config
+        self.loras = lora_library.Library(config.lora_dir, catalog.registry)
         self._rng = rng or random.SystemRandom()
 
     # ----------------------------------------------------------------- helpers ----
@@ -527,27 +560,106 @@ class Planner:
         )
         return None, guidance, f"Without {', '.join(terms or wanted)}."
 
-    def _loras(self, spec: ModelSpec, requested: list[LoraRef]) -> list[Lora]:
-        resolved: list[Lora] = []
-        for lora in requested:
-            resolved.append(Lora(path=self._lora_path(lora.name), scale=lora.scale))
-        return resolved
+    def _loras(self, requested: Sequence[LoraRef], allow_paths: bool = False) -> list[Fitted]:
+        """The LoRAs asked for with ``--lora``. ``--lora none`` asks for none at all."""
+        if any(lora.name.lower() in lora_library.NONE for lora in requested):
+            return []
+        return [self._lora(lora, allow_paths) for lora in requested]
 
-    def _lora_path(self, name: str) -> str:
-        direct = Path(name).expanduser()
-        if direct.is_file():
-            return str(direct)
-        folder = self.config.lora_dir
-        for candidate in (folder / name, folder / f"{name}.safetensors"):
-            if candidate.is_file():
-                return str(candidate)
-        if name.count("/") == 1 and not name.startswith((".", "~", "/")):
-            return name  # a Hugging Face repo id; must already be in the cache
-        available = sorted(p.stem for p in folder.glob("*.safetensors")) if folder.is_dir() else []
-        listing = (
-            f" Available: {', '.join(available)}." if available else f" Put .safetensors files in {folder}."
-        )
+    def _lora(self, wanted: LoraRef, allow_paths: bool) -> Fitted:
+        """One ``--lora`` name as a file.
+
+        A name is a LoRA of the library, or a Hugging Face repository that is already in the
+        cache. A path is only taken from the Mac itself: a prompt that arrives over chat must
+        not be able to point Dreambot at any file on it.
+        """
+        name = wanted.name
+        if allow_paths:
+            direct = Path(name).expanduser()
+            if direct.is_file():
+                return Fitted(direct.stem, str(direct), wanted.scale)
+        try:
+            entry = self.loras.find(name)
+        except lora_library.LoraError as exc:
+            raise PlanError(f"The LoRA `{name}` can't be used: {exc}.") from exc
+        if entry is not None:
+            # The scale typed is a share of the strength the LoRA was added with.
+            return Fitted(entry.name, entry.path, wanted.scale * entry.scale, entry.base, entry.trigger)
+        if ".." not in name and not name.startswith(".") and re.fullmatch(r"[\w.-]+/[\w.-]+", name):
+            return Fitted(name, name, wanted.scale)  # a Hugging Face repository; it must be in the cache
+        if not allow_paths and not re.fullmatch(r"[\w-][\w.-]*", name):
+            raise PlanError("`--lora` takes the name of a LoRA; file paths only work from the Mac itself.")
+        available = [entry.name for entry in self.loras.entries()[0]]
+        if available:
+            listing = f" Available: {', '.join(available)}."
+        elif allow_paths:
+            listing = (
+                f" Add one with `dreambot loras add`, or put .safetensors files in {self.config.lora_dir}."
+            )
+        else:
+            listing = " None are installed on the Mac yet."
         raise PlanError(f"I can't find a LoRA called `{name}`.{listing}")
+
+    def _lora_model(
+        self, loras: Sequence[Fitted], typed: Params, settings: ResolvedSettings, notes: list[str]
+    ) -> Params:
+        """What the person typed, with the model their LoRA was trained on chosen for them.
+
+        A LoRA is changes to one model's weights and means nothing on another. So naming a
+        LoRA names its model too, unless the person names a model themselves — and then the two
+        have to be of one family.
+        """
+        known = [
+            (lora, spec) for lora in loras if lora.base and (spec := self.catalog.registry.find(lora.base))
+        ]
+        if not known:
+            return typed
+        if typed.model is not None:
+            self._fitting(self.catalog.lookup(typed.model), loras, notes, strict=True)
+            return typed
+        (first, model), *others = known
+        for lora, spec in others:
+            if spec.family != model.family:
+                raise PlanError(
+                    f"`{first.name}` and `{lora.name}` were trained on different models ({model.title} and "
+                    f"{spec.title}), so they can't be used together."
+                )
+        ready = next((spec for _, spec in known if self.catalog.is_installed(spec)), None)
+        if ready is None:
+            raise PlanError(
+                f"`{first.name}` is a LoRA for {model.title}, which isn't installed. "
+                f"Run `dreambot models pull {model.id}`."
+            )
+        theirs = self.catalog.registry.find(settings.model) if settings.model else None
+        if theirs is not None and theirs.id != ready.id:
+            notes.append(
+                f"`{first.name}` is a LoRA for {ready.title}, so this ran on it rather than on {theirs.title}."
+            )
+        return replace(typed, model=ready.id)
+
+    def _fitting(
+        self, spec: ModelSpec, loras: Sequence[Fitted], notes: list[str], *, strict: bool
+    ) -> list[Fitted]:
+        """The LoRAs that can go on ``spec``: those trained on a model of its family, or on nobody knows what.
+
+        One that cannot is refused when the person asked for it here (``strict``), and left out
+        with a note when it only came along from an earlier job or from their settings.
+        """
+        kept: list[Fitted] = []
+        for lora in loras:
+            base = self.catalog.registry.find(lora.base) if lora.base else None
+            if base is None or base.family == spec.family:
+                kept.append(lora)
+            elif strict:
+                raise PlanError(
+                    f"`{lora.name}` is a LoRA for {base.title}; it can't be used with {spec.title}. "
+                    f"Leave `--model` out to run it on {base.title}."
+                )
+            else:
+                notes.append(
+                    f"`{lora.name}` is a LoRA for {base.title}, so {spec.title} made this without it."
+                )
+        return kept
 
     def _require(self, spec: ModelSpec, op: Op) -> None:
         if not spec.supports(op):
@@ -585,6 +697,7 @@ class Planner:
         *,
         directions: Sequence[str] | None = None,
         seeds: Sequence[int] | None = None,
+        allow_paths: bool = False,
     ) -> Plan:
         """Plan a prompt.
 
@@ -592,11 +705,38 @@ class Planner:
         first write a line of art direction for each image; planning again with those
         ``directions`` (and the same ``seeds``) then builds the prompts from them. An empty
         direction leaves that image with the rule-based emulation in :mod:`dreambot.core.styles`.
+
+        ``allow_paths`` says the prompt was typed on the Mac itself, where ``--lora`` may name
+        a file anywhere on it.
         """
+        typed = parsed.params.loras
+        if typed or not settings.loras:
+            return self._imagine(parsed, settings, refs, typed, directions, seeds, allow_paths)
+        # The person's default LoRAs go on every prompt they fit. One they do not fit — an edit,
+        # when they were trained on a model that only draws — runs without them rather than not at all.
+        try:
+            usual = parse_loras(" ".join(settings.loras))
+            return self._imagine(parsed, settings, refs, usual, directions, seeds, False)
+        except PlanError as exc:
+            plan = self._imagine(parsed, settings, refs, [], directions, seeds, allow_paths)
+            plan.notes.append(f"Your default LoRA was left out of this one. ({exc})")
+            return plan
+
+    def _imagine(
+        self,
+        parsed: ParsedPrompt,
+        settings: ResolvedSettings,
+        refs: ResolvedRefs | None,
+        loras: Sequence[LoraRef],
+        directions: Sequence[str] | None,
+        seeds: Sequence[int] | None,
+        allow_paths: bool,
+    ) -> Plan:
         refs = refs or ResolvedRefs()
-        typed = parsed.params
-        params = typed.merged_over(settings.as_params())
         notes: list[str] = []
+        fitted = self._loras(loras, allow_paths)
+        typed = self._lora_model(fitted, parsed.params, settings, notes)
+        params = typed.merged_over(settings.as_params())
         text = parsed.positive_text
         if not text and not refs.images:
             raise PlanError("Give me something to imagine: a description, an image, or both.")
@@ -624,7 +764,16 @@ class Planner:
             looks, overall = self._looks(sources, seeds[0], count, style_weight, stylize, boarded)
             shown = replace(refs, style=[BOARD] if overall.board is not None else [])
 
-        op, spec = self._imagine_model(choosing, params, settings, shown, notes)
+        try:
+            op, spec = self._imagine_model(choosing, params, settings, shown, notes)
+        except PlanError as exc:
+            if typed.model is not None and parsed.params.model is None:
+                # The model was chosen for the LoRA, not by the person: say why it is in the way.
+                held = self.catalog.lookup(typed.model)
+                raise PlanError(
+                    f"`{fitted[0].name}` only works on {held.title}, the model it was trained on. {exc}"
+                ) from exc
+            raise
         steps, quality_scale = self._steps(spec, params, notes)
         scale = quality_scale * (0.5 if params.draft else 1.0)
 
@@ -655,7 +804,9 @@ class Planner:
             # Only a plain text prompt is art-directed. With images attached the text is an
             # instruction, or a description that has to agree with a picture the model cannot see.
             candidate = enhance.Brief(
-                text=text,
+                # With a LoRA's trigger words: they usually name its look ("pixel art style"),
+                # and the art director then keeps to it as to any other medium the prompt names.
+                text=triggered(text, fitted),
                 count=count,
                 stylize=0 if raw else stylize,
                 chaos=chaos,
@@ -713,7 +864,7 @@ class Planner:
             steps=steps,
             guidance=guidance,
             negative=negative,
-            loras=self._loras(spec, params.loras),
+            loras=[lora.lora for lora in fitted],
             weights=location,
             quantize=quantize,
             stop_at=params.stop / 100 if params.stop is not None and params.stop < 100 else None,
@@ -748,6 +899,7 @@ class Planner:
                 notes.append(
                     "Only the first image prompt was used; install an edit model to combine several."
                 )
+        directed = [triggered(prompt, fitted) for prompt in directed]
 
         plan = Plan(
             model=spec.id,
@@ -763,6 +915,8 @@ class Planner:
         )
         if styled and (detail := self._style_detail(sources, overall, version, style_weight, stylize)):
             plan.detail["style"] = detail
+        if fitted:
+            plan.detail["loras"] = [lora.record() for lora in fitted]
         if params.hd:
             self._add_hd(plan)
         return plan
@@ -1040,8 +1194,13 @@ class Planner:
         count: int,
         negative: str | None = None,
         params: Params | None = None,
+        loras: Sequence[Fitted] = (),
     ) -> Plan:
-        """New takes on one image: same prompt (unless remixed), keeps the composition."""
+        """New takes on one image: same prompt (unless remixed), keeps the composition.
+
+        ``loras`` are the ones the image was made with. They are used again, unless a remixed
+        prompt names LoRAs of its own.
+        """
         params = params or Params()
         notes: list[str] = []
         spec = self.catalog.registry.find(model)
@@ -1058,6 +1217,10 @@ class Planner:
             spec = self.catalog.lookup(params.model)
             self._require(spec, Op.IMG2IMG)
 
+        if params.loras:
+            fitted = self._fitting(spec, self._loras(params.loras), notes, strict=True)
+        else:
+            fitted = self._fitting(spec, loras, notes, strict=False)
         steps, _ = self._steps(spec, params, notes)
         guidance = self._guidance(spec, params)
         seeds = self._seeds(params, count)
@@ -1067,7 +1230,7 @@ class Planner:
         render = Render(
             op=Op.IMG2IMG,
             model=spec.id,
-            prompt=text,
+            prompt=triggered(text, fitted),
             seeds=seeds,
             slots=list(range(1, count + 1)),
             width=snap(width, spec.multiple),
@@ -1079,10 +1242,13 @@ class Planner:
             # `--strength` is the raw per-model control; without it, aim for a noise level.
             strength=params.strength,
             noise=None if params.strength is not None else VARIATION_NOISE[mode],
-            loras=self._loras(spec, params.loras),
+            loras=[lora.lora for lora in fitted],
             weights=location,
             quantize=quantize,
         )
+        detail: dict[str, Any] = {"mode": mode, "noise": render.noise, "strength": render.strength}
+        if fitted:
+            detail["loras"] = [lora.record() for lora in fitted]
         return Plan(
             model=spec.id,
             op=Op.IMG2IMG,
@@ -1094,7 +1260,7 @@ class Planner:
             renders=[render],
             source=source,
             notes=notes,
-            detail={"mode": mode, "noise": render.noise, "strength": render.strength},
+            detail=detail,
         )
 
     # ------------------------------------------------------------------ upscale ----
@@ -1108,6 +1274,7 @@ class Planner:
         creative: bool,
         enlarged: str | None = None,
         tiles: list[Tile] | None = None,
+        loras: Sequence[Fitted] = (),
     ) -> Plan:
         """Double an image's size.
 
@@ -1116,7 +1283,8 @@ class Planner:
         Creative re-renders the enlarged image so the model invents new fine detail. That is
         done tile by tile at the model's native resolution — rendering a 4-megapixel image in
         one piece pushes the noise schedule so far that the picture would be redrawn rather
-        than refined. ``enlarged`` is the plainly enlarged source and ``tiles`` its tiles.
+        than refined. ``enlarged`` is the plainly enlarged source and ``tiles`` its tiles, and
+        ``loras`` are the ones the image was made with: new detail is drawn in the same look.
         """
         notes: list[str] = []
         with Image.open(source) as image:
@@ -1169,6 +1337,7 @@ class Planner:
         if enlarged is None or not tiles:
             raise PlanError("A re-rendered upscale needs the enlarged source image and its tiles.")
         location, quantize = self._weights(spec)
+        fitted = self._fitting(spec, loras, notes, strict=False)
         with Image.open(enlarged) as big:
             target_w, target_h = big.size
         seed = self._rng.randint(0, MAX_SEED)
@@ -1176,7 +1345,7 @@ class Planner:
             Render(
                 op=Op.IMG2IMG,
                 model=spec.id,
-                prompt=text,
+                prompt=triggered(text, fitted),
                 seeds=[seed],
                 slots=[number],
                 width=tile.box[2] - tile.box[0],
@@ -1184,11 +1353,19 @@ class Planner:
                 steps=spec.steps,
                 image=str(tile.path),
                 noise=noise,
+                loras=[lora.lora for lora in fitted],
                 weights=location,
                 quantize=quantize,
             )
             for number, tile in enumerate(tiles, start=1)
         ]
+        detail: dict[str, Any] = {
+            "mode": "creative" if creative else "subtle",
+            "factor": factor,
+            "tiles": len(tiles),
+        }
+        if fitted:
+            detail["loras"] = [lora.record() for lora in fitted]
         return Plan(
             model=spec.id,
             op=Op.IMG2IMG,
@@ -1201,7 +1378,7 @@ class Planner:
             tiles=list(tiles),
             tile_base=enlarged,
             notes=notes,
-            detail={"mode": "creative" if creative else "subtle", "factor": factor, "tiles": len(tiles)},
+            detail=detail,
         )
 
     # ---------------------------------------------------------- repaint / extend ----

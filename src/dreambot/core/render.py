@@ -176,6 +176,7 @@ Short prompts are art-directed for you (a different shot for each image); --raw 
 Attach an image to use it as an image prompt, or steer with it:
   --edit (change it by instruction) · --oref (keep this person/object) · --sref (borrow its style)
 Styles blend: --sref takes several images, style codes and saved styles, each with an optional ::weight.
+A LoRA is one fine-tuned look (pixel art, anime): --lora <name>, or {slash}settings lora <name> for every prompt.
 
 {TEXT_SHORTCUTS}
 

@@ -136,7 +136,7 @@ class Commands:
         if action is not None:
             if target is not None:
                 action = action.on(target.job, target.image if action.index is None else None)
-            return await self._act(user=user, channel=channel, action=action)
+            return await self._act(user=user, channel=channel, action=action, allow_paths=allow_paths)
 
         if text.startswith("/"):
             raise DreambotError(f"I don't know that command. Send {slash}help to see what I can do.")
@@ -145,7 +145,7 @@ class Commands:
         if target is not None and text:
             # Replying to a picture with words: change that picture as described.
             action = Action(ActionKind.EDIT, target.job, target.image, prompt=text)
-            return await self._act(user=user, channel=channel, action=action)
+            return await self._act(user=user, channel=channel, action=action, allow_paths=allow_paths)
         if not text and not attachments:
             return []
         if not text and attachments:
@@ -163,8 +163,10 @@ class Commands:
 
     # ------------------------------------------------------------------ actions ----
 
-    async def _act(self, *, user: str, channel: str, action: Action) -> list[Reply]:
-        result = await self.service.act(user=user, channel=channel, action=action)
+    async def _act(
+        self, *, user: str, channel: str, action: Action, allow_paths: bool = False
+    ) -> list[Reply]:
+        result = await self.service.act(user=user, channel=channel, action=action, allow_paths=allow_paths)
         if result.jobs:
             return [Reply(queued=result.jobs)]
         if action.kind is ActionKind.SELECT and result.job and result.image:
@@ -292,6 +294,12 @@ class Commands:
             ops = ", ".join(op.value for op in spec.ops) or "specialty"
             lines.append(f"• {spec.id} — {spec.summary} [{ops}]")
         lines.append("\nMore can be added on the Mac with: dreambot models pull <name>")
+        if styled := service.planner.loras.entries()[0]:
+            lines.append("\nLoRAs — one fine-tuned look each (use with --lora <name>):")
+            for entry in styled:
+                made_for = f", for {entry.base}" if entry.base else ""
+                lines.append(f"• {entry.name} — {entry.title or entry.name}{made_for}")
+        lines.append("LoRAs (anime, pixel art, ...) are added on the Mac with: dreambot loras add <source>")
         return [Reply(text="\n".join(lines))]
 
     async def _cmd_params(self, **_) -> list[Reply]:
@@ -373,6 +381,9 @@ class Commands:
         lowered = value.lower()
         if key == "model":
             settings.model = None if lowered in ("default", "auto", "none") else value
+        elif key in ("lora", "loras"):
+            # Checked when saved: every name has to be a LoRA of the library.
+            settings.loras = [] if lowered in ("off", "none", "default") else value.replace(",", " ").split()
         elif key == "stylize":
             if lowered in STYLIZE_PRESETS:
                 settings.stylize = STYLIZE_PRESETS[lowered]
@@ -410,6 +421,7 @@ class Commands:
         lines = [
             "Your settings:",
             f"  model       {model}",
+            f"  lora        {', '.join(resolved.loras) or 'none'}",
             f"  stylize     {stylize}",
             f"  raw         {on(resolved.raw)}",
             f"  variation   {resolved.variation}",
@@ -425,7 +437,8 @@ class Commands:
             lines.append("  option sets " + ", ".join(f"--{name}" for name in sorted(resolved.option_sets)))
         lines.append(
             f"\nChange one with `{slash}settings <name> <value>`, e.g. `{slash}settings stylize high`, "
-            f"`{slash}settings model qwen-image`, `{slash}settings variation subtle`. "
+            f"`{slash}settings model qwen-image`, `{slash}settings lora pixel-art` (or `off`), "
+            f"`{slash}settings variation subtle`. "
             f"`{slash}settings reset` restores the defaults."
         )
         return "\n".join(lines)

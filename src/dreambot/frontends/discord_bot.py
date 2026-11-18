@@ -543,6 +543,28 @@ class DiscordFrontend(ChatFrontend):
                 ],
             )
             view.add_item(select)
+        library = self.service.planner.loras.entries()[0][:25]
+        if library:
+            # Fine-tuned looks, given to every prompt: none, one, or several trained on one model.
+            using = {token.partition(":")[0] for token in resolved.loras}
+            view.add_item(
+                ui.Select(
+                    custom_id=f"{SETTINGS_PREFIX}:lora",
+                    placeholder="LoRA (none)",
+                    row=4,
+                    min_values=0,
+                    max_values=len(library),
+                    options=[
+                        discord.SelectOption(
+                            label=(entry.title or entry.name)[:100],
+                            value=entry.name,
+                            description=(f"For {entry.base}" if entry.base else "For any model")[:100],
+                            default=entry.name in using,
+                        )
+                        for entry in library
+                    ],
+                )
+            )
         button("RAW Mode", "raw", resolved.raw, 1)
         for name, value in STYLIZE_PRESETS.items():
             button(f"Stylize {name}", f"stylize:{value}", resolved.stylize == value, 1)
@@ -576,6 +598,11 @@ class DiscordFrontend(ChatFrontend):
             elif key == "model":
                 values = (interaction.data or {}).get("values") or []
                 settings.model = values[0] if values else None
+            elif key == "lora":
+                # A strength set by hand (`/settings lora pixel-art:0.6`) stays with its LoRA.
+                kept = {token.partition(":")[0]: token for token in settings.loras}
+                picked = (interaction.data or {}).get("values") or []
+                settings.loras = [kept.get(name, name) for name in picked]
             elif key == "stylize":
                 settings.stylize = int(rest[0])
             elif key == "variation":
