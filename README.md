@@ -128,6 +128,11 @@ page says; `--base` and `--trigger` say them outright. After that:
 | the LoRA menu in Discord's `/settings` | the same, in Discord |
 | `--lora none` | not even your usual one, for this prompt |
 
+| | |
+| --- | --- |
+| ![The web app's prompt bar with the LoRA menu open and Pixel Art ticked; below it, one prompt made with three LoRAs: pixel art, claymation and a child's crayon drawing](docs/screenshots/lora-picker.jpg) | ![The lightbox on a pixel-art image: the prompt, the words it was rendered from with the LoRA's trigger words in front, and the LoRA named beside the model](docs/screenshots/lora-lightbox.jpg) |
+| The LoRA button, and one prompt made with three LoRAs | An image says which LoRA made it, and with which words |
+
 Variations and creative upscales of a picture are made with the LoRA it was made with. A LoRA means nothing
 on a model it was not trained on, so `--lora pixel-art --model dev` is refused with the reason; and where your
 usual LoRA cannot go — an edit runs on an edit model — the job runs without it and says so.
@@ -141,6 +146,11 @@ Z-Image Turbo, with one prompt and one seed, these changed the picture completel
 and anime (`strangerzonehf/Anime-Z`). A pencil-sketch LoRA (`Ttio2/Z-Image-Turbo-pencil-sketch`) did nothing
 until the prompt named the medium, and then drew real hatching where the words alone gave a grey photograph:
 for a LoRA whose page gives no trigger words, `--trigger "pencil sketch"` is the thing to try.
+
+![One prompt and one seed on Z-Image Turbo, with no LoRA and with ten different ones: the crayon drawing, claymation, airbrush and anime LoRAs change the picture completely, the others hardly at all](docs/screenshots/lora-looks.jpg)
+
+*"a lighthouse keeper and his dog on a cliff at sunset", seed 7: no LoRA, then ten. The ones that look like the
+first picture are the ones that need their medium named in the prompt.*
 
 The library is the folder `~/Library/Application Support/Dreambot/loras/`. Any LoRA `.safetensors` dropped
 into it works by its file name; the notes are a `<name>.toml` beside it (`base`, `trigger`, `scale`), which
