@@ -203,10 +203,10 @@ def test_models_that_share_everything_upstream_declare_their_files():
     seen: dict[tuple, list] = {}
     for spec in REGISTRY:
         seen.setdefault((spec.repo, spec.extra_repos), []).append(spec)
-    # Iris turbo and base are one checkpoint run two ways (mflux gives both the same repo and file).
-    one_checkpoint = {frozenset({"iris-3b", "iris-3b-base"})}
+    # Iris turbo and base are one set of weights run two ways (mflux gives both the same repo and file).
+    same_weights = {frozenset({"iris-3b", "iris-3b-base"})}
     for (repo, _), specs in seen.items():
-        if len(specs) < 2 or frozenset(spec.id for spec in specs) in one_checkpoint:
+        if len(specs) < 2 or frozenset(spec.id for spec in specs) in same_weights:
             continue
         for spec in specs:
             assert spec.files, f"{spec.id} shares {repo} with {[s.id for s in specs]} but names no files"

@@ -487,11 +487,15 @@ PARAMS: tuple[ParamSpec, ...] = (
         summary="For variations and image-to-image: how much of the source image to keep (0-1).",
     ),
     ParamSpec(
-        "loras",
+        # Named as people type it, so that a job's prompt reads back the way it was written.
+        "lora",
         Kind.LORAS,
-        aliases=("lora",),
+        aliases=("loras",),
+        target="loras",
         extension=True,
-        summary="LoRA(s) to apply: `--lora name` or `--lora name:0.8 other:0.5`.",
+        summary="LoRA(s) to apply: `--lora name` or `--lora name:0.8 other:0.5`; `--lora none` for none.",
+        how="A LoRA is a small fine-tune of one model for one look. One added with `dreambot loras add` "
+        "brings its model and its trigger words with it.",
     ),
     ParamSpec("negative", Kind.TEXT, aliases=("neg",), extension=True, summary="Free-text negative prompt."),
 )

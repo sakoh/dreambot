@@ -28,7 +28,7 @@ Lookbook, and a plain prompt.*
 ## Contents
 
 - [Requirements](#requirements) · [Install](#install) · [Quick start](#quick-start)
-- [Models](#models) · [Prompts and parameters](#prompts-and-parameters) · [The prompt enhancer](#the-prompt-enhancer) · [Styles and Lookbooks](#styles-and-lookbooks) · [Working with results](#working-with-results)
+- [Models](#models) · [LoRAs](#loras) · [Prompts and parameters](#prompts-and-parameters) · [The prompt enhancer](#the-prompt-enhancer) · [Styles and Lookbooks](#styles-and-lookbooks) · [Working with results](#working-with-results)
 - [Web app](#web-app) · [Chat frontends](#chat-frontends): [Telegram](#telegram) · [Discord](#discord) · [iMessage](#imessage)
 - [Privacy](#privacy) · [How it works](#how-it-works) · [Midjourney parity](#midjourney-parity) · [Development](#development)
 
@@ -98,6 +98,66 @@ and **`seedvr2-3b`** (upscaling): about 27 GB together, all Apache-2.0.
 (`dreambot models list --all` marks them). Every operation has at least one Apache/MIT option.
 
 Other MLX image libraries (for example the generators in `mlx-vlm`, or SDXL ports) are not integrated yet.
+
+## LoRAs
+
+A model draws anything, in every style it has ever seen. A **LoRA** narrows it to one look — anime, pixel
+art, one illustrator's line. It is a small file (a few hundred MB) of changes to one particular model, and
+it is how these models are fine-tuned: thousands are published on Hugging Face for Z-Image, FLUX and
+Qwen-Image.
+
+```sh
+dreambot loras add tarn59/pixel_art_style_lora_z_image_turbo --name pixel-art     # from Hugging Face
+dreambot loras add ~/Downloads/inkwash.safetensors --base z-image-turbo --trigger "ink wash painting"
+dreambot loras                       # what is in your library
+dreambot loras info pixel-art        # the model it is for, its trigger words, its license
+dreambot loras remove pixel-art
+```
+
+Adding one writes down what you would otherwise look up every time: **the model it was trained on** and its
+**trigger words**, the phrase it was trained to answer to. Both are read from its Hugging Face page when the
+page says; `--base` and `--trigger` say them outright. After that:
+
+| | |
+| --- | --- |
+| `a fox in a forest --lora pixel-art` | runs on the LoRA's own model, with its trigger words in front of the prompt |
+| `--lora pixel-art:0.6` | at 60% of the strength it was added with |
+| `--lora pixel-art grain:0.4` | several at once, if they were trained on the same model |
+| `/settings lora pixel-art` | on every prompt, until `/settings lora off` |
+| the **LoRA** button by the web app's prompt | the same, by clicking: pick one or several, and set each one's strength on its chip under the prompt |
+| the LoRA menu in Discord's `/settings` | the same, in Discord |
+| `--lora none` | not even your usual one, for this prompt |
+
+| | |
+| --- | --- |
+| ![The web app's prompt bar with the LoRA menu open and Pixel Art ticked; below it, one prompt made with three LoRAs: pixel art, claymation and a child's crayon drawing](docs/screenshots/lora-picker.jpg) | ![The lightbox on a pixel-art image: the prompt, the words it was rendered from with the LoRA's trigger words in front, and the LoRA named beside the model](docs/screenshots/lora-lightbox.jpg) |
+| The LoRA button, and one prompt made with three LoRAs | An image says which LoRA made it, and with which words |
+
+Variations and creative upscales of a picture are made with the LoRA it was made with. A LoRA means nothing
+on a model it was not trained on, so `--lora pixel-art --model dev` is refused with the reason; and where your
+usual LoRA cannot go — an edit runs on an edit model — the job runs without it and says so.
+
+**Which ones are worth adding.** These models already follow the name of a medium: typing "anime" or
+"coloring book page" gets most of the way there, and a LoRA for such a look adds little. A LoRA earns its
+place with a look that words do not reach, and by keeping that look the same from prompt to prompt. On
+Z-Image Turbo, with one prompt and one seed, these changed the picture completely: pixel art
+(`tarn59/pixel_art_style_lora_z_image_turbo`), a child's crayon drawing (`ostris/z_image_turbo_childrens_drawings`),
+1980s airbrush (`tarn59/80s_air_brush_style_z_image_turbo`), claymation (`artificialguybr/ClayAnimation-Redmond-ZIMAGE`)
+and anime (`strangerzonehf/Anime-Z`). A pencil-sketch LoRA (`Ttio2/Z-Image-Turbo-pencil-sketch`) did nothing
+until the prompt named the medium, and then drew real hatching where the words alone gave a grey photograph:
+for a LoRA whose page gives no trigger words, `--trigger "pencil sketch"` is the thing to try.
+
+![One prompt and one seed on Z-Image Turbo, with no LoRA and with ten different ones: the crayon drawing, claymation, airbrush and anime LoRAs change the picture completely, the others hardly at all](docs/screenshots/lora-looks.jpg)
+
+*"a lighthouse keeper and his dog on a cliff at sunset", seed 7: no LoRA, then ten. The ones that look like the
+first picture are the ones that need their medium named in the prompt.*
+
+The library is the folder `~/Library/Application Support/Dreambot/loras/`. Any LoRA `.safetensors` dropped
+into it works by its file name; the notes are a `<name>.toml` beside it (`base`, `trigger`, `scale`), which
+you can edit while Dreambot runs. Z-Image, FLUX.1, FLUX.2, FLUX 3, Qwen-Image, Krea 2, Anima, ERNIE-Image,
+MOSS-Image, FIBO 2 and Ideogram 4 take LoRAs; Iris, Lens, Boogu, Ming-Image and the first FIBO do not.
+A LoRA's own license applies along with its model's. Over chat `--lora` takes names only: a file path works
+from this Mac's command line and nowhere else.
 
 ## Prompts and parameters
 
@@ -293,7 +353,7 @@ Midjourney's website, for one Mac: <http://127.0.0.1:7373/>.
 
 | Page | What is there |
 | --- | --- |
-| **Create** | The prompt bar, with drop zones for an image prompt, a style reference and a subject reference; an uploads library; settings (shape, model, stylize, variety, weirdness, raw, HD); the **P** button. Below it, everything that has been made, newest first, with jobs drawing themselves as they run. |
+| **Create** | The prompt bar, with drop zones for an image prompt, a style reference and a subject reference; an uploads library; settings (shape, model, stylize, variety, weirdness, raw, HD); the **P** button; the **LoRA** button, to give every prompt a fine-tuned look. Below it, everything that has been made, newest first, with jobs drawing themselves as they run. |
 | **Lightbox** | Click an image: vary (subtle, strong, remix), upscale (subtle, creative), zoom, pan, make square, edit, rerun, describe; copy the prompt, seed or job id; download; like; file it in a folder or a Lookbook; use it in the next prompt. ← → move through the feed. |
 | **Organize** | Every image, to search and to filter by liked, model, kind of job, Lookbook, folder and day. Select many (shift-click for a range) to like, trash, file or download as a zip. Trash only hides. |
 | **Lookbooks** | Make, fill, rename and delete Lookbooks; choose your defaults; see what Dreambot reads in a book. |
@@ -479,6 +539,7 @@ port = 7373
 | Variations, upscales (SeedVR2 and tiled), `--hd`, edits, references, zoom/pan/square, region edits, describe | real weights, results inspected by eye |
 | The prompt enhancer | real language model (Qwen2.5-VL 7B) and real images, compared with and without |
 | Style references (`--sref`) | real weights (Z-Image Turbo, FLUX.2 klein 4B; Qwen-Image 2.1 for one comparison) and the real vision model, results inspected by eye. Three prompts across the three style versions with one reference: shown the picture whole (`--sv 1`), none of the three took its style and one had the reference's hand and gun in it; with words and a swatch board (`--sv 2`) and with words alone (`--sv 3`), all three took the style and none took its content. **Two reference pictures in all**, both generated images: photographs and pictures with a lot of text in them have not been tried |
+| LoRAs | real weights and the real Hugging Face: eleven published LoRAs for Z-Image Turbo added with `dreambot loras add` (model and trigger words read from each page; one repository with two files, one file name with brackets), then one prompt and one seed without a LoRA and with each. All eleven loaded. Five changed the picture completely with no help; six changed little or nothing until the prompt named their medium, and of those the pencil sketch was the one that then clearly did more than the words alone. Asked for on FLUX.1 dev a LoRA was refused before anything ran; given to FLUX.2 klein 4B as a bare file it was refused by the engine, in plain words. The web app's LoRA button, its strength chips and its menu: driven in a browser on the stand-in backend. **Not run on real weights**: variations and upscales that carry a LoRA, several LoRAs at once, LoRAs on any model but Z-Image Turbo. Discord's LoRA menu: automated tests only |
 | Blending by weight | real weights, two prompts: the same two references at 3:1, 1:1 and 1:3 give a visible progression from one style to the other; a style code with a picture gives a plausible mix. More than two references: automated tests only |
 | What the vision model says about a style | nine real images. It names a medium and five short phrases, drops the labels about half the time (the parser then reads by position), and calls most generated images "digital painting". Asked to fuse two styles into one, it joined their phrases with "and" or copied the worked example, so blending is done by rule |
 | Lookbooks | real weights: a four-picture book gave each image of a grid a different lead and a visibly different look; a one-picture book at `--stylize` 0, 20, 100 and 400 gave no look, a touch, the look, and more of it. With a book whose lead was photograph-like the three strengths looked alike, because the look was already close to the model's own. Larger books, several books at once, the `liked` book: automated tests only |

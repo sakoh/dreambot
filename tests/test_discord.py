@@ -346,6 +346,51 @@ async def test_settings_panel(server: Server):
     assert server.service.resolved_settings(f"discord:{ALICE}").stylize == 100
 
 
+async def test_the_settings_panel_offers_the_lora_library(server: Server):
+    def selects(view) -> dict[str, discord.ui.Select]:
+        return {item.custom_id: item for item in view.children if isinstance(item, discord.ui.Select)}
+
+    alice = f"discord:{ALICE}"
+    assert "set:lora" not in selects((await server.slash("settings")).original.view)  # nothing to offer yet
+
+    folder = server.service.config.lora_dir
+    folder.mkdir(parents=True)
+    for name, base in (("pixel-art", "z-image-turbo"), ("anime", "z-image-turbo"), ("for-dev", "dev")):
+        (folder / f"{name}.safetensors").write_bytes(b"x")
+        (folder / f"{name}.toml").write_text(f'base = "{base}"\ntrigger = "{name} style"\n')
+    menu = selects((await server.slash("settings")).original.view)["set:lora"]
+    assert [(option.value, option.description, option.default) for option in menu.options] == [
+        ("anime", "For z-image-turbo", False),
+        ("for-dev", "For dev", False),
+        ("pixel-art", "For z-image-turbo", False),
+    ]
+    assert menu.min_values == 0 and menu.max_values == 3
+
+    async def choose(*names: str) -> FakeInteraction:
+        picked = FakeInteraction(server.log, data={"custom_id": "set:lora", "values": list(names)})
+        await server.front._on_component(picked)
+        return picked
+
+    chosen = await choose("pixel-art")
+    assert server.service.settings(alice).loras == ["pixel-art"]
+    _content, view = chosen.response.edited
+    assert [option.value for option in selects(view)["set:lora"].options if option.default] == ["pixel-art"]
+
+    # A strength set by hand stays with its LoRA when another is added from the menu.
+    settings = server.service.settings(alice)
+    settings.loras = ["pixel-art:0.6"]
+    server.service.save_settings(alice, settings)
+    await choose("pixel-art", "anime")
+    assert server.service.settings(alice).loras == ["pixel-art:0.6", "anime"]
+
+    # Two that were trained on different models cannot be used together: refused, nothing changed.
+    refused = await choose("pixel-art", "for-dev")
+    assert refused.original.ephemeral and "trained on different models" in refused.original.content
+    assert server.service.settings(alice).loras == ["pixel-art:0.6", "anime"]
+    await choose()
+    assert server.service.settings(alice).loras == []
+
+
 async def test_strangers_are_refused_privately_and_pairing_works(server: Server):
     refused = await server.slash("imagine", as_user=8002, prompt="a fox")
     assert refused.original.ephemeral and "private" in refused.original.content

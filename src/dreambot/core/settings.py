@@ -41,6 +41,8 @@ class UserSettings:
     personalize: bool | None = None
     #: Ids of the Lookbooks a bare ``--p`` stands for.
     looks: list[str] = field(default_factory=list)
+    #: LoRAs every prompt is given, as ``--lora`` would name them (``pixel-art``, ``grain:0.5``).
+    loras: list[str] = field(default_factory=list)
     #: Text appended to every prompt (``/prefer suffix``).
     suffix: str = ""
     #: Named shortcuts for parameter text (``/prefer option set``), used as ``--name``.
@@ -73,6 +75,7 @@ class UserSettings:
             enhance=pick(self.enhance, auto_enhance() if defaults.enhance is None else defaults.enhance),
             personalize=bool(self.personalize),
             looks=tuple(self.looks),
+            loras=tuple(self.loras),
             suffix=self.suffix,
             option_sets=dict(self.option_sets),
         )
@@ -90,6 +93,7 @@ class ResolvedSettings:
     enhance: bool = False
     personalize: bool = False
     looks: tuple[str, ...] = ()
+    loras: tuple[str, ...] = ()
     suffix: str = ""
     option_sets: dict[str, str] = field(default_factory=dict)
 
