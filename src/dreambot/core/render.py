@@ -217,7 +217,7 @@ Attach an image to use it as an image prompt, or steer with it:
   --edit (change it by instruction) · --oref (keep this person/object) · --sref (borrow its style)
 --sref blends images, style codes and saved styles, each with an optional ::weight.
 A LoRA is one fine-tuned look (pixel art, anime): --lora <name>.
---video makes a video: from words, or of an attached image (--loop, --motion, --seconds).
+--video makes a video: from words, or of an attached image (--motion, --loop).
 
 {TEXT_SHORTCUTS}
 
