@@ -145,6 +145,37 @@ def test_doctor_leaves_messages_alone_until_imessage_is_enabled(home: Path, monk
     ]
 
 
+def test_doctor_shows_folders_and_reasons_as_they_are(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # The folders are the person's to name, and a failed check gives its reason in someone else's
+    # words. Square brackets in either were read as the console's markup: with everything kept
+    # in a folder called [lab], every path `dreambot doctor` printed was missing that folder.
+    import importlib.metadata
+
+    lab = tmp_path / "[lab]"
+    (lab / "home").mkdir(parents=True)
+    (lab / "vision").mkdir()
+    (lab / "home" / "config.toml").write_text(f'[assist]\nvision_model = "{lab / "vision"}"\n')
+    monkeypatch.setenv("DREAMBOT_HOME", str(lab / "home"))
+    monkeypatch.setenv("DREAMBOT_OUTPUT_DIR", str(lab / "pictures"))
+    monkeypatch.setenv("HF_HUB_CACHE", str(lab / "hub"))
+    monkeypatch.setattr(launchd, "status", lambda: {"installed": False, "loaded": False})
+
+    def unreadable(name: str) -> str:
+        raise OSError(f"cannot read the metadata of {name} [permission denied]")
+
+    monkeypatch.setattr(importlib.metadata, "version", unreadable)
+    result = runner.invoke(cli.app, ["doctor"])
+    assert "MLX — cannot read the metadata of mlx [permission denied]" in said(result)
+    # The console breaks a long path wherever the line ends; put it back together.
+    unbroken = result.output.replace("\n", "")
+    assert f"Language model — {lab}/vision; prompt enhancer" in unbroken
+    assert f"Hugging Face cache: {lab}/hub" in unbroken
+    assert f"Config: {lab}/home/config.toml" in unbroken
+    assert f"Images are saved to: {lab}/pictures" in unbroken
+
+
 DISCORD_TOKEN = "MTIzNDU2Nzg5MDEyMzQ1Njc4OQ.GabcDE.exampleExampleExampleExample_1234567"
 
 
