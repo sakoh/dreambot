@@ -1097,13 +1097,17 @@ def _setup_telegram(config: Config) -> bool:
         return False
     valid, detail = _check_telegram_token(token)
     if valid is False:
-        console.print(f"   [red]Telegram did not accept that token: {detail}. Nothing was saved.[/red]")
+        console.print(
+            f"   [red]Telegram did not accept that token: {_plain(detail)}. Nothing was saved.[/red]"
+        )
         return False
     secrets.set_token("telegram", token)
     _update_config(config, {"telegram": {"enabled": True}})
     if valid:
-        console.print(f"   [green]That is @{detail}. Token saved to your Keychain; Telegram enabled.[/green]")
-        console.print(f"   Your bot: https://t.me/{detail}")
+        console.print(
+            f"   [green]That is @{_plain(detail)}. Token saved to your Keychain; Telegram enabled.[/green]"
+        )
+        console.print(f"   Your bot: https://t.me/{_plain(detail)}")
     else:
         console.print(
             f"   [yellow]Saved to your Keychain, but Telegram could not be reached to check it ({detail}).[/yellow]"
@@ -1124,14 +1128,16 @@ def _setup_discord(config: Config) -> bool:
     if token:
         valid, detail = _check_discord_token(token)
         if valid is False:
-            console.print(f"   [red]Discord did not accept that token: {detail}. Nothing was saved.[/red]")
+            console.print(
+                f"   [red]Discord did not accept that token: {_plain(detail)}. Nothing was saved.[/red]"
+            )
             return False
         secrets.set_token("discord", token)
         _update_config(config, {"discord": {"enabled": True}})
         changed = True
         if valid:
             console.print(
-                f"   [green]That is {detail}. Token saved to your Keychain; Discord enabled.[/green]"
+                f"   [green]That is {_plain(detail)}. Token saved to your Keychain; Discord enabled.[/green]"
             )
         else:
             console.print(
