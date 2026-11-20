@@ -108,6 +108,30 @@ def test_setup_knows_its_frontends(home: Path):
     assert result.exit_code == 2 and "telegram, discord, imessage, web" in said(result)
 
 
+def test_models_info_prints_a_models_own_words_as_they_are(home: Path, monkeypatch: pytest.MonkeyPatch):
+    # A model's title, summary, licence and other names come from Dreambot's own list, which has
+    # no square brackets in it today. FLUX.2 [klein] is how that model's makers write its name;
+    # written that way in the list, it would have been printed as "FLUX.2 9B".
+    import dataclasses
+
+    from dreambot.engine.registry import REGISTRY
+
+    klein = dataclasses.replace(
+        REGISTRY.get("flux2-klein-9b"),
+        title="FLUX.2 [klein] 9B",
+        summary="The larger [klein].",
+        license="flux-[klein]-license",
+        repo="black-forest-labs/FLUX.2-[klein]-9B",
+        aliases=("flux2[klein]", "klein9"),
+    )
+    monkeypatch.setattr(type(REGISTRY), "get", lambda self, name: klein)
+    shown = said(runner.invoke(cli.app, ["models", "info", "flux2-klein-9b"]))
+    assert "FLUX.2 [klein] 9B (flux2-klein-9b) The larger [klein]." in shown
+    assert "License: flux-[klein]-license — check before commercial use" in shown
+    assert "Upstream: https://huggingface.co/black-forest-labs/FLUX.2-[klein]-9B" in shown
+    assert "Also known as: flux2[klein], klein9" in shown
+
+
 def test_setup_skips_everything_on_enter_and_never_opens_messages(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ):

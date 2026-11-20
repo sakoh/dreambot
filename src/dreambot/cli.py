@@ -406,18 +406,22 @@ def models_info(model: Annotated[str, typer.Argument(help="Model name.")]) -> No
     except UnknownModel as exc:
         err.print(f"[red]{_plain(exc)}[/red]")
         raise typer.Exit(2) from exc
-    console.print(f"[bold]{spec.title}[/bold] ({spec.id})")
-    console.print(spec.summary)
+    console.print(f"[bold]{_plain(spec.title)}[/bold] ({spec.id})")
+    console.print(_plain(spec.summary))
     console.print(f"Operations: {', '.join(op.value for op in spec.ops) or 'none wired up yet'}")
     console.print(
         f"Defaults: {spec.steps} steps"
         + (f", guidance {spec.guidance:g}" if spec.guidance is not None else "")
     )
     console.print(f"Negative prompts: {'yes' if spec.cfg else 'no (best-effort)'}")
-    console.print(f"License: {spec.license}" + ("" if spec.permissive else " — check before commercial use"))
-    console.print(f"Upstream: https://huggingface.co/{spec.repo}" + (" (gated)" if spec.gated else ""))
+    console.print(
+        f"License: {_plain(spec.license)}" + ("" if spec.permissive else " — check before commercial use")
+    )
+    console.print(
+        f"Upstream: https://huggingface.co/{_plain(spec.repo)}" + (" (gated)" if spec.gated else "")
+    )
     if spec.aliases:
-        console.print(f"Also known as: {', '.join(spec.aliases)}")
+        console.print(f"Also known as: {_plain(', '.join(spec.aliases))}")
     found = weights.installed(spec)
     if found:
         for item in found:
