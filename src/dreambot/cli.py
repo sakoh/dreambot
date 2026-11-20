@@ -739,8 +739,10 @@ def doctor() -> None:
         else:
             ok = False
             console.print(f"[red]✗[/red] iMessage: {state}, cannot read the Messages database yet")
-            console.print(f"  [dim]{problem}[/dim]")
-        console.print(f"  [dim]For iMessage, grant Full Disk Access to: {launchd.interpreter()}[/dim]")
+            console.print(f"  [dim]{_plain(problem)}[/dim]")
+        console.print(
+            f"  [dim]For iMessage, grant Full Disk Access to: {_plain(launchd.interpreter())}[/dim]"
+        )
         console.print("  [dim](and to your terminal app when you run `dreambot run` by hand)[/dim]")
     if config.web.enabled:
         console.print(
@@ -1176,7 +1178,7 @@ def _setup_imessage(config: Config) -> bool:
             "   The background service reads the Messages database. Give Full Disk Access to its Python"
         )
         console.print("   (System Settings → Privacy & Security → Full Disk Access → +, then ⌘⇧G and paste):")
-        console.print(f"   [bold]{launchd.interpreter()}[/bold]")
+        console.print(f"   [bold]{_plain(launchd.interpreter())}[/bold]")
         console.print(
             "   Its log says whether that worked: `dreambot service status` shows where the log is."
         )
@@ -1187,9 +1189,9 @@ def _setup_imessage(config: Config) -> bool:
             reader.close()
             console.print("   [green]The Messages database is readable from this terminal.[/green]")
         except ChatDBError as exc:
-            console.print(f"   [yellow]{exc}[/yellow]")
+            console.print(f"   [yellow]{_plain(exc)}[/yellow]")
         console.print(
-            f"   For the background service, also give Full Disk Access to: {launchd.interpreter()}"
+            f"   For the background service, also give Full Disk Access to: {_plain(launchd.interpreter())}"
         )
     console.print("   When Dreambot starts, macOS asks whether it may control Messages — choose Allow.")
     if mode == "self":
