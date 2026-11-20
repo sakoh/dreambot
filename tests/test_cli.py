@@ -318,3 +318,29 @@ def test_setup_web_switches_the_web_app_on_and_off(home: Path):
     result = runner.invoke(cli.app, ["setup", "web"], input="off\n")
     assert "Switched off" in said(result) and "enabled = false" in (home / "config.toml").read_text()
     assert "Web app: off" in said(runner.invoke(cli.app, ["doctor"]))
+
+
+def test_a_message_is_printed_as_it_is_square_brackets_and_all(home: Path, monkeypatch: pytest.MonkeyPatch):
+    # Square brackets are the console's own markup. Printed inside a coloured line as it was, a
+    # hint that names a section of the config file lost the section, a name lost its brackets,
+    # and a name that held a closing tag stopped the command with a traceback.
+    import socket
+
+    monkeypatch.setenv("DREAMBOT_BACKEND", "fake")
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        port = taken.getsockname()[1]
+        result = runner.invoke(cli.app, ["web", "--port", str(port), "--no-open"])
+    assert result.exit_code == 1, result.output
+    assert f"port {port} is in use" in said(result)
+    assert "choose another with `[web] port` in the config file" in said(result)
+
+    result = runner.invoke(cli.app, ["loras", "remove", "[web]"])
+    assert result.exit_code == 2 and "`[web]` can't be a LoRA's name" in said(result)
+    result = runner.invoke(cli.app, ["loras", "remove", "x[/red]"])
+    assert result.exit_code == 2 and "`x[/red]` can't be a LoRA's name" in said(result)
+    result = runner.invoke(cli.app, ["setup", "[bold]telegram"])
+    assert result.exit_code == 2 and "not `[bold]telegram`" in said(result)
+    result = runner.invoke(cli.app, ["models", "pull", "[web]"])
+    assert result.exit_code == 2 and "Unknown model '[web]'" in said(result)

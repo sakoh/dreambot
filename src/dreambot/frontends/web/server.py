@@ -1242,7 +1242,8 @@ class WebFrontend:
     def __init__(self, service: Dreambot, *, host: str | None = None, port: int | None = None):
         self.service = service
         self.host = host or service.config.web.host
-        self.port = port or service.config.web.port
+        # 0 asks for any free port, so it is not the same as no port given.
+        self.port = service.config.web.port if port is None else port
         self.web: WebApp | None = None
         self._server: _Server | None = None
         self._task: asyncio.Task[None] | None = None

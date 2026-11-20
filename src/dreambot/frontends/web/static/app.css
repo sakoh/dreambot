@@ -1158,6 +1158,10 @@ main {
   display: grid;
   gap: 12px;
   align-content: start;
+  /* Every row as tall as what is in it. Left to itself, a row whose content is clipped (the
+     prompt, which is cut off after twelve lines) is given no height once the panel holds more
+     than fits in the window, and the prompt is gone. */
+  grid-auto-rows: max-content;
 }
 
 .lightbox-scroll .job-prompt {
