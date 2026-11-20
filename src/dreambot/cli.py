@@ -180,11 +180,11 @@ async def _imagine(prompt: str, attachments: list[str], show: bool, verbose: boo
 
     for job in jobs:
         if job.status is JobStatus.DONE:
-            console.print(job_caption(job))
+            console.print(_plain(job_caption(job)))
             for image in job.images:
-                console.print(f"  {image.index}. {image.path}")
+                console.print(f"  {image.index}. {_plain(image.path)}")
             if job.grid:
-                console.print(f"  grid: {job.grid}")
+                console.print(f"  grid: {_plain(job.grid)}")
             if show:
                 subprocess.run(["/usr/bin/open", job.grid or job.images[0].path], check=False)
         else:
@@ -220,7 +220,7 @@ async def _chat(verbose: bool, open_results: bool = True) -> None:
         if reply.text:
             console.print(reply.text, markup=False, highlight=False)
         for image in reply.images:
-            console.print(f"  [dim]{image}[/dim]")
+            console.print(f"  [dim]{_plain(image)}[/dim]")
         if reply.images and open_results:
             subprocess.run(["/usr/bin/open", "-g", reply.images[0]], check=False)
 
@@ -419,7 +419,9 @@ def models_info(model: Annotated[str, typer.Argument(help="Model name.")]) -> No
     found = weights.installed(spec)
     if found:
         for item in found:
-            console.print(f"Installed: {item.repo} — {item.label}, {item.size_gb:.1f} GB\n  {item.path}")
+            console.print(
+                f"Installed: {_plain(item.repo)} — {item.label}, {item.size_gb:.1f} GB\n  {_plain(item.path)}"
+            )
     else:
         repo, level = weights.recommended_repo(spec)
         console.print(
