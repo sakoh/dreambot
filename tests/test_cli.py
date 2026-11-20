@@ -307,6 +307,41 @@ def test_a_restart_waits_for_running_jobs_unless_told_not_to(home: Path, monkeyp
     store.close()
 
 
+def test_who_may_use_it_and_how_the_service_is_are_printed_as_they_are(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # An id is printed back as it was typed, and the service's state is launchd's word for it.
+    # Square brackets in either were read as the console's markup. An id that was typed with
+    # `[/b]` in it was saved, and from then on `dreambot access list` stopped with a traceback
+    # instead of showing the list it had to be removed from.
+    lab = tmp_path / "[lab]"
+    monkeypatch.setenv("HOME", str(lab))  # the log is kept in the home folder's Library/Logs
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text('[access]\nowners = ["imessage:[me]@example.com"]\n')
+
+    result = runner.invoke(cli.app, ["access", "allow", "imessage:[friend]@example.com"])
+    assert result.exit_code == 0, result.output
+    assert "imessage:[friend]@example.com may now use this Dreambot." in said(result)
+    result = runner.invoke(cli.app, ["access", "allow", "discord:42[/b]"])
+    assert result.exit_code == 0 and "discord:42[/b] may now use this Dreambot." in said(result)
+    listed = runner.invoke(cli.app, ["access", "list"])
+    assert listed.exit_code == 0, listed.output
+    assert "Owners imessage:[me]@example.com Allowed discord:42[/b] imessage:[friend]@example.com" in said(
+        listed
+    )
+    assert runner.invoke(cli.app, ["access", "revoke", "discord:42[/b]"]).exit_code == 0
+
+    monkeypatch.setattr(launchd, "plist_path", lambda: home / "config.toml")  # a file that is there
+    monkeypatch.setattr(
+        launchd,
+        "_launchctl",
+        lambda *arguments: subprocess.CompletedProcess(arguments, 0, "state = [waiting]\npid = [none]\n", ""),
+    )
+    result = runner.invoke(cli.app, ["service", "status"])
+    assert "Running (state: [waiting], pid: [none])" in said(result)
+    assert f"Logs: {lab}/Library/Logs/Dreambot/dreambot.log" in result.output.replace("\n", "")
+
+
 def test_setup_web_switches_the_web_app_on_and_off(home: Path):
     result = runner.invoke(cli.app, ["setup", "web"], input="\n")
     assert result.exit_code == 0 and not (home / "config.toml").exists(), "Enter changes nothing"

@@ -1305,10 +1305,10 @@ def access_list() -> None:
         access = Access(config, store)
         console.print("[bold]Owners[/bold]")
         for user in sorted(access.owners()) or ["(none yet — run `dreambot pair`)"]:
-            console.print(f"  {user}")
+            console.print(f"  {_plain(user)}")
         console.print("[bold]Allowed[/bold]")
         for user in sorted(access.members()) or ["(nobody else)"]:
-            console.print(f"  {user}")
+            console.print(f"  {_plain(user)}")
         if config.access.open:
             console.print("[yellow]access.open is on: anyone who can reach the bot may use it.[/yellow]")
     finally:
@@ -1329,7 +1329,7 @@ def access_allow(
         Access(config, store).allow(user)
     finally:
         store.close()
-    console.print(f"{normalize_user(user)} may now use this Dreambot.")
+    console.print(f"{_plain(normalize_user(user))} may now use this Dreambot.")
 
 
 @access_app.command("revoke")
@@ -1458,8 +1458,10 @@ def service_status() -> None:
     elif not info["loaded"]:
         console.print("Installed but not loaded. Run: dreambot service install")
     else:
-        console.print(f"Running (state: {info['state'] or 'unknown'}, pid: {info['pid'] or '—'})")
-    console.print(f"Logs: {config.log_dir / 'dreambot.log'}")
+        console.print(
+            f"Running (state: {_plain(info['state'] or 'unknown')}, pid: {_plain(info['pid'] or '—')})"
+        )
+    console.print(f"Logs: {_plain(config.log_dir / 'dreambot.log')}")
 
 
 def main() -> None:
