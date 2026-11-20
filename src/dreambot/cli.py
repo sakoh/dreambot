@@ -14,6 +14,7 @@ from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
@@ -41,6 +42,17 @@ app.add_typer(access_app, name="access")
 console = Console()
 err = Console(stderr=True)
 
+
+def _plain(text: object) -> str:
+    """Words that came from somewhere else (a message, a name the person typed), to be printed as they are.
+
+    Rich reads square brackets as its own markup. Put into a coloured line as it is, a hint that
+    names a section of the config file (``[web] port``) loses the section, and a name that
+    holds something like ``[/red]`` stops the command with a traceback.
+    """
+    return escape(str(text))
+
+
 LOCAL_USER = "console:me"
 LOCAL_CHANNEL = "console:main"
 
@@ -49,7 +61,7 @@ def _config() -> Config:
     try:
         return load_config()
     except ConfigError as exc:
-        err.print(f"[red]Config error:[/red] {exc}")
+        err.print(f"[red]Config error:[/red] {_plain(exc)}")
         raise typer.Exit(2) from exc
 
 
@@ -157,7 +169,7 @@ async def _imagine(prompt: str, attachments: list[str], show: bool, verbose: boo
                     allow_paths=True,
                 )
             except DreambotError as exc:
-                err.print(f"[red]{exc}[/red]")
+                err.print(f"[red]{_plain(exc)}[/red]")
                 return 2
             try:
                 for job in jobs:
@@ -177,7 +189,7 @@ async def _imagine(prompt: str, attachments: list[str], show: bool, verbose: boo
                 subprocess.run(["/usr/bin/open", job.grid or job.images[0].path], check=False)
         else:
             failed = True
-            err.print(f"[red]#{job.id} {job.status.value}:[/red] {job.error or ''}")
+            err.print(f"[red]#{job.id} {job.status.value}:[/red] {_plain(job.error or '')}")
     return 1 if failed else 0
 
 
@@ -368,7 +380,7 @@ def models_pull(
     try:
         spec = REGISTRY.get(model)
     except UnknownModel as exc:
-        err.print(f"[red]{exc}[/red]")
+        err.print(f"[red]{_plain(exc)}[/red]")
         raise typer.Exit(2) from exc
     repo, level = weights.recommended_repo(spec, [quant] if quant else None)
     console.print(f"[bold]{spec.title}[/bold] — {spec.summary}")
@@ -390,7 +402,7 @@ def models_info(model: Annotated[str, typer.Argument(help="Model name.")]) -> No
     try:
         spec = REGISTRY.get(model)
     except UnknownModel as exc:
-        err.print(f"[red]{exc}[/red]")
+        err.print(f"[red]{_plain(exc)}[/red]")
         raise typer.Exit(2) from exc
     console.print(f"[bold]{spec.title}[/bold] ({spec.id})")
     console.print(spec.summary)
@@ -572,10 +584,10 @@ def loras_info(name: Annotated[str, typer.Argument(help="The LoRA's name.")]) ->
     try:
         entry = Library(config.lora_dir).find(name)
     except LoraError as exc:
-        err.print(f"[red]{name} can't be used: {exc}.[/red]")
+        err.print(f"[red]{_plain(name)} can't be used: {_plain(exc)}.[/red]")
         raise typer.Exit(2) from exc
     if entry is None:
-        err.print(f"[red]There is no LoRA called {name}.[/red] See `dreambot loras`.")
+        err.print(f"[red]There is no LoRA called {_plain(name)}.[/red] See `dreambot loras`.")
         raise typer.Exit(2)
     console.print(f"[bold]{entry.title or entry.name}[/bold] ({entry.name})")
     base = REGISTRY.find(entry.base) if entry.base else None
@@ -605,11 +617,11 @@ def loras_remove(
     try:
         name = loras.check_name(name)
     except loras.LoraError as exc:
-        err.print(f"[red]{exc}[/red]")
+        err.print(f"[red]{_plain(exc)}[/red]")
         raise typer.Exit(2) from exc
     there = [path for path in (folder / f"{name}.safetensors", folder / f"{name}.toml") if path.is_file()]
     if not there:
-        err.print(f"[red]There is no LoRA called {name}.[/red]")
+        err.print(f"[red]There is no LoRA called {_plain(name)}.[/red]")
         raise typer.Exit(2)
     if not yes and not typer.confirm(f"Remove the LoRA {name} ({', '.join(path.name for path in there)})?"):
         raise typer.Exit(1)
@@ -939,7 +951,7 @@ async def _web(config: Config, port: int | None, show: bool, verbose: bool) -> i
         try:
             await site.start()
         except RuntimeError as exc:
-            err.print(f"[red]The web app could not start: {exc}[/red]")
+            err.print(f"[red]The web app could not start: {_plain(exc)}[/red]")
             return 1
         console.print(f"Dreambot's web app is at [bold]{site.url}[/bold]  (Ctrl-C to stop)")
         if show:
@@ -1236,7 +1248,7 @@ def setup(
     config = _config()
     chosen = frontend.lower() if frontend else None
     if chosen is not None and chosen not in _SETUP_STEPS:
-        err.print(f"[red]I can set up {', '.join(_SETUP_STEPS)} — not `{frontend}`.[/red]")
+        err.print(f"[red]I can set up {', '.join(_SETUP_STEPS)} — not `{_plain(frontend)}`.[/red]")
         raise typer.Exit(2)
     from dreambot import launchd
 
@@ -1398,7 +1410,7 @@ def service_install(now: NowOption = False) -> None:
     try:
         path, runtime = launchd.install(config.log_dir, config.home)
     except RuntimeError as exc:
-        err.print(f"[red]Could not start the service:[/red] {exc}")
+        err.print(f"[red]Could not start the service:[/red] {_plain(exc)}")
         raise typer.Exit(1) from exc
     console.print(f"Installed and started: {path}")
     if runtime is not None:
