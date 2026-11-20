@@ -330,14 +330,14 @@ def models_list(
         installed = ", ".join(f"{w.label} {w.size_gb:.0f}GB" for w in found) if found else "[dim]—[/dim]"
         if best is not None and len(found) > 1:
             installed += f" [dim](uses {best.label})[/dim]"
-        license_text = spec.license if spec.permissive else f"[yellow]{spec.license}[/yellow]"
+        license_text = spec.license if spec.permissive else f"[yellow]{_plain(spec.license)}[/yellow]"
         mark = " [green]✓[/green]" if spec.verified else ""
         table.add_row(
             f"[bold]{spec.id}[/bold]{mark}",
             installed,
             ", ".join(op.value for op in spec.ops) or "[dim]specialty[/dim]",
             license_text,
-            spec.summary,
+            _plain(spec.summary),
         )
     if shown == 0:
         console.print(
@@ -374,7 +374,9 @@ def models_pull(
     env.pop("HF_HUB_OFFLINE", None)
     if model.lower() in ("describe", "vision"):
         # Not an image model: the vision-language model behind /describe and /shorten.
-        console.print(f"[bold]Vision model[/bold] for /describe and /shorten: {weights.DEFAULT_VISION_MODEL}")
+        console.print(
+            f"[bold]Vision model[/bold] for /describe and /shorten: {_plain(weights.DEFAULT_VISION_MODEL)}"
+        )
         args = [sys.executable, "-m", "dreambot.engine.prepare", "describe"]
         raise typer.Exit(subprocess.run(args, env=env, check=False).returncode)
     try:
@@ -383,11 +385,11 @@ def models_pull(
         err.print(f"[red]{_plain(exc)}[/red]")
         raise typer.Exit(2) from exc
     repo, level = weights.recommended_repo(spec, [quant] if quant else None)
-    console.print(f"[bold]{spec.title}[/bold] — {spec.summary}")
-    console.print(f"Source: https://huggingface.co/{repo}" + (f" ({level})" if level else ""))
+    console.print(f"[bold]{_plain(spec.title)}[/bold] — {_plain(spec.summary)}")
+    console.print(f"Source: https://huggingface.co/{_plain(repo)}" + (f" ({_plain(level)})" if level else ""))
     if not spec.permissive:
         console.print(
-            f"[yellow]License: {spec.license}.[/yellow] Review it at https://huggingface.co/{spec.repo}"
+            f"[yellow]License: {_plain(spec.license)}.[/yellow] Review it at https://huggingface.co/{_plain(spec.repo)}"
         )
     args = [sys.executable, "-m", "dreambot.engine.prepare", spec.id, *([quant] if quant else [])]
     raise typer.Exit(subprocess.run(args, env=env, check=False).returncode)

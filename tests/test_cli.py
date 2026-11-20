@@ -488,6 +488,59 @@ def test_setup_web_switches_the_web_app_on_and_off(home: Path):
     assert "Web app: off" in said(runner.invoke(cli.app, ["doctor"]))
 
 
+def test_models_pull_and_list_print_names_as_they_are(home: Path, monkeypatch: pytest.MonkeyPatch):
+    # `--quant` is printed back in the line that says where the model comes from, before the
+    # downloader has looked at it. Square brackets in it were read as the console's markup:
+    # `[q8]` was left out, and `[/q8]` ended the command with a traceback instead of the
+    # downloader's "Unknown quantization".
+    import dataclasses
+
+    from dreambot.engine import prepare
+    from dreambot.engine.registry import REGISTRY
+
+    def run(args, env=None, check=False):
+        """The downloader, in this process. It refuses the quantization before it fetches anything."""
+        return type("Done", (), {"returncode": prepare.main(args[3:])})()
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    result = runner.invoke(cli.app, ["models", "pull", "z-image-turbo", "--quant", "[q8]"])
+    assert result.exit_code == 2 and "Unknown quantization '[q8]'" in said(result), result.output
+    assert "mflux-community/z-image-turbo-mflux-[q8] ([q8])" in result.output.replace("\n", "")
+    result = runner.invoke(cli.app, ["models", "pull", "z-image-turbo", "--quant", "[/q8]"])
+    assert result.exit_code == 2 and "Unknown quantization '[/q8]'" in said(result), result.output
+    assert "mflux-community/z-image-turbo-mflux-[/q8] ([/q8])" in result.output.replace("\n", "")
+
+    # A model's title, summary and licence come from Dreambot's own list, which has no square
+    # brackets in it today. FLUX.2 [klein] is how that model's makers write its name.
+    klein = dataclasses.replace(
+        REGISTRY.get("flux2-klein-9b"),
+        title="FLUX.2 [klein] 9B",
+        summary="The larger [klein].",
+        license="FLUX [dev] Non-Commercial License",
+        repo="black-forest-labs/FLUX.2-[klein]-9B",
+    )
+    monkeypatch.setattr(type(REGISTRY), "get", lambda self, name: klein)
+    monkeypatch.setattr(type(REGISTRY), "__iter__", lambda self: iter([klein]))
+    result = runner.invoke(cli.app, ["models", "pull", "flux2-klein-9b", "--quant", "q0"])
+    assert "FLUX.2 [klein] 9B — The larger [klein]." in said(result)
+    assert "License: FLUX [dev] Non-Commercial License. Review it at" in said(result)
+    assert "huggingface.co/black-forest-labs/FLUX.2-[klein]-9B" in result.output.replace("\n", "")
+    # (The table folds its cells; the bracketed words are short enough to stay whole.)
+    listed = said(runner.invoke(cli.app, ["models", "list", "--all"]))
+    assert "[dev]" in listed, "the licence"
+    assert "[klein]" in listed, "the summary"
+
+    # The same goes for the vision model `dreambot models pull describe` fetches.
+    from dreambot.engine import weights
+
+    monkeypatch.setattr(weights, "DEFAULT_VISION_MODEL", "someone/vision-[mlx]")
+    monkeypatch.setattr(
+        cli.subprocess, "run", lambda args, env=None, check=False: type("Done", (), {"returncode": 0})()
+    )
+    result = runner.invoke(cli.app, ["models", "pull", "describe"])
+    assert "for /describe and /shorten: someone/vision-[mlx]" in said(result)
+
+
 def test_a_message_is_printed_as_it_is_square_brackets_and_all(home: Path, monkeypatch: pytest.MonkeyPatch):
     # Square brackets are the console's own markup. Printed inside a coloured line as it was, a
     # hint that names a section of the config file lost the section, a name lost its brackets,
