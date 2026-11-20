@@ -207,6 +207,46 @@ def test_service_restart_needs_a_running_service(home: Path, monkeypatch: pytest
     assert not [call for call in cli._launchctl_for_test if call[0] == "kickstart"]
 
 
+def test_the_background_services_files_are_named_as_they_are(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # Where the service is installed, what it runs and where it writes its log are paths on this
+    # Mac. A folder in them with square brackets in its name, [lab] say, was read as the
+    # console's markup and left out, so the path that was printed led nowhere.
+    from dreambot.frontends.imessage import chatdb
+
+    lab = tmp_path / "[lab]"
+    monkeypatch.setenv("HOME", str(lab))  # the log is kept in the home folder's Library/Logs
+    monkeypatch.setenv("DREAMBOT_HOME", str(lab / "dreambot"))
+    monkeypatch.setattr(launchd, "interpreter", lambda: f"{lab}/python/bin/python3.12")
+    monkeypatch.setattr(launchd, "code_is_guarded", lambda: "Documents")
+    agent = lab / "Library" / "LaunchAgents" / "agent.plist"
+    monkeypatch.setattr(launchd, "install", lambda log_dir, home: (agent, home / "runtime"))
+
+    result = runner.invoke(cli.app, ["service", "install"])
+    assert result.exit_code == 0, result.output
+    # The console breaks a long path wherever the line ends; put it back together.
+    unbroken = result.output.replace("\n", "")
+    assert f"Installed and started: {agent}" in unbroken
+    assert f"It runs the copy in: {lab}/dreambot/runtime" in unbroken
+    assert f"Logs: {lab}/Library/Logs/Dreambot/dreambot.log" in unbroken
+    assert f"grant Full Disk Access to: {lab}/python/bin/python3.12" in unbroken
+
+    # `dreambot doctor` points at the same log when only the service may read Messages.
+    def refused(self) -> None:
+        raise chatdb.ChatDBError("macOS is blocking access to your Messages database.")
+
+    monkeypatch.setattr(chatdb.ChatDB, "open", refused)
+    monkeypatch.setattr(
+        launchd, "_launchctl", lambda *arguments: subprocess.CompletedProcess(arguments, 0, "", "")
+    )
+    (lab / "dreambot").mkdir(parents=True)
+    (lab / "dreambot" / "config.toml").write_text("[imessage]\nenabled = true\n")
+    result = runner.invoke(cli.app, ["doctor"])
+    assert "the background service may be allowed to" in said(result)
+    assert f"Its log says: {lab}/Library/Logs/Dreambot/dreambot.log" in result.output.replace("\n", "")
+
+
 def test_setup_imessage_points_at_the_service_when_one_is_running(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ):
