@@ -115,6 +115,7 @@ async def test_the_real_server_streams_events_and_refuses_a_taken_port(bot):  # 
     await front.start()
     try:
         assert front.port != 0 and front.url == f"http://127.0.0.1:{front.port}/"
+        assert front.port != service.config.web.port, "0 asks for any free port, not for the configured one"
         async with httpx.AsyncClient(base_url=front.url.rstrip("/")) as client:
             assert (await client.get("/api/state")).status_code == 401
             assert (await client.get("/")).status_code == 200
