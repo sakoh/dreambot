@@ -592,16 +592,18 @@ def loras_info(name: Annotated[str, typer.Argument(help="The LoRA's name.")]) ->
     console.print(f"[bold]{entry.title or entry.name}[/bold] ({entry.name})")
     base = REGISTRY.find(entry.base) if entry.base else None
     console.print(
-        f"Trained on: {f'{base.title} ({base.id})' if base else 'not known — it is tried on whichever model a prompt uses'}"
+        f"Trained on: {f'{_plain(base.title)} ({base.id})' if base else 'not known — it is tried on whichever model a prompt uses'}"
     )
-    console.print(f"Trigger words: {entry.trigger or 'none'}")
+    console.print(f"Trigger words: {_plain(entry.trigger or 'none')}")
     console.print(f"Scale: {entry.scale:g}")
-    console.print(f"File: {entry.path}  [dim]({Path(entry.path).stat().st_size / 1000**2:.0f} MB)[/dim]")
-    if entry.source:
-        console.print(f"Source: {entry.source}")
     console.print(
-        f"License: {entry.license or 'not stated'}"
-        + (f"; {base.title} itself is {base.license}" if base else "")
+        f"File: {_plain(entry.path)}  [dim]({Path(entry.path).stat().st_size / 1000**2:.0f} MB)[/dim]"
+    )
+    if entry.source:
+        console.print(f"Source: {_plain(entry.source)}")
+    console.print(
+        f"License: {_plain(entry.license or 'not stated')}"
+        + (f"; {_plain(base.title)} itself is {_plain(base.license)}" if base else "")
     )
 
 

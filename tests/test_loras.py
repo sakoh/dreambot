@@ -866,6 +866,41 @@ def test_adding_from_the_command_line_runs_the_downloader_and_reports(home: Path
     assert again.exit_code == 2 and "already a LoRA called `pixel-art`" in said(again)
 
 
+def test_everything_about_one_lora_is_shown_as_it_is(tmp_path: Path, monkeypatch):
+    # `dreambot loras info` prints what a LoRA's page says about it and where its file is. Square
+    # brackets in any of that were read as the console's markup and left out, so that a LoRA
+    # answering to `[trigger], pixel art` was said to answer to `, pixel art`.
+    import dataclasses
+
+    home = tmp_path / "[lab]" / "home"
+    monkeypatch.setenv("DREAMBOT_HOME", str(home))
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    cfg = Config.model_validate({"home": str(home)})
+    add(
+        cfg,
+        trigger="[trigger], pixel art",
+        source="/Users/me/[loras]/pixel.safetensors",
+        license="other [see its page]",
+    )
+    shown = runner.invoke(cli.app, ["loras", "info", "pixel"])
+    assert shown.exit_code == 0, shown.output
+    assert "Trigger words: [trigger], pixel art" in said(shown)
+    assert "Source: /Users/me/[loras]/pixel.safetensors" in said(shown)
+    assert "License: other [see its page]; Z-Image Turbo itself is apache-2.0" in said(shown)
+    # (The console breaks a long path wherever the line ends; put it back together.)
+    assert f"File: {cfg.lora_dir}/pixel.safetensors" in shown.output.replace("\n", "")
+
+    # The model it was trained on is named from Dreambot's own list, which has no square brackets
+    # in it today. FLUX.2 [klein] is how that model's makers write its name.
+    klein = dataclasses.replace(
+        REGISTRY.get("flux2-klein-9b"), title="FLUX.2 [klein] 9B", license="FLUX [dev] Non-Commercial License"
+    )
+    monkeypatch.setattr(type(REGISTRY), "find", lambda self, name: klein)
+    shown = said(runner.invoke(cli.app, ["loras", "info", "pixel"]))
+    assert "Trained on: FLUX.2 [klein] 9B (flux2-klein-9b)" in shown
+    assert "; FLUX.2 [klein] 9B itself is FLUX [dev] Non-Commercial License" in shown
+
+
 def test_a_lora_that_does_not_fit_is_explained_in_words():
     spec = REGISTRY.get("z-image-turbo")
     fits_nothing = ValueError(
