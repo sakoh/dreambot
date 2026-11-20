@@ -418,9 +418,11 @@ const writeLoras = (chosen) => chosen.map((lora) => (lora.scale === 1 ? lora.nam
 
 /** The prompt bar's LoRA button: pick the fine-tuned looks that every prompt is made with. */
 function Loras() {
-  const { app } = useStore();
+  const { app, draft } = useStore();
   const [help, setHelp] = useState(false);
   if (!app) return null;
+  // A video has no LoRA of its own: the picture it starts on is drawn with the chosen ones.
+  const filming = draft.video.on;
   const chosen = app.settings.loras.map(readLora);
   const names = new Set(chosen.map((lora) => lora.name));
   const flip = (entry) => {
@@ -431,8 +433,10 @@ function Loras() {
     return saveSettings({ loras: writeLoras([...together, { name: entry.name, scale: 1 }]) });
   };
   const label = chosen.length
-    ? `LoRA: ${chosen.map((lora) => lora.name).join(", ")} — on every prompt until you change it`
-    : "LoRA: give every prompt one fine-tuned look (pixel art, anime, …)";
+    ? `LoRA: ${chosen.map((lora) => lora.name).join(", ")} — ${filming ? "the picture each video starts on is drawn with it" : "on every prompt until you change it"}`
+    : filming
+      ? "LoRA: draw the picture each video starts on in one fine-tuned look (pixel art, anime, …)"
+      : "LoRA: give every prompt one fine-tuned look (pixel art, anime, …)";
   return html`<${Menu}
       icon="down"
       text="LoRA"
@@ -466,10 +470,11 @@ function Loras() {
 
 /** A chosen LoRA under the prompt: what it is, how strongly it is applied, and a way to drop it. */
 function LoraChip({ lora, chosen }) {
-  const { app } = useStore();
+  const { app, draft } = useStore();
   const entry = app.loras.find((other) => other.name === lora.name) || { title: lora.name, base: "", trigger: "" };
   const save = (next) => saveSettings({ loras: writeLoras(next) });
   const about = [
+    draft.video.on ? "The picture each video starts on is drawn with it." : "",
     entry.base ? `Runs on ${entry.base}, the model it was trained on.` : "Goes on whichever model the prompt runs on.",
     entry.trigger ? `Every prompt starts with “${entry.trigger}”` : "",
   ];
@@ -685,13 +690,16 @@ export function PromptBar() {
   };
   const loras = app ? app.settings.loras.map(readLora) : [];
   const shown = draft.refs;
-  // What is added to the prompt without being typed. A video takes the shape of the picture it
-  // starts on, and the picture-making parameters do nothing for one, so they are left out.
+  // A video that is given a frame to start on, or a video to continue, takes its shape and its
+  // look from that. One made from words starts on a picture drawn from them (unless the words
+  // alone are filmed), and what shapes a picture shapes that one: LoRAs, Lookbooks, parameters.
   const framed = Boolean(draft.extend) || shown.some((ref) => ref.role === "image" || ref.role === "end");
+  const drawing = !filming || (!framed && videoFrom(draft) === "picture");
+  // What is added to the prompt without being typed.
   const sticky = [
     draft.params.ar && !(filming && framed) && `--ar ${draft.params.ar}`,
-    !filming && Number(draft.params.chaos) > 0 && `--chaos ${draft.params.chaos}`,
-    !filming && Number(draft.params.weird) > 0 && `--weird ${draft.params.weird}`,
+    drawing && Number(draft.params.chaos) > 0 && `--chaos ${draft.params.chaos}`,
+    drawing && Number(draft.params.weird) > 0 && `--weird ${draft.params.weird}`,
   ].filter(Boolean);
 
   return html`<div
@@ -729,19 +737,19 @@ export function PromptBar() {
       ></textarea>
       ${draft.text && html`<${IconButton} icon="x" label="Clear the prompt" onClick=${() => setDraft({ text: "" })} />`}
       <${VideoButton} />
-      ${!filming && html`<${Personalize} />`}
-      ${!filming && html`<${Loras} />`}
+      ${drawing && html`<${Personalize} />`}
+      ${drawing && html`<${Loras} />`}
       <${IconButton} icon="sliders" label="Settings" active=${panel} onClick=${() => setPanel(!panel)} />
       <button type="button" class="button is-primary send" disabled=${busy} onClick=${() => submit(false)} title="Enter sends; ⌘Enter sends and keeps the prompt">
         ${!filming ? "Imagine" : draft.extend ? "Extend" : "Make video"}
       </button>
     </div>
     ${filming && html`<${VideoOptions} />`}
-    ${(shown.length > 0 || sticky.length > 0 || draft.extend || (loras.length > 0 && !filming)) &&
+    ${(shown.length > 0 || sticky.length > 0 || draft.extend || (loras.length > 0 && drawing)) &&
     html`<div class="ref-row">
       ${draft.extend && html`<${ExtendChip} extend=${draft.extend} />`}
       ${shown.map((item) => html`<${RefChip} key=${item.id} item=${item} filming=${filming} />`)}
-      ${!filming && loras.map((lora) => html`<${LoraChip} key=${`lora-${lora.name}`} lora=${lora} chosen=${loras} />`)}
+      ${drawing && loras.map((lora) => html`<${LoraChip} key=${`lora-${lora.name}`} lora=${lora} chosen=${loras} />`)}
       ${sticky.map(
         (text) => html`<span class="chip is-param" title="Added to every prompt; change it in Settings">${text}</span>`,
       )}
