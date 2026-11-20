@@ -741,7 +741,7 @@ def doctor() -> None:
                 f"[yellow]![/yellow] iMessage: {state}; this terminal cannot read the Messages database, "
                 "but the background service may be allowed to"
             )
-            console.print(f"  [dim]Its log says: {config.log_dir / 'dreambot.log'}[/dim]")
+            console.print(f"  [dim]Its log says: {_plain(config.log_dir / 'dreambot.log')}[/dim]")
         else:
             ok = False
             console.print(f"[red]✗[/red] iMessage: {state}, cannot read the Messages database yet")
@@ -1426,14 +1426,14 @@ def service_install(now: NowOption = False) -> None:
     except RuntimeError as exc:
         err.print(f"[red]Could not start the service:[/red] {_plain(exc)}")
         raise typer.Exit(1) from exc
-    console.print(f"Installed and started: {path}")
+    console.print(f"Installed and started: {_plain(path)}")
     if runtime is not None:
-        console.print(f"It runs the copy in: {runtime}")
+        console.print(f"It runs the copy in: {_plain(runtime)}")
         console.print(
             "[bold]After changing or updating Dreambot, run `dreambot service install` again.[/bold]"
         )
-    console.print(f"Logs: {config.log_dir / 'dreambot.log'}")
-    console.print(f"For iMessage, grant Full Disk Access to: [bold]{launchd.interpreter()}[/bold]")
+    console.print(f"Logs: {_plain(config.log_dir / 'dreambot.log')}")
+    console.print(f"For iMessage, grant Full Disk Access to: [bold]{_plain(launchd.interpreter())}[/bold]")
     console.print(
         "(System Settings → Privacy & Security → Full Disk Access → +, then press ⌘⇧G and paste that path.)"
     )
