@@ -344,3 +344,40 @@ def test_a_message_is_printed_as_it_is_square_brackets_and_all(home: Path, monke
     assert result.exit_code == 2 and "not `[bold]telegram`" in said(result)
     result = runner.invoke(cli.app, ["models", "pull", "[web]"])
     assert result.exit_code == 2 and "Unknown model '[web]'" in said(result)
+
+
+def test_a_prompt_and_the_paths_of_what_was_made_are_printed_as_they_are(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # A prompt is the person's own words, and the folders are theirs to name. Square brackets in
+    # either were read as the console's markup: a sign that says [open] lost its word in the
+    # caption, a folder called [lab] went missing from every path that was printed, and a
+    # prompt that held [/dim] ended the command with a traceback once its pictures were made.
+    from tests.test_adapters import make_repo
+
+    out, cache = tmp_path / "[lab]" / "pictures", tmp_path / "[lab]" / "hub"
+    monkeypatch.setenv("DREAMBOT_OUTPUT_DIR", str(out))
+    monkeypatch.setenv("HF_HUB_CACHE", str(cache))
+    monkeypatch.setenv("DREAMBOT_BACKEND", "fake")
+
+    result = runner.invoke(cli.app, ["imagine", "a neon sign that says [open] --ar 1:1", "--no-open"])
+    assert result.exit_code == 0, result.output
+    assert "a neon sign that says [open]" in said(result)
+    # The console breaks a long path wherever the line ends; put it back together.
+    unbroken = result.output.replace("\n", "")
+    assert f"1. {out}/" in unbroken, "where each picture is"
+    assert f"grid: {out}/" in unbroken, "where the grid is"
+    result = runner.invoke(cli.app, ["imagine", "a fox [/dim] in the snow --ar 1:1", "--no-open"])
+    assert result.exit_code == 0 and "a fox [/dim] in the snow" in said(result), result.output
+
+    result = runner.invoke(cli.app, ["chat", "--no-open"], input="a red fox in the snow --ar 1:1\n")
+    assert result.exit_code == 0, result.output
+    assert f"  {out}/" in result.output.replace("\n", ""), "chat prints where the grid is"
+
+    # An installed model is shown with the folder it is in, and a copy of one that somebody
+    # else exported is listed under the name its folder has.
+    make_repo(cache, "mflux-community/z-image-turbo-mflux-q8", {"transformer/0.safetensors": b"x"})
+    make_repo(cache, "someone/Z-Image-Turbo-mflux-q8[mine]", {"transformer/0.safetensors": b"x"})
+    result = runner.invoke(cli.app, ["models", "info", "z-image-turbo"])
+    assert f"{cache}/models--mflux-community--z-image-turbo-mflux-q8/" in result.output.replace("\n", "")
+    assert "Installed: someone/Z-Image-Turbo-mflux-q8[mine] — q8" in said(result)
