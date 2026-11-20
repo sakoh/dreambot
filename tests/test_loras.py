@@ -957,3 +957,33 @@ def test_a_lora_that_does_not_fit_is_explained_in_words():
     assert "DoRA" in _lora_problem(ValueError("DoRA with LoRA matrices is not supported: k"), spec)
     # A model whose own weights are missing is still a missing model.
     assert _lora_problem(FileNotFoundError("No safetensors files found in /models/x/vae"), spec) is None
+
+
+def test_the_model_a_lora_was_trained_on_is_named_as_it_is(home: Path, monkeypatch):
+    # A model's title and licence come from Dreambot's own list, which has no square brackets in
+    # it today. FLUX.2 [klein] is how that model's makers write its name; written that way in
+    # the list, adding a LoRA for it would have said "FLUX.2 9B is licensed ...".
+    import dataclasses
+
+    from dreambot.engine import prepare, weights
+
+    klein = dataclasses.replace(
+        REGISTRY.get("flux2-klein-9b"), title="FLUX.2 [klein] 9B", license="flux-[klein]-license"
+    )
+    monkeypatch.setattr(type(REGISTRY), "find", lambda self, name: klein)
+    monkeypatch.setattr(type(REGISTRY), "get", lambda self, name: klein)
+    card = Card(repo="someone/inked", files=(("inked.safetensors", 1000),), trigger="ink drawing")
+
+    def run(args, env=None, check=False):
+        monkeypatch.setattr(prepare, "HuggingFace", lambda: Hub(card))
+        return type("Done", (), {"returncode": prepare.main(args[3:])})()
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    added = runner.invoke(cli.app, ["loras", "add", "someone/inked", "--name", "inked", "--base", "klein"])
+    assert added.exit_code == 0, added.output
+    assert "FLUX.2 [klein] 9B is licensed flux-[klein]-license, and so is what is made with it" in said(added)
+
+    # Where a model that is not installed would come from is worked out from the same list.
+    monkeypatch.setattr(weights, "recommended_repo", lambda spec: ("someone/flux2-[klein]-9b-q8", "[q8]"))
+    shown = said(runner.invoke(cli.app, ["models", "info", "flux2-klein-9b"]))
+    assert "would fetch someone/flux2-[klein]-9b-q8 ([q8])" in shown

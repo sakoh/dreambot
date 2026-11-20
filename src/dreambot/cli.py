@@ -431,8 +431,8 @@ def models_info(model: Annotated[str, typer.Argument(help="Model name.")]) -> No
     else:
         repo, level = weights.recommended_repo(spec)
         console.print(
-            f"Not installed. `dreambot models pull {spec.id}` would fetch {repo}"
-            + (f" ({level})" if level else "")
+            f"Not installed. `dreambot models pull {spec.id}` would fetch {_plain(repo)}"
+            + (f" ({_plain(level)})" if level else "")
         )
     console.print("Verified by Dreambot's tests: " + ("yes" if spec.verified else "not yet"))
 
@@ -568,16 +568,18 @@ def loras_add(
         trained_on = REGISTRY.find(entry.base) if entry.base else None
         if trained_on is not None and not trained_on.permissive:
             console.print(
-                f"[yellow]{trained_on.title} is licensed {trained_on.license}[/yellow], and so is what is made with it."
+                f"[yellow]{_plain(trained_on.title)} is licensed {_plain(trained_on.license)}[/yellow], and so is what is made with it."
             )
         if trained_on is not None and not Catalog(config).is_installed(trained_on):
             console.print(
                 f"[yellow]It was trained on {trained_on.id}, which is not installed:[/yellow] "
                 f"dreambot models pull {trained_on.id}"
             )
-        console.print(f'Try it:  [bold]dreambot imagine "a fox in a forest --lora {entry.name}"[/bold]')
         console.print(
-            f"For every prompt: `/settings lora {entry.name}` in chat, or the LoRA button by the prompt "
+            f'Try it:  [bold]dreambot imagine "a fox in a forest --lora {_plain(entry.name)}"[/bold]'
+        )
+        console.print(
+            f"For every prompt: `/settings lora {_plain(entry.name)}` in chat, or the LoRA button by the prompt "
             "in the web app."
         )
 
@@ -636,7 +638,7 @@ def loras_remove(
     if not yes and not typer.confirm(f"Remove the LoRA {name} ({', '.join(path.name for path in there)})?"):
         raise typer.Exit(1)
     loras.remove(folder, name)
-    console.print(f"Removed {name}. Pictures made with it stay where they are.")
+    console.print(f"Removed {_plain(name)}. Pictures made with it stay where they are.")
 
 
 # --------------------------------------------------------------------------------------
