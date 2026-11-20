@@ -835,6 +835,46 @@ def test_the_command_line_lists_shows_and_removes(home: Path, tmp_path: Path):
     assert runner.invoke(cli.app, ["loras", "remove", "../../etc", "--yes"]).exit_code == 2
 
 
+def test_what_a_lora_calls_itself_is_listed_as_it_is(tmp_path: Path, monkeypatch):
+    # A LoRA's trigger words and title are written by whoever published it, and a file put in
+    # the folder by hand keeps the name it came with. Square brackets in them were read as the
+    # console's markup and left out: `[trigger], pixel art` was listed as `, pixel art`.
+    from dreambot.engine import prepare
+
+    home = tmp_path / "[lab]" / "home"
+    monkeypatch.setenv("DREAMBOT_HOME", str(home))
+    monkeypatch.setenv("HF_HUB_CACHE", str(tmp_path / "hub"))
+    make_repo(tmp_path / "hub", "mflux-community/z-image-turbo-mflux-q8", {"transformer/0.safetensors": b"x"})
+    cfg = Config.model_validate({"home": str(home)})
+    add(cfg, title="Pixel Art [v2]", trigger="[trigger], pixel art")
+    safetensors(cfg.lora_dir / "anime[v2].safetensors")
+    (cfg.lora_dir / "sketch[old].toml").write_text('title = "Sketch"\n')  # notes whose file is gone
+
+    listed = said(runner.invoke(cli.app, ["loras", "list"]))
+    assert "anime[v2]" in listed and "[trigger], pixel art" in listed
+    assert "sketch[old] is left out: its file is gone (sketch[old].safetensors)." in listed
+    assert "Pixel Art [v2] (pixel)" in said(runner.invoke(cli.app, ["loras", "info", "pixel"]))
+
+    # Adding one says its trigger words, or where to write them down when its page names none.
+    worded = Card(
+        repo="someone/inked", files=(("inked.safetensors", 1000),), trigger="[trigger], ink drawing"
+    )
+    wordless = Card(repo="someone/grain", files=(("grain.safetensors", 1000),))
+
+    def run(args, env=None, check=False):
+        monkeypatch.setattr(prepare, "HuggingFace", lambda: Hub(worded, wordless))
+        return type("Done", (), {"returncode": prepare.main(args[3:])})()
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    added = runner.invoke(cli.app, ["loras", "add", "someone/inked", "--name", "inked"])
+    assert added.exit_code == 0, added.output
+    assert "Trigger words, put in front of the prompt: [trigger], ink drawing" in said(added)
+    added = runner.invoke(cli.app, ["loras", "add", "someone/grain", "--name", "grain"])
+    assert added.exit_code == 0 and "No trigger words are known for it" in said(added), added.output
+    # (The console breaks a long path wherever the line ends; put it back together.)
+    assert f"{cfg.lora_dir}/grain.toml as `trigger" in added.output.replace("\n", "")
+
+
 def test_adding_from_the_command_line_runs_the_downloader_and_reports(home: Path, monkeypatch):
     from dreambot.engine import prepare
 

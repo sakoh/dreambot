@@ -471,9 +471,9 @@ def loras_list() -> None:
             else:
                 trained_on = f"{base.id} [yellow](not installed)[/yellow]"
             table.add_row(
-                f"[bold]{entry.name}[/bold]",
+                f"[bold]{_plain(entry.name)}[/bold]",
                 trained_on,
-                entry.trigger or "[dim]—[/dim]",
+                _plain(entry.trigger) or "[dim]—[/dim]",
                 f"{entry.scale:g}",
                 f"{Path(entry.path).stat().st_size / 1000**2:.0f} MB",
             )
@@ -482,7 +482,7 @@ def loras_list() -> None:
             "Use one in a prompt with [bold]--lora <name>[/bold], or always with `/settings lora <name>`."
         )
     for name, problem in sorted(problems.items()):
-        err.print(f"[yellow]{name}[/yellow] is left out: {problem}.")
+        err.print(f"[yellow]{_plain(name)}[/yellow] is left out: {_plain(problem)}.")
 
 
 @loras_app.command("add")
@@ -553,11 +553,11 @@ def loras_add(
         if entry is None:
             continue
         if entry.trigger:
-            console.print(f"Trigger words, put in front of the prompt: [bold]{entry.trigger}[/bold]")
+            console.print(f"Trigger words, put in front of the prompt: [bold]{_plain(entry.trigger)}[/bold]")
         else:
             console.print(
                 "[dim]No trigger words are known for it. If its page names some, write them into "
-                f'{notes} as `trigger = "..."`.[/dim]'
+                f'{_plain(notes)} as `trigger = "..."`.[/dim]'
             )
         trained_on = REGISTRY.find(entry.base) if entry.base else None
         if trained_on is not None and not trained_on.permissive:
@@ -591,7 +591,7 @@ def loras_info(name: Annotated[str, typer.Argument(help="The LoRA's name.")]) ->
     if entry is None:
         err.print(f"[red]There is no LoRA called {_plain(name)}.[/red] See `dreambot loras`.")
         raise typer.Exit(2)
-    console.print(f"[bold]{entry.title or entry.name}[/bold] ({entry.name})")
+    console.print(f"[bold]{_plain(entry.title or entry.name)}[/bold] ({_plain(entry.name)})")
     base = REGISTRY.find(entry.base) if entry.base else None
     console.print(
         f"Trained on: {f'{base.title} ({base.id})' if base else 'not known — it is tried on whichever model a prompt uses'}"
