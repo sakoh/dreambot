@@ -656,7 +656,7 @@ def doctor() -> None:
         nonlocal ok
         ok = ok and passed
         mark = "[green]✓[/green]" if passed else "[red]✗[/red]"
-        console.print(f"{mark} {label}" + (f" [dim]— {detail}[/dim]" if detail else ""))
+        console.print(f"{mark} {label}" + (f" [dim]— {_plain(detail)}[/dim]" if detail else ""))
 
     console.print(f"[bold]Dreambot {__version__}[/bold]\n")
     check(
@@ -694,12 +694,14 @@ def doctor() -> None:
         )
     else:
         state = "on" if enhancing else "off by default (`/settings enhance on` to use it)"
-        console.print(f"[green]✓[/green] Language model [dim]— {language}; prompt enhancer {state}[/dim]")
-    console.print(f"  [dim]Hugging Face cache: {weights.hf_cache_dir()}[/dim]")
+        console.print(
+            f"[green]✓[/green] Language model [dim]— {_plain(language)}; prompt enhancer {state}[/dim]"
+        )
+    console.print(f"  [dim]Hugging Face cache: {_plain(weights.hf_cache_dir())}[/dim]")
     console.print(
-        f"  [dim]Config: {config.config_path}{'' if config.config_path.exists() else ' (not created; defaults in use)'}[/dim]"
+        f"  [dim]Config: {_plain(config.config_path)}{'' if config.config_path.exists() else ' (not created; defaults in use)'}[/dim]"
     )
-    console.print(f"  [dim]Images are saved to: {config.output_dir}[/dim]")
+    console.print(f"  [dim]Images are saved to: {_plain(config.output_dir)}[/dim]")
     console.print()
     console.print("[bold]Chat frontends[/bold]")
     from dreambot import launchd, secrets
