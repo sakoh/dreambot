@@ -260,6 +260,40 @@ def test_setup_imessage_points_at_the_service_when_one_is_running(
     }
 
 
+def test_why_messages_cannot_be_read_is_said_in_full(
+    home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # When the Messages database cannot be read, the message ends with what SQLite said, in
+    # square brackets. Those were read as the console's markup, so `dreambot doctor` and
+    # `dreambot setup imessage` gave the advice without the reason. The program to give Full
+    # Disk Access to is named by its path, which lost any folder with brackets in its name.
+    from dreambot.frontends.imessage import chatdb
+
+    not_a_database = tmp_path / "chat.db"
+    not_a_database.write_text("this is not a database")
+    monkeypatch.setattr(chatdb.ChatDB.__init__, "__defaults__", (not_a_database,))
+    monkeypatch.setattr(launchd, "interpreter", lambda: "/Users/me/[tools]/python/bin/python3.12")
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text("[imessage]\nenabled = true\n")
+
+    result = runner.invoke(cli.app, ["doctor"])
+    assert "cannot read the Messages database yet" in said(result)
+    assert "shows exactly which program to add.) [file is not a database]" in said(result)
+    assert "grant Full Disk Access to: /Users/me/[tools]/python/bin/python3.12" in said(result)
+
+    result = runner.invoke(cli.app, ["setup", "imessage"], input="self\n")
+    assert result.exit_code == 0, result.output
+    assert "shows exactly which program to add.) [file is not a database]" in said(result)
+    assert "also give Full Disk Access to: /Users/me/[tools]/python/bin/python3.12" in said(result)
+
+    # With the background service running, it is the service's program that is named.
+    monkeypatch.setattr(
+        launchd, "_launchctl", lambda *arguments: subprocess.CompletedProcess(arguments, 0, "", "")
+    )
+    result = runner.invoke(cli.app, ["setup", "imessage"], input="self\n")
+    assert "then ⌘⇧G and paste): /Users/me/[tools]/python/bin/python3.12" in said(result)
+
+
 def test_setup_warns_when_discord_would_refuse_the_invite_link(home: Path, monkeypatch: pytest.MonkeyPatch):
     """The wall a real setup ran into: "Integration requires code grant"."""
     answers = {
