@@ -16,7 +16,7 @@ faithfully it is reproduced locally:
     Recognised, not implemented yet; using it yields a clear message rather than a parse error.
 
 Parameters marked ``extension`` do not exist in Midjourney: they expose controls that only make
-sense when you own the model (which model, how many steps, which LoRAs).
+sense when you own the model (which model, how many steps, which LoRAs, how long a video).
 """
 
 from __future__ import annotations
@@ -141,6 +141,10 @@ class Params:
     loop: bool | None = None
     end: list[Ref] = field(default_factory=list)
     bs: int | None = None
+    seconds: float | None = None
+    #: What a video made from words alone starts on: ``picture`` (one made from the words
+    #: first) or ``words`` (nothing: the video model films the words itself). ``--from``.
+    video_from: str | None = None
     # -- compatibility no-ops
     speed: str | None = None
     visibility: str | None = None
@@ -151,6 +155,13 @@ class Params:
     strength: float | None = None
     loras: list[LoraRef] = field(default_factory=list)
     negative: str | None = None
+
+    @property
+    def wants_video(self) -> bool:
+        """Whether these parameters ask for a video: ``--video``, or one that only a video has."""
+        return bool(
+            self.video or self.motion or self.loop or self.end or self.bs or self.seconds or self.video_from
+        )
 
     def given(self) -> dict[str, Any]:
         """Only the parameters that were explicitly set."""
@@ -414,13 +425,57 @@ PARAMS: tuple[ParamSpec, ...] = (
         summary="Which local model to use, e.g. `--model qwen-image` (see `/models`).",
     ),
     # ------------------------------------------------------------------- video ----
-    ParamSpec("video", Kind.FLAG, support=_P, summary="Animate the image prompt into a video."),
     ParamSpec(
-        "motion", Kind.CHOICE, choices=("low", "high"), support=_P, summary="Amount of motion in a video."
+        "video",
+        Kind.FLAG,
+        summary="Make a video: of the image at the start of the prompt, or from the words alone.",
+        how="A local video model. Midjourney only animates an image. Here a prompt without one works too: "
+        "a picture is made from the words first, and the video starts on it (see `--from`).",
     ),
-    ParamSpec("loop", Kind.FLAG, support=_P, summary="Make the video loop (end frame = start frame)."),
-    ParamSpec("end", Kind.REFS, support=_P, summary="Image to use as the video's last frame."),
-    ParamSpec("bs", Kind.INT, minimum=1, maximum=4, support=_P, summary="Videos per job (1, 2 or 4)."),
+    ParamSpec(
+        "from",
+        Kind.CHOICE,
+        choices=("picture", "words"),
+        target="video_from",
+        extension=True,
+        summary="What a video with no image starts on: `picture` (one made from your words first, the "
+        "default) or `words` (the video model films the words itself).",
+    ),
+    ParamSpec(
+        "motion",
+        Kind.CHOICE,
+        choices=("low", "high"),
+        support=_E,
+        summary="How much moves in a video: `low` (the default) or `high`.",
+        how="A video that starts on a picture is begun from the picture held still (low: the frame stays "
+        "where it is) or from nothing (high: the camera moves too), and the model is told the same in "
+        "words. A video filmed from words alone is only told.",
+    ),
+    ParamSpec("loop", Kind.FLAG, summary="Make the video end on the frame it starts on, so that it loops."),
+    ParamSpec(
+        "end",
+        Kind.REFS,
+        # Midjourney's ending frame. No video model here can be led up to a picture yet: the
+        # planner says so when it is asked for (see ``VideoTraits.ends``).
+        support=_P,
+        summary="An image for the video to end on. Not yet: Wan 2.2 cannot lead a video up to a picture.",
+    ),
+    ParamSpec(
+        "bs",
+        Kind.INT,
+        minimum=1,
+        maximum=4,
+        summary="Videos per job, 1-4 (the default is 4, as in Midjourney).",
+    ),
+    ParamSpec(
+        "seconds",
+        Kind.FLOAT,
+        aliases=("sec",),
+        minimum=1,
+        maximum=5,
+        extension=True,
+        summary="How long a video is, 1-5 seconds (default 5), or how much `extend` adds (default 4).",
+    ),
     # ------------------------------------------------------ compatibility no-ops ----
     ParamSpec(
         "fast",

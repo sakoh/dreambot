@@ -4,9 +4,13 @@ This is the one place Dreambot touches the network on purpose. It runs as its ow
 process (started by ``dreambot models pull``) with downloads enabled, while the long-lived
 inference worker always runs offline.
 
-Two cases:
+Three cases:
 
 * The mflux community publishes a pre-quantized export of the model: download that repository.
+* The model names the repos of its weights itself (the video model, which mflux does not
+  run): download the files it reads from the one that suits this Mac. What it needs that is
+  not on Hugging Face is fetched from where its author publishes it, and kept only if it is
+  the very file that is expected (:func:`fetch_assets`).
 * Otherwise the weights live in the original upstream repository, which usually contains far
   more than is needed (several variants, other frameworks). mflux knows exactly which files it
   wants, so the model is constructed once here and mflux fetches just those.
@@ -17,22 +21,49 @@ the library the same way (see :mod:`dreambot.engine.loras`).
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import inspect
 import json
+import shutil
 import sys
+import tempfile
+import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dreambot.engine import loras, weights
 from dreambot.engine.loras import Card, LoraError
-from dreambot.engine.registry import REGISTRY, ModelSpec, UnknownModel
+from dreambot.engine.registry import REGISTRY, Asset, ModelSpec, UnknownModel
+
+#: Seconds a download from outside Hugging Face may take to answer.
+FETCH_TIMEOUT = 60.0
 
 
 def download(spec: ModelSpec, quant: str | None = None) -> weights.Weights:
     """Fetch weights for ``spec`` and return what is now installed."""
     from huggingface_hub import snapshot_download
 
-    if spec.slug:
+    if spec.exports:
+        if quant is not None and quant not in spec.exports:
+            raise SystemExit(f"{spec.id} is published as {', '.join(spec.exports)}; there is no {quant}.")
+        repo, _ = weights.recommended_repo(spec, [quant] if quant else None)
+        for wanted, patterns in (
+            (repo, list(spec.files) or None),
+            *((helper, None) for helper in spec.helper_repos),
+        ):
+            try:
+                print(f"Downloading {wanted} ...", flush=True)
+                snapshot_download(repo_id=wanted, allow_patterns=patterns)
+            except Exception as exc:
+                if type(exc).__name__ != "GatedRepoError":
+                    raise
+                raise SystemExit(
+                    f"{wanted} is gated. Accept its license at https://huggingface.co/{wanted} "
+                    "and sign in with `hf auth login`, then try again."
+                ) from exc
+        fetch_assets(spec)
+    elif spec.slug:
         preference = [quant] if quant else list(weights.quant_preference())
         last_error: Exception | None = None
         for level in preference:
@@ -68,6 +99,54 @@ def download(spec: ModelSpec, quant: str | None = None) -> weights.Weights:
             f"The download finished but {spec.id} still looks incomplete in the Hugging Face cache."
         )
     return found
+
+
+def fetch_assets(spec: ModelSpec, folder: Path | None = None) -> None:
+    """Fetch what a model needs that is not on Hugging Face, into Dreambot's own folder for such files.
+
+    A file is kept only if its SHA-256 is the one the registry names. A PyTorch checkpoint is
+    kept as safetensors: the same arrays, read out of it without PyTorch and without running
+    anything the file says to run (:mod:`dreambot.engine.wan.taehv`).
+    """
+    folder = folder or weights.assets_dir()
+    for asset in spec.assets:
+        if weights.asset_path(asset, folder):
+            continue
+        print(f"Downloading {asset.url} ...", flush=True)
+        with tempfile.TemporaryDirectory(prefix="dreambot-asset-") as scratch:
+            fetched = Path(scratch) / (Path(urlparse(asset.url).path).name or "download")
+            try:
+                with (
+                    urllib.request.urlopen(asset.url, timeout=FETCH_TIMEOUT) as answer,
+                    open(fetched, "wb") as out,
+                ):
+                    shutil.copyfileobj(answer, out)
+            except OSError as exc:
+                raise SystemExit(f"{asset.url} could not be downloaded ({exc}).") from exc
+            _keep(asset, fetched, folder / asset.name)
+
+
+def _keep(asset: Asset, fetched: Path, target: Path) -> None:
+    """Put a downloaded file in its place if it is what was expected."""
+    digest = hashlib.sha256()
+    with open(fetched, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    if digest.hexdigest() != asset.sha256:
+        raise SystemExit(
+            f"What came from {asset.url} is not the file that was expected (its SHA-256 is "
+            f"{digest.hexdigest()}), so it was not kept."
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if fetched.suffix == ".pth" and target.suffix == ".safetensors":
+        from dreambot.engine.wan import taehv
+
+        try:
+            taehv.convert(fetched, target)
+        except taehv.CheckpointError as exc:
+            raise SystemExit(str(exc)) from exc
+    else:
+        shutil.move(str(fetched), target)
 
 
 def _construct(spec: ModelSpec) -> None:

@@ -1,14 +1,18 @@
 // The lightbox: one image large, everything known about it, and every action Midjourney puts
-// under an image — vary, upscale, rerun, remix, retexture, zoom, pan, square, edit — plus where
-// to keep it.
+// under an image — vary, upscale, rerun, remix, retexture, zoom, pan, square, edit, animate —
+// plus where to keep it. A video plays here, and what is under it is what a video can be given:
+// more seconds. Animating and extending "manually" hand over to the prompt bar, as on
+// Midjourney's site: that is where the words, a length and a loop are given.
 
 import { html, useEffect, useRef, useState } from "./vendor/preact-htm.js";
 import { api, thumb } from "./api.js";
 import {
   act,
   addRef,
+  animateManually,
   attempt,
   closeLightbox,
+  extendManually,
   go,
   keepJob,
   openLightbox,
@@ -16,10 +20,11 @@ import {
   refreshJob,
   refreshLookbooks,
   setDraft,
+  setVideo,
   toast,
   useStore,
 } from "./store.js";
-import { Ask, Icon, IconButton, Menu, Swatches, copy, splitPrompt } from "./ui.js";
+import { Ask, Icon, IconButton, Menu, Swatches, clipLength, copy, splitPrompt } from "./ui.js";
 
 function Group({ title, children }) {
   return html`<div class="action-group">
@@ -105,6 +110,14 @@ function Retexture({ loras, usual, onSubmit, onCancel }) {
   </form>`;
 }
 
+/** A row of an action group: what the buttons in it have in common, then the buttons. */
+function Row({ label, children }) {
+  return html`<div class="action-line">
+    <span class="action-label">${label}</span>
+    <div class="action-row">${children}</div>
+  </div>`;
+}
+
 export function Lightbox() {
   const { lightbox, jobs, order, lookbooks, folders, app } = useStore();
   const [detail, setDetail] = useState(null);
@@ -150,7 +163,8 @@ export function Lightbox() {
   useEffect(() => {
     if (!lightbox) return undefined;
     const key = (event) => {
-      if (event.target.matches("input, textarea, select")) return;
+      // In a video that has the keyboard, the arrow keys move through it.
+      if (event.target instanceof Element && event.target.matches("input, textarea, select, video")) return;
       if (event.key === "Escape") closeLightbox();
       else if (event.key === "ArrowLeft") step(-1);
       else if (event.key === "ArrowRight") step(1);
@@ -174,9 +188,24 @@ export function Lightbox() {
     return answer;
   };
   const picture = { job: job.id, index };
+  const clip = Boolean(image.video);
+  // Hand the browser a file to keep, as a link with `download` does.
+  const save = (address) => {
+    const link = document.createElement("a");
+    link.href = address;
+    link.download = "";
+    link.click();
+  };
   const use = (role) => {
     addRef({ role, picture, url: image.url, name: `#${job.id}` });
     toast(`Added to the prompt bar as ${role === "image" ? "an image prompt" : `a ${role} reference`}.`);
+  };
+  // "Manually" is done in the prompt bar: go there with the picture, or the video, loaded into it.
+  const toTheBar = (load) => {
+    load(job, image);
+    closeLightbox();
+    go("create");
+    window.scrollTo({ top: 0 });
   };
   const bulk = (action, more = {}) => attempt(() => api.post("/api/images/bulk", { action, items: [picture], ...more }));
   const inFolders = new Set((detail && detail.folders[String(index)]) || []);
@@ -209,23 +238,34 @@ export function Lightbox() {
     ref=${root}
     tabindex="-1"
     role="dialog"
-    aria-label="Image"
+    aria-label=${clip ? "Video" : "Image"}
     onMouseDown=${(event) => event.target === event.currentTarget && closeLightbox()}
   >
     <div class="lightbox-stage" onMouseDown=${(event) => event.target === event.currentTarget && closeLightbox()}>
       ${here > 0 && html`<${IconButton} icon="left" label="Previous (←)" cls="nav prev" size=${26} onClick=${() => step(-1)} />`}
-      <img
-        key=${image.url}
-        src=${image.url}
-        alt=${job.text}
-        style=${{ aspectRatio: `${image.width} / ${image.height}` }}
-        draggable="true"
-        onDragStart=${(event) =>
-          event.dataTransfer.setData(
-            "application/x-dreambot-picture",
-            JSON.stringify({ picture, url: image.url, name: `#${job.id}` }),
-          )}
-      />
+      ${clip
+        ? html`<video
+            key=${image.video}
+            src=${image.video}
+            poster=${image.url}
+            style=${{ aspectRatio: `${image.width} / ${image.height}` }}
+            controls
+            autoplay
+            loop
+            playsinline
+          ></video>`
+        : html`<img
+            key=${image.url}
+            src=${image.url}
+            alt=${job.text}
+            style=${{ aspectRatio: `${image.width} / ${image.height}` }}
+            draggable="true"
+            onDragStart=${(event) =>
+              event.dataTransfer.setData(
+                "application/x-dreambot-picture",
+                JSON.stringify({ picture, url: image.url, name: `#${job.id}` }),
+              )}
+          />`}
       ${here !== -1 &&
       here < sequence.length - 1 &&
       html`<${IconButton} icon="right" label="Next (→)" cls="nav next" size=${26} onClick=${() => step(1)} />`}
@@ -240,9 +280,19 @@ export function Lightbox() {
             fill=${image.favorite}
             onClick=${() => act(job.id, "favorite", { index })}
           />
-          <a class="icon-button" href=${`${image.url}?download=1`} title="Download the original" aria-label="Download the original">
-            <${Icon} name="download" />
-          </a>
+          ${clip
+            ? html`<${Menu}
+                icon="download"
+                label="Download"
+                align="left"
+                items=${[
+                  { label: "Download video", icon: "download", onClick: () => save(`${image.video}?download=1`) },
+                  { label: "Download GIF", icon: "download", onClick: () => save(`${image.video}?as=gif`) },
+                ]}
+              />`
+            : html`<a class="icon-button" href=${`${image.url}?download=1`} title="Download the original" aria-label="Download the original">
+                <${Icon} name="download" />
+              </a>`}
           <${Menu}
             icon="folder"
             label="Folders"
@@ -288,8 +338,13 @@ export function Lightbox() {
         ${params.length > 0 && html`<div class="chips">${params.map((param) => html`<span class="chip is-param">${param}</span>`)}</div>`}
         ${image.prompt &&
         html`<details class="small">
-          <summary>What this image was rendered from</summary>
+          <summary>What this ${clip ? "video" : "image"} was rendered from</summary>
           <p>${image.prompt}</p>
+          ${clip &&
+          job.video &&
+          job.video.drawn &&
+          job.video.drawn[image.index] &&
+          html`<p>It starts on a picture by ${job.video.picture}, drawn from: ${job.video.drawn[image.index]}</p>`}
         </details>`}
         ${job.style &&
         html`<div class="panel-style">
@@ -305,6 +360,7 @@ export function Lightbox() {
           <span>${job.kind}</span><span>${job.model}</span>
           ${(job.loras || []).map((lora) => html`<span title="LoRA">${lora.name}${lora.scale === 1 ? "" : ` ×${lora.scale}`}</span>`)}
           <span>${image.width}×${image.height}</span>
+          ${clip && html`<span>${clipLength(image.seconds)} · ${image.sound ? "with sound" : "silent"}</span>`}
           <span>seed ${image.seed}</span><span>#${job.id}</span>
           <span>${new Date(job.created * 1000).toLocaleString()}</span>
         </div>
@@ -339,8 +395,40 @@ export function Lightbox() {
           onCancel=${() => setAsking(null)}
           onSubmit=${(prompt) => run("retexture", { prompt })}
         />`}
-
-        <${Group} title="Vary">
+        ${clip &&
+        html`<${Group} title="Extend Video">
+            <${Row} label="Auto">
+              <${Action} label="Low motion" icon="forward" title="Four seconds more, going on as it was, with gentle movement" onClick=${() => run("extend", { value: "low" })} />
+              <${Action} label="High motion" icon="forward" title="Four seconds more, going on as it was, with a lot of movement" onClick=${() => run("extend", { value: "high" })} />
+            <//>
+            <${Row} label="Manual">
+              <${Action}
+                label="Extend manually…"
+                icon="edit"
+                title="Say what happens next in the prompt bar, and how much longer it gets."
+                onClick=${() => toTheBar(extendManually)}
+              />
+            <//>
+          <//>
+          <${Group} title="More">
+            <${Action} label="Rerun" icon="refresh" title="The same again, with new seeds" onClick=${() => run("reroll")} />
+          <//>
+          <${Group} title="Use its first frame in a prompt">
+            <${Action}
+              label="Starting frame"
+              icon="video"
+              title="Start another video on the picture this one starts on"
+              onClick=${() => {
+                setVideo({ on: true });
+                use("image");
+              }}
+            />
+            <${Action} label="Image prompt" icon="image" onClick=${() => use("image")} />
+            <${Action} label="Style" icon="styles" onClick=${() => use("style")} />
+            <${Action} label="Subject" icon="person" onClick=${() => use("subject")} />
+          <//>`}
+        ${!clip &&
+        html`<${Group} title="Vary">
           <${Action} label="Subtle" icon="wand" onClick=${() => vary("vary_subtle")} />
           <${Action} label="Strong" icon="refresh" onClick=${() => vary("vary_strong")} />
           <${Action} label="Remix…" icon="edit" title="Variations that follow a new prompt" onClick=${() => setAsking("remix")} />
@@ -360,6 +448,24 @@ export function Lightbox() {
           ${["left", "right", "up", "down"].map(
             (direction) => html`<${IconButton} icon=${direction} label=${`Extend ${direction}`} cls="button" onClick=${() => run("pan", { value: direction })} />`,
           )}
+        <//>
+        <${Group} title="Animate Image">
+          <${Row} label="Auto">
+            <${Action} label="Low motion" icon="video" title="A video of it: the camera holds still and things move gently" onClick=${() => run("animate", { value: "low" })} />
+            <${Action} label="High motion" icon="video" title="A video of it: the camera and everything in front of it move" onClick=${() => run("animate", { value: "high" })} />
+          <//>
+          <${Row} label="Loop">
+            <${Action} label="Low motion" icon="loop" title="A video of it that ends where it starts, to play round and round" onClick=${() => run("animate", { value: "low", prompt: "--loop" })} />
+            <${Action} label="High motion" icon="loop" title="A looping video of it, with a lot of movement" onClick=${() => run("animate", { value: "high", prompt: "--loop" })} />
+          <//>
+          <${Row} label="Manual">
+            <${Action}
+              label="Animate manually…"
+              icon="edit"
+              title="Say what should happen in the prompt bar. A length and a loop can be chosen there."
+              onClick=${() => toTheBar(animateManually)}
+            />
+          <//>
         <//>
         <${Group} title="More">
           <${Action} label="Edit…" icon="edit" title="Change the image by instruction" onClick=${() => setAsking("edit")} />
@@ -391,7 +497,7 @@ export function Lightbox() {
               go("create");
             }}
           />
-        <//>
+        <//>`}
 
         ${detail &&
         (detail.parent || detail.children.length > 0) &&

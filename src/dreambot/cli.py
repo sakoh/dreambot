@@ -97,7 +97,7 @@ def imagine(
     ] = True,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
-    """Generate images from a prompt, exactly as you would message it to the bot.
+    """Generate images (or, with --video, a video) from a prompt, exactly as you would message it to the bot.
 
     Example: dreambot imagine "a red fox in the snow --ar 16:9 --chaos 20"
     """
@@ -170,11 +170,11 @@ async def _imagine(prompt: str, attachments: list[str], show: bool, verbose: boo
         if job.status is JobStatus.DONE:
             console.print(job_caption(job))
             for image in job.images:
-                console.print(f"  {image.index}. {image.path}")
+                console.print(f"  {image.index}. {job.media(image.index)}")
             if job.grid:
                 console.print(f"  grid: {job.grid}")
             if show:
-                subprocess.run(["/usr/bin/open", job.grid or job.images[0].path], check=False)
+                subprocess.run(["/usr/bin/open", job.grid or job.media(job.images[0].index)], check=False)
         else:
             failed = True
             err.print(f"[red]#{job.id} {job.status.value}:[/red] {job.error or ''}")
@@ -399,6 +399,11 @@ def models_info(model: Annotated[str, typer.Argument(help="Model name.")]) -> No
         f"Defaults: {spec.steps} steps"
         + (f", guidance {spec.guidance:g}" if spec.guidance is not None else "")
     )
+    if spec.video:
+        console.print(
+            f"Videos: {spec.video.fps} frames a second, up to {spec.video.max_frames / spec.video.fps:.0f} seconds"
+            + ", silent"
+        )
     console.print(f"Negative prompts: {'yes' if spec.cfg else 'no (best-effort)'}")
     console.print(f"License: {spec.license}" + ("" if spec.permissive else " — check before commercial use"))
     console.print(f"Upstream: https://huggingface.co/{spec.repo}" + (" (gated)" if spec.gated else ""))
@@ -668,6 +673,15 @@ def doctor() -> None:
         bool(installed),
         ", ".join(spec.id for spec in installed) or "run: dreambot models pull z-image-turbo",
     )
+    if any(spec.video for spec in installed):
+        console.print(
+            f"[green]✓[/green] Video [dim]— {next(spec.id for spec in installed if spec.video)}[/dim]"
+        )
+    else:
+        console.print(
+            "[dim]·[/dim] Video: no video model [dim]— `dreambot models pull wan-2.2` adds Animate and "
+            "`--video` (about 17 GB)[/dim]"
+        )
     vision = weights.find_vision_model(config.assist.vision_model)
     language = (
         vision.parent.parent.name.removeprefix("models--").replace("--", "/")

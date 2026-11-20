@@ -19,7 +19,7 @@ the browser has open, so three things keep those out:
   marked ``SameSite=Strict`` so that no other site's request carries it;
 * a request that changes something must come from this app's own origin.
 
-Images are served by job id, upload id or Lookbook id — never by file path.
+Images and videos are served by job id, upload id or Lookbook id — never by file path.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from dreambot import __version__
-from dreambot.core import fingerprint, imaging, lookbook
+from dreambot.core import fingerprint, imaging, lookbook, video
 from dreambot.core.access import LOCAL_WEB_USER
 from dreambot.core.actions import Action, ActionKind
 from dreambot.core.fetch import FetchError, fetch_image
@@ -60,6 +60,7 @@ from dreambot.core.imaging import ImageError
 from dreambot.core.jobs import EventType, Job, JobEvent, JobStatus, new_job_id
 from dreambot.core.params import PromptError
 from dreambot.core.service import Dreambot, DreambotError, style_card
+from dreambot.core.settings import VIDEO_BATCHES
 from dreambot.engine.protocol import Op
 
 log = logging.getLogger(__name__)
@@ -97,6 +98,8 @@ class _Static(StaticFiles):
 COOKIE = "dreambot"
 CHANNEL = "web:main"
 THUMB_WIDTHS = (256, 512, 1024)
+#: The longer side of the copy that is kept of a picture a video is going to start on.
+START_PREVIEW_SIDE = 1024
 MAX_BODY = 1 << 20
 #: How many images one request may put in a download.
 MAX_DOWNLOAD = 400
@@ -224,6 +227,8 @@ class WebApp:
         self.cache = self.config.home / "cache"
         self.uploads = self.config.home / "uploads"
         self._previews: dict[str, int] = {}
+        #: The pictures the videos of running jobs are going to start on: job id -> video numbers.
+        self._starts: dict[str, set[int]] = {}
         self._unsubscribe = service.subscribe(self._on_job_event)
         #: Part of the address the page loads its scripts and styles from (see :class:`_Static`).
         self.build = _build()
@@ -273,6 +278,8 @@ class WebApp:
             delete("/api/styles/{code}", self.delete_style),
             get("/api/styles/{code}", self.style),
             get("/media/job/{job}/{index:int}", self.job_image),
+            get("/media/clip/{job}/{index:int}", self.job_clip),
+            get("/media/poster/{job}/{index:int}", self.job_poster),
             get("/media/grid/{job}", self.job_grid),
             get("/media/preview/{job}", self.job_preview),
             get("/media/upload/{upload}", self.upload_image),
@@ -380,6 +387,8 @@ class WebApp:
             "instruction": bool(job.detail.get("instruction")),
             "count": len(job.seeds) or len(job.images),
             "texts": job.texts,
+            # Whether its results are videos, and how they were asked for (motion, loop).
+            "video": {**(job.detail.get("video") or {})} if job.is_video else None,
             "images": [
                 {
                     "index": image.index,
@@ -390,9 +399,24 @@ class WebApp:
                     "trashed": (job.id, image.index) in trashed,
                     "prompt": image.prompt,
                     "url": f"/media/job/{job.id}/{image.index}",
+                    # A video's picture (`url`) is its first frame.
+                    **self._clip_view(job, image.index),
                 }
                 for image in job.images
             ],
+        }
+
+    @staticmethod
+    def _clip_view(job: Job, index: int) -> dict[str, Any]:
+        clip = job.clip(index)
+        if clip is None:
+            return {}
+        return {
+            "video": f"/media/clip/{job.id}/{index}",
+            "seconds": round(clip.seconds, 2),
+            "sound": clip.sound,
+            # The picture to show it by among others: where it ends, not where it starts.
+            "poster": f"/media/poster/{job.id}/{index}" if clip.poster else f"/media/job/{job.id}/{index}",
         }
 
     def _book_view(self, book: dict[str, Any]) -> dict[str, Any]:
@@ -479,6 +503,15 @@ class WebApp:
                     for entry in service.planner.loras.entries()[0]
                 ],
                 "vision": service.catalog.vision_model() is not None,
+                # What a video is made by and like, until a prompt says otherwise.
+                "video": {
+                    "model": filmer.id if (filmer := service.planner.video_model()) else None,
+                    # Whether a video can be given a picture to end on.
+                    "ends": bool(filmer and filmer.video and filmer.video.ends),
+                    "seconds": self.config.video.seconds,
+                    "count": self.config.video.count,
+                    "motion": self.config.video.motion,
+                },
                 "queue": service.queue_length,
                 "settings": {
                     "model": settings.model,
@@ -492,6 +525,15 @@ class WebApp:
                     "enhance": resolved.enhance,
                     "personalize": resolved.personalize,
                     "looks": list(resolved.looks),
+                    # Midjourney's Video Batch Size and Video Resolution.
+                    "videos": resolved.videos or self.config.video.count,
+                    "video_hd": self.config.video.hd if resolved.video_hd is None else resolved.video_hd,
+                    # Whether a video asked for in words alone starts on a picture made from them.
+                    "picture_first": (
+                        self.config.video.picture_first
+                        if resolved.picture_first is None
+                        else resolved.picture_first
+                    ),
                 },
                 "output": str(self.config.output_dir),
             }
@@ -500,9 +542,13 @@ class WebApp:
     async def save_settings(self, request: Request) -> Response:
         data = await self._body(request)
         settings = self.service.settings(self.user)
-        for key in ("raw", "remix", "hd", "enhance", "personalize"):
+        for key in ("raw", "remix", "hd", "enhance", "personalize", "video_hd", "picture_first"):
             if key in data:
                 setattr(settings, key, bool(data[key]))
+        if "videos" in data:
+            if data["videos"] not in VIDEO_BATCHES:
+                raise WebError("Videos per prompt is 1, 2 or 4.")
+            settings.videos = int(data["videos"])
         if "model" in data:
             settings.model = str(data["model"]) if data["model"] else None
         if "loras" in data:
@@ -529,7 +575,17 @@ class WebApp:
             "fraction": round(event.fraction, 3),
             "position": event.position,
         }
-        if event.type is EventType.PREVIEW and event.preview:
+        if event.type is EventType.PREVIEW and event.preview and event.slot is not None:
+            # The picture one of the job's videos is going to start on. It is shown in that
+            # video's place until the video is made, so a small copy is kept where it can be served.
+            target = self._start_picture(job.id, event.slot)
+            with contextlib.suppress(OSError):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with Image.open(event.preview) as picture:
+                    picture.thumbnail((START_PREVIEW_SIDE, START_PREVIEW_SIDE))
+                    picture.convert("RGB").save(target, quality=85)
+                self._starts.setdefault(job.id, set()).add(event.slot)
+        elif event.type is EventType.PREVIEW and event.preview:
             # The worker's preview file is gone when the job ends; keep the latest where it can be served.
             target = self.cache / "previews" / f"{job.id}.png"
             with contextlib.suppress(OSError):
@@ -538,10 +594,20 @@ class WebApp:
                 self._previews[job.id] = self._previews.get(job.id, 0) + 1
         if job.id in self._previews:
             payload["preview"] = f"/media/preview/{job.id}?v={self._previews[job.id]}"
+        if job.id in self._starts:
+            payload["starts"] = {
+                str(slot): f"/media/preview/{job.id}?slot={slot}" for slot in sorted(self._starts[job.id])
+            }
         if job.status.finished:
             self._previews.pop(job.id, None)
             payload.pop("preview", None)
+            payload.pop("starts", None)
+            for slot in self._starts.pop(job.id, ()):
+                self._start_picture(job.id, slot).unlink(missing_ok=True)
         self.hub.publish(payload)
+
+    def _start_picture(self, job_id: str, slot: int) -> Path:
+        return self.cache / "previews" / f"{job_id}-start-{slot}.jpg"
 
     async def events(self, request: Request) -> Response:
         hub = self.hub
@@ -636,7 +702,9 @@ class WebApp:
             str(data["value"]) if data.get("value") not in (None, "") else None,
             str(data["prompt"]).strip() if data.get("prompt") else None,
         )
-        result = await self.service.act(user=self.user, channel=CHANNEL, action=action)
+        # Pictures that go with the action, as `@1`, `@2` in its words (an animation's end frame).
+        sent = [self._picture(ref) for ref in data.get("attachments") or []]
+        result = await self.service.act(user=self.user, channel=CHANNEL, action=action, attachments=sent)
         return JSONResponse(
             {
                 "jobs": [self.job_view(job) for job in result.jobs],
@@ -782,6 +850,7 @@ class WebApp:
                             "job": job.id,
                             "index": image.index,
                             "url": f"/media/job/{job.id}/{image.index}",
+                            **self._clip_view(job, image.index),
                             "prompt": job.prompt,
                             "model": job.model,
                             "kind": job.kind.value,
@@ -868,8 +937,10 @@ class WebApp:
                     if job is None:
                         continue
                     for image in job.images:
-                        if image.index == index and Path(image.path).is_file():
-                            archive.write(image.path, Path(image.path).name)
+                        # A video goes in as the video, not as the picture it starts on.
+                        path = Path(job.media(image.index))
+                        if image.index == index and path.is_file():
+                            archive.write(path, path.name)
                             added += 1
             return added
 
@@ -1186,6 +1257,39 @@ class WebApp:
             raise WebError("That job has no such image.", 404) from exc
         return await self._serve(request, image.path)
 
+    async def job_clip(self, request: Request) -> Response:
+        """A video a job made. Served in ranges, which is how a browser plays and seeks one."""
+        job = self._job(request.path_params["job"])
+        clip = job.clip(request.path_params["index"])
+        if clip is None:
+            raise WebError("That job has no such video.", 404)
+        source = Path(clip.path)
+        if not source.is_file():
+            raise WebError("That video's file is no longer on disk.", 404)
+        headers = {"Cache-Control": "private, max-age=86400"}
+        if request.query_params.get("as") == "gif":
+            # Midjourney's "Download Gif". Made once, and kept with the thumbnails.
+            target = self.cache / "gifs" / f"{job.id}_{request.path_params['index']}.gif"
+            if not target.is_file():
+                try:
+                    await asyncio.to_thread(video.gif, source, target)
+                except video.VideoError as exc:
+                    raise WebError(str(exc), 500) from exc
+            return FileResponse(
+                target, filename=f"{source.stem}.gif", media_type="image/gif", headers=headers
+            )
+        if request.query_params.get("download"):
+            return FileResponse(source, filename=source.name, media_type="video/mp4", headers=headers)
+        return FileResponse(source, media_type="video/mp4", headers=headers)
+
+    async def job_poster(self, request: Request) -> Response:
+        """The picture a video is shown by: the frame it ends on."""
+        job = self._job(request.path_params["job"])
+        clip = job.clip(request.path_params["index"])
+        if clip is None or not clip.poster:
+            raise WebError("That job has no such video.", 404)
+        return await self._serve(request, clip.poster)
+
     async def job_grid(self, request: Request) -> Response:
         job = self._job(request.path_params["job"])
         if not job.grid:
@@ -1195,6 +1299,11 @@ class WebApp:
     async def job_preview(self, request: Request) -> Response:
         job = self._job(request.path_params["job"])
         target = self.cache / "previews" / f"{job.id}.png"
+        if slot := request.query_params.get("slot"):
+            # The picture one of its videos is going to start on.
+            if not slot.isdigit():
+                raise WebError("There is no preview yet.", 404)
+            target = self._start_picture(job.id, int(slot))
         if not target.is_file():
             raise WebError("There is no preview yet.", 404)
         return FileResponse(target, headers={"Cache-Control": "no-store"})
@@ -1242,7 +1351,8 @@ class WebFrontend:
     def __init__(self, service: Dreambot, *, host: str | None = None, port: int | None = None):
         self.service = service
         self.host = host or service.config.web.host
-        self.port = port or service.config.web.port
+        # 0 asks for any free port, so it is not the same as no port given.
+        self.port = service.config.web.port if port is None else port
         self.web: WebApp | None = None
         self._server: _Server | None = None
         self._task: asyncio.Task[None] | None = None

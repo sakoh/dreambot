@@ -36,7 +36,7 @@ from pathlib import Path
 
 from dreambot.core.access import LOCAL_IMESSAGE_USER, normalize_user
 from dreambot.core.service import Dreambot
-from dreambot.frontends.base import Buttons, ChatFrontend, Incoming
+from dreambot.frontends.base import Buttons, ChatFrontend, Incoming, is_video
 from dreambot.frontends.imessage.chatdb import ChatDB, ChatDBError, Row
 from dreambot.frontends.imessage.sender import Sender, SendError
 
@@ -442,11 +442,16 @@ class IMessageFrontend(ChatFrontend):
             if text:
                 self._outgoing.append(_Outgoing(conversation, _normalize_text(text), time.monotonic()))
                 await self.sender.send_text(conversation, partner, text)
+            videos = sum(1 for image in images if is_video(image))
             log.info(
                 "imessage: sent %s",
                 " and ".join(
                     part
-                    for part in (f"{len(images)} picture(s)" if images else "", "a message" if text else "")
+                    for part in (
+                        f"{len(images) - videos} picture(s)" if len(images) > videos else "",
+                        f"{videos} video(s)" if videos else "",
+                        "a message" if text else "",
+                    )
                     if part
                 )
                 or "nothing",

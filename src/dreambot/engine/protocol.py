@@ -1,8 +1,8 @@
 """Wire protocol between the Dreambot process and its MLX worker subprocess.
 
 One JSON object per line. Requests flow parent -> worker on the worker's stdin; events flow
-worker -> parent on the worker's original stdout. Images never cross the pipe: the worker
-writes files to disk and reports their paths.
+worker -> parent on the worker's original stdout. Images and videos never cross the pipe: the
+worker writes files to disk and reports their paths.
 
 The protocol is deliberately small and language-neutral so that an alternative worker (for
 example a Swift one) could implement it later.
@@ -32,6 +32,16 @@ class Op(StrEnum):
     CONTROL = "control"
     #: Super-resolution.
     UPSCALE = "upscale"
+    #: A video from words alone.
+    TXT2VID = "txt2vid"
+    #: A video that starts on an image, and may end on another (animate, loops).
+    IMG2VID = "img2vid"
+    #: A video continued past its last frame.
+    EXTEND = "extend"
+
+
+#: The operations that make a video rather than a picture.
+VIDEO_OPS = frozenset({Op.TXT2VID, Op.IMG2VID, Op.EXTEND})
 
 
 class _Message(BaseModel):
@@ -61,9 +71,9 @@ class GenerateRequest(_Message):
     height: int | None = None
     steps: int | None = None
     guidance: float | None = None
-    #: One image is produced per seed.
+    #: One image (or one video) is produced per seed.
     seeds: list[int] = Field(min_length=1)
-    #: Init image (img2img, inpaint, upscale, control).
+    #: Init image (img2img, inpaint, upscale, control), or the first frame of a video (img2vid).
     image: str | None = None
     #: 0..1 — how much of the init image survives. 0 ignores it, 1 returns it unchanged.
     #: This is the model's raw control (the fraction of denoising steps skipped); what it
@@ -78,6 +88,14 @@ class GenerateRequest(_Message):
     image_weights: list[float] | None = None
     #: Mask image; white pixels are regenerated, black pixels are kept.
     mask: str | None = None
+    #: Video: how many frames to make (for ``extend``: how many to add), and how many a second.
+    frames: int | None = None
+    fps: float | None = None
+    #: Video: an image for the last frame to be (img2vid, extend). The same image as ``image``
+    #: makes a loop.
+    end_image: str | None = None
+    #: Video: the video to continue (extend).
+    video: str | None = None
     loras: list[Lora] = Field(default_factory=list)
     #: Resolved weights location: a local directory or a Hugging Face repo id. ``None`` lets
     #: the backend use the model's upstream default.
@@ -85,7 +103,7 @@ class GenerateRequest(_Message):
     #: On-the-fly quantization bits for non-quantized weights (3, 4, 5, 6, 8).
     quantize: int | None = None
     out_dir: str
-    #: Output files are named ``{basename}_{index}.png``.
+    #: Output files are named ``{basename}_{index}.png`` (and ``.mp4``, for a video).
     basename: str
     #: Fraction (0..1] of the denoising schedule to run before stopping early (Midjourney ``--stop``).
     stop_at: float | None = None
@@ -209,6 +227,8 @@ class Preview(_Message):
 
 
 class ImageDone(_Message):
+    """One result of a request is finished: a picture, or a video with the picture it starts on."""
+
     type: Literal["image"] = "image"
     id: str
     index: int
@@ -217,6 +237,12 @@ class ImageDone(_Message):
     width: int
     height: int
     seconds: float
+    #: Set by the video operations: the video file, of which ``path`` is the first frame.
+    video: str | None = None
+    frames: int | None = None
+    fps: float | None = None
+    #: Whether the video has a soundtrack.
+    sound: bool = False
 
 
 class TextDone(_Message):

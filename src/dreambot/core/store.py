@@ -6,11 +6,14 @@ sub-millisecond local write — and guarded by a lock so background threads may 
 The schema only ever grows by whole tables, and nothing is added to the JSON of a job that an
 older build would trip over. So an older Dreambot can still open a database a newer one has
 used: it simply does not see the newer tables. That is why they do not raise ``SCHEMA_VERSION``.
+A newer build may also have made jobs of a kind this one does not know (videos, to a build
+from before there were any). Those are left out of what is listed, not guessed at.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -23,7 +26,23 @@ from typing import Any
 
 from dreambot.core.jobs import Job, JobImage, JobStatus, new_job_id, normalize_job_id
 
+log = logging.getLogger(__name__)
+
 SCHEMA_VERSION = 1
+
+
+def _job(row: Any) -> Job | None:
+    """The job in a row, or ``None`` for one this build cannot read (see the module's note)."""
+    try:
+        return Job.from_dict(json.loads(row["data"]))
+    except (ValueError, TypeError, KeyError) as exc:
+        log.debug("left out a job this build cannot read (%s)", exc)
+        return None
+
+
+def _jobs(rows: Sequence[Any]) -> list[Job]:
+    return [job for job in map(_job, rows) if job is not None]
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -224,7 +243,7 @@ class Store:
             row = self._db.execute(
                 "SELECT data FROM jobs WHERE id = ?", (normalize_job_id(job_id),)
             ).fetchone()
-        return Job.from_dict(json.loads(row["data"])) if row else None
+        return _job(row) if row else None
 
     def recent_jobs(
         self, *, user: str | None = None, channel: str | None = None, limit: int = 20, only_done: bool = False
@@ -245,7 +264,7 @@ class Store:
             rows = self._db.execute(
                 f"SELECT data FROM jobs {where} ORDER BY created DESC, rowid DESC LIMIT ?", (*values, limit)
             ).fetchall()
-        return [Job.from_dict(json.loads(row["data"])) for row in rows]
+        return _jobs(rows)
 
     def last_job(self, *, channel: str, with_images: bool = True) -> Job | None:
         """The most recent finished job in a conversation — what a bare "U2" refers to."""
@@ -261,7 +280,7 @@ class Store:
                 "SELECT data FROM jobs WHERE status IN (?, ?) ORDER BY created",
                 (JobStatus.QUEUED.value, JobStatus.RUNNING.value),
             ).fetchall()
-        return [Job.from_dict(json.loads(row["data"])) for row in rows]
+        return _jobs(rows)
 
     def count_jobs(self, *, user: str | None = None) -> dict[str, int]:
         where, values = ("WHERE user = ?", (user,)) if user else ("", ())
@@ -500,8 +519,7 @@ class Store:
                 (JobStatus.DONE.value, limit * 4),
             ).fetchall()
         found: list[tuple[Job, JobImage]] = []
-        for row in rows:
-            job = Job.from_dict(json.loads(row["data"]))
+        for job in _jobs(rows):
             found.extend((job, image) for image in job.images if image.favorite)
         return found[:limit]
 
@@ -538,7 +556,7 @@ class Store:
             rows = self._db.execute(
                 f"SELECT data FROM jobs {where} ORDER BY created DESC, rowid DESC LIMIT ?", (*values, limit)
             ).fetchall()
-        return [Job.from_dict(json.loads(row["data"])) for row in rows]
+        return _jobs(rows)
 
     def job_days(self) -> list[tuple[str, int]]:
         """(day, number of jobs) for every day something was made, newest first — a gallery's timeline."""
@@ -555,7 +573,7 @@ class Store:
             rows = self._db.execute(
                 "SELECT data FROM jobs WHERE parent = ? ORDER BY created", (normalize_job_id(job_id),)
             ).fetchall()
-        return [Job.from_dict(json.loads(row["data"])) for row in rows]
+        return _jobs(rows)
 
     def set_trashed(self, items: Sequence[tuple[str, int]], trashed: bool) -> None:
         now = time.time()

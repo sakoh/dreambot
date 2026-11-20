@@ -1,4 +1,5 @@
-"""The real backend: image models through mflux, captions through mlx-vlm, text through mlx-lm.
+"""The real backend: image models through mflux, the video model through Dreambot's own Wan
+engine, captions and text through mlx-vlm.
 
 Everything here runs on MLX. Models stay loaded between requests (loading a 10-30 GB model
 per job would dominate latency) in a small least-recently-used cache that is trimmed against
@@ -30,7 +31,14 @@ from PIL.PngImagePlugin import PngInfo
 
 from dreambot import __version__
 from dreambot.core.text import parse_numbered
-from dreambot.engine.backends.base import BackendError, JobCancelled, JobContext, require_inputs
+from dreambot.engine import weights as weights_module
+from dreambot.engine.backends.base import (
+    BackendError,
+    JobCancelled,
+    JobContext,
+    input_files,
+    require_inputs,
+)
 from dreambot.engine.protocol import (
     DescribeRequest,
     ErrorKind,
@@ -187,6 +195,8 @@ class MlxBackend:
 
         self._mx = mx
         self._models: OrderedDict[tuple, _Entry] = OrderedDict()
+        #: The video engine, made when the first video is asked for.
+        self._wan: Any = None
         ram = _physical_memory_gb()
         #: Loaded models are evicted (least recently used first) once MLX holds more than this.
         self.budget_gb = float(os.environ.get("DREAMBOT_MEMORY_BUDGET_GB", ram * 0.5))
@@ -223,9 +233,12 @@ class MlxBackend:
                 f"{spec.id} does not support '{req.op.value}' (it supports: {supported}).", ErrorKind.INVALID
             )
         require_inputs(req, variant.max_refs)
-        for path in [req.image, req.mask, *req.images]:
-            if path and not Path(path).is_file():
-                raise BackendError(f"Input image not found: {path}", ErrorKind.INVALID)
+        for path in input_files(req):
+            if not Path(path).is_file():
+                raise BackendError(f"Input file not found: {path}", ErrorKind.INVALID)
+        if spec.runtime == "wan":
+            self._video(spec, req, ctx)
+            return
         if req.stop_at is not None and req.stop_at < 1.0 and variant.latent is None:
             raise BackendError(f"{spec.id} cannot stop early (--stop).", ErrorKind.INVALID)
 
@@ -276,6 +289,44 @@ class MlxBackend:
         finally:
             entry.last_used = time.monotonic()
         self._trim(keep=entry.key)
+
+    def _video(self, spec: ModelSpec, req: GenerateRequest, ctx: JobContext) -> None:
+        """Hand a video request to the video engine, keeping its pipeline in the model cache."""
+        from dreambot.engine.backends import wan
+
+        memory = weights_module.physical_memory_gb()
+        if self._wan is None:
+            self._wan = wan.WanVideo(memory)
+        key = ("wan", spec.id, req.weights)
+        entry = self._models.get(key)
+        if entry is None:
+            if memory < wan.ALONE_MEMORY_GB:
+                self.unload(None)
+            while len(self._models) >= self.max_models:
+                self._evict_oldest()
+            ctx.emit(Loading(id=req.id, model=spec.id))
+            started = time.perf_counter()
+            entry = _Entry(key=key, spec_id=spec.id, model=self._wan.load(spec, req))
+            self._models[key] = entry
+            ctx.emit(Loaded(id=req.id, model=spec.id, seconds=time.perf_counter() - started))
+        else:
+            self._models.move_to_end(key)
+        Path(req.out_dir).mkdir(parents=True, exist_ok=True)
+        try:
+            self._wan.generate(entry.model, spec, req, ctx)
+        except JobCancelled:
+            gc.collect()
+            self._mx.clear_cache()
+            raise
+        except Exception:
+            # A pipeline that failed part of the way may be holding half of what it was doing.
+            self._models.pop(key, None)
+            gc.collect()
+            self._mx.clear_cache()
+            raise
+        finally:
+            entry.last_used = time.monotonic()
+        self._trim(keep=key)
 
     def _resolve_strength(
         self, entry: _Entry, spec: ModelSpec, variant: Variant, req: GenerateRequest, ctx: JobContext

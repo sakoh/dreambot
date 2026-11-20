@@ -24,13 +24,14 @@ from pathlib import Path
 from typing import Any
 
 from dreambot.config import Config
-from dreambot.core import enhance, fingerprint, imaging, lookbook
+from dreambot.core import direct, enhance, fingerprint, imaging, lookbook
+from dreambot.core import video as video_files
 from dreambot.core.access import Access
-from dreambot.core.actions import GENERATIVE, PAN_DIRECTIONS, Action, ActionKind
+from dreambot.core.actions import GENERATIVE, MOTIONS, PAN_DIRECTIONS, Action, ActionKind
 from dreambot.core.fetch import FetchError, fetch_image
 from dreambot.core.fingerprint import StyleFingerprint
 from dreambot.core.imaging import ImageError
-from dreambot.core.jobs import EventType, Job, JobEvent, JobImage, JobKind, JobStatus, new_job_id
+from dreambot.core.jobs import Clip, EventType, Job, JobEvent, JobImage, JobKind, JobStatus, new_job_id
 from dreambot.core.params import Params, PromptError, Ref, parse_loras
 from dreambot.core.planner import (
     STYLE_LEGACY,
@@ -42,6 +43,8 @@ from dreambot.core.planner import (
     Render,
     ResolvedRefs,
     StyleSource,
+    filmed,
+    started,
     style_version,
 )
 from dreambot.core.prompt import MAX_PERMUTATIONS, ParsedPrompt, expand_permutations, parse_prompt
@@ -52,6 +55,7 @@ from dreambot.core.text import SHORTEN_INSTRUCTION, heuristic_shorten, parse_num
 from dreambot.engine.client import Engine, EngineCancelled, EngineError, new_request_id
 from dreambot.engine.loras import LoraError, unworded
 from dreambot.engine.protocol import (
+    VIDEO_OPS,
     DescribeRequest,
     ErrorKind,
     Event,
@@ -68,12 +72,20 @@ log = logging.getLogger(__name__)
 Listener = Callable[[JobEvent], Awaitable[None] | None]
 #: Seconds between progress events for one job (frontends edit a chat message for each).
 PROGRESS_INTERVAL = 1.0
+#: How much of a job's progress making the pictures its videos start on counts for. (They take
+#: a few seconds each, and a video most of a minute.)
+FIRST_SHARE = 0.08
 MAX_JOBS_PER_MESSAGE = MAX_PERMUTATIONS
 #: Shown once per person, on the first job a language model art-directed.
 ENHANCE_HINT = (
     "A language model on this Mac added art direction to your prompt (`info` shows what it wrote). "
     "`--raw` skips that for one prompt and `/settings enhance off` turns it off. "
     "This note appears only once."
+)
+#: Shown once per person, on the first video a model on the Mac directed.
+DIRECT_HINT = (
+    "A model on this Mac wrote what happens in this video (`info` shows what it wrote). `--raw` films "
+    "your words alone, and `/settings enhance off` turns this off. This note appears only once."
 )
 #: Operations whose prompt describes the picture (rather than instructing a change to one).
 _SCENE_OPS = (Op.TXT2IMG, Op.IMG2IMG, Op.REDUX, Op.CONTROL)
@@ -98,6 +110,11 @@ class ActionResult:
 class _Queued:
     job: Job
     run: Callable[[Job], Awaitable[None]]
+
+
+def _words(prompt: str) -> str:
+    """The words of a prompt as a job keeps it, without the parameters after them."""
+    return re.split(r"\s--[A-Za-z]", f" {prompt}", maxsplit=1)[0].strip()
 
 
 def _slug(text: str, limit: int = 48) -> str:
@@ -400,7 +417,7 @@ class Dreambot:
         except ImageError as exc:
             raise DreambotError(str(exc)) from exc
 
-        planned: list[tuple[Job, Plan, Callable[..., Plan], ResolvedRefs | None]] = []
+        planned: list[tuple[Job, Plan, Callable[..., Plan] | None, ResolvedRefs | None]] = []
         for parsed in parsed_prompts:
             refs, ref_notes = await self._resolve_refs(
                 parsed, prepared, scratch, user=user, settings=settings, allow_paths=allow_paths
@@ -409,25 +426,35 @@ class Dreambot:
                 if turn:
                     # As in Midjourney, every repeat of `--sref random` draws a style of its own.
                     refs, ref_notes = self._redraw_styles(refs, ref_notes)
+                filming = parsed.params.wants_video
                 try:
-                    plan = self.planner.imagine(parsed, settings, refs, allow_paths=allow_paths)
+                    if filming:
+                        # Directed when it runs. So are the pictures made that it starts on, when
+                        # it is asked for in words alone.
+                        plan = self.planner.video(parsed, settings, refs, allow_paths=allow_paths)
+                    else:
+                        plan = self.planner.imagine(parsed, settings, refs, allow_paths=allow_paths)
                 except (PlanError, PromptError) as exc:
                     raise DreambotError(str(exc)) from exc
                 # The same request planned again, with the seeds already drawn, once the
-                # language model has written its direction.
-                replan = functools.partial(
-                    self.planner.imagine,
-                    parsed,
-                    settings,
-                    refs,
-                    seeds=list(plan.seeds),
-                    allow_paths=allow_paths,
-                )
+                # language model has written its direction. (That is for pictures, and so for the
+                # pictures a video starts on. What a video's director writes is added to the plan
+                # it has.)
+                replan = None
+                if not filming or plan.first is not None:
+                    replan = functools.partial(
+                        self.planner.video if filming else self.planner.imagine,
+                        parsed,
+                        settings,
+                        refs,
+                        seeds=list(plan.seeds),
+                        allow_paths=allow_paths,
+                    )
                 plan.notes[:0] = ref_notes
                 if refs.edit:
                     plan.detail["instruction"] = True  # `--edit`: the text says what to change
                 job = self._job_from_plan(
-                    JobKind.IMAGINE,
+                    JobKind.VIDEO if filming else JobKind.IMAGINE,
                     plan,
                     user=user,
                     channel=channel,
@@ -437,7 +464,7 @@ class Dreambot:
                 job.inputs = {"attachments": prepared}
                 # Words for a style come from the vision model, which has to wait its turn on
                 # the GPU like everything else: the job asks for them when it runs.
-                waiting = self._style_pending(parsed, refs)
+                waiting = replan is not None and self._style_pending(parsed, refs)
                 planned.append((job, plan, replan, refs if waiting else None))
         for job, plan, replan, waiting_refs in planned:
             await self._enqueue(job, self._runner(plan, replan, waiting_refs))
@@ -481,36 +508,7 @@ class Dreambot:
         claimed: set[int] = set()
 
         async def one(ref: Ref, role: str) -> list[str]:
-            if ref.kind == "url":
-                try:
-                    downloaded = await asyncio.to_thread(fetch_image, ref.value, scratch)
-                    return [str(imaging.prepare_input(downloaded, scratch))]
-                except (FetchError, ImageError) as exc:
-                    raise DreambotError(str(exc)) from exc
-            if ref.kind == "attachment":
-                if ref.value == "*":
-                    free = [i for i in range(len(attachments)) if i not in claimed]
-                    if not free:
-                        raise DreambotError(f"`--{role}` needs an image: attach one, or give a link.")
-                    claimed.update(free)
-                    return [attachments[i] for i in free]
-                position = int(ref.value) - 1
-                if position >= len(attachments):
-                    raise DreambotError(
-                        f"`--{role} @{ref.value}`: this message has {len(attachments)} attached image(s)."
-                    )
-                claimed.add(position)
-                return [attachments[position]]
-            if ref.kind == "path":
-                if not allow_paths:
-                    raise DreambotError(
-                        "File paths only work from the Mac itself; attach the image or use a link."
-                    )
-                try:
-                    return [str(imaging.prepare_input(ref.value, scratch))]
-                except ImageError as exc:
-                    raise DreambotError(str(exc)) from exc
-            return []
+            return await self._ref_images(ref, role, attachments, claimed, scratch, allow_paths)
 
         async def many(refs: list[Ref], role: str) -> list[str]:
             # Explicit references first, so that a bare `--edit` takes what is left over.
@@ -542,10 +540,58 @@ class Dreambot:
             elif source.code is not None:
                 resolved.style_codes.append(source.code)
         resolved.sources.extend(await asyncio.to_thread(self._look_sources, params, user, settings))
+        resolved.end = await many(params.end, "end")
+        if params.end and not resolved.end:
+            raise DreambotError("`--end` takes an image: a link, or an attachment number like `@2`.")
         resolved.image_prompts = await many(parsed.image_prompts, "image prompt")
         # Attached images nobody claimed are image prompts, as in Midjourney.
         resolved.image_prompts.extend(path for i, path in enumerate(attachments) if i not in claimed)
         return resolved, notes
+
+    async def _ref_images(
+        self,
+        ref: Ref,
+        role: str,
+        attachments: Sequence[str],
+        claimed: set[int],
+        scratch: Path,
+        allow_paths: bool,
+    ) -> list[str]:
+        """The image files one reference of a prompt stands for: a link, an attachment, a path.
+
+        ``claimed`` collects the attachments that references have taken, so that the ones
+        nobody named can be given a role of their own.
+        """
+        if ref.kind == "url":
+            try:
+                downloaded = await asyncio.to_thread(fetch_image, ref.value, scratch)
+                return [str(imaging.prepare_input(downloaded, scratch))]
+            except (FetchError, ImageError) as exc:
+                raise DreambotError(str(exc)) from exc
+        if ref.kind == "attachment":
+            if ref.value == "*":
+                free = [i for i in range(len(attachments)) if i not in claimed]
+                if not free:
+                    raise DreambotError(f"`--{role}` needs an image: attach one, or give a link.")
+                claimed.update(free)
+                return [attachments[i] for i in free]
+            position = int(ref.value) - 1
+            if position >= len(attachments):
+                raise DreambotError(
+                    f"`--{role} @{ref.value}`: this message has {len(attachments)} attached image(s)."
+                )
+            claimed.add(position)
+            return [attachments[position]]
+        if ref.kind == "path":
+            if not allow_paths:
+                raise DreambotError(
+                    "File paths only work from the Mac itself; attach the image or use a link."
+                )
+            try:
+                return [str(imaging.prepare_input(ref.value, scratch))]
+            except ImageError as exc:
+                raise DreambotError(str(exc)) from exc
+        return []
 
     # -------------------------------------------------------------------- styles ----
 
@@ -1036,7 +1082,8 @@ class Dreambot:
         index = action.index
         if index is None:
             if len(job.images) > 1:
-                raise DreambotError(f"Which image? Add its number (1-{len(job.images)}), for example `U2`.")
+                which = "Which video" if job.is_video else "Which image"
+                raise DreambotError(f"{which}? Add its number (1-{len(job.images)}), for example `U2`.")
             index = job.images[0].index
         try:
             image = job.image(index)
@@ -1049,12 +1096,19 @@ class Dreambot:
         return job, image
 
     async def act(
-        self, *, user: str, channel: str, action: Action, allow_paths: bool = False
+        self,
+        *,
+        user: str,
+        channel: str,
+        action: Action,
+        allow_paths: bool = False,
+        attachments: Sequence[str | Path] = (),
     ) -> ActionResult:
         """Carry out an action on an earlier job.
 
         ``allow_paths`` says the action was asked for on the Mac itself. Running a prompt again
         is running it for whoever asks, so it is their word that counts, not the first asker's.
+        ``attachments`` are images sent along with the action (the end frame of an animation).
         """
         kind = action.kind
         if kind is ActionKind.CANCEL:
@@ -1063,8 +1117,6 @@ class Dreambot:
             )
             message = f"Cancelled {len(cancelled)} job(s)." if cancelled else "Nothing is running."
             return ActionResult(jobs=[], message=message)
-        if kind is ActionKind.ANIMATE:
-            raise DreambotError("Turning images into video isn't available yet.")
         if kind is ActionKind.REROLL:
             job, _ = self._target(action, channel, need_image=False)
             return ActionResult(
@@ -1108,13 +1160,32 @@ class Dreambot:
         assert kind in GENERATIVE
         self._check_room(user, 1)
         try:
+            end = await self._end_frame(action, user, attachments, allow_paths=allow_paths)
             new_job, plan = self._plan_action(
-                action, job, image, user=user, channel=channel, allow_paths=allow_paths
+                action, job, image, user=user, channel=channel, allow_paths=allow_paths, end=end
             )
         except (PlanError, PromptError, ImageError, ValueError) as exc:
             raise DreambotError(str(exc)) from exc
         await self._enqueue(new_job, self._runner(plan))
         return ActionResult(jobs=[new_job])
+
+    async def _end_frame(
+        self, action: Action, user: str, attachments: Sequence[str | Path], *, allow_paths: bool
+    ) -> str | None:
+        """The image a video is to end on, when the words of an action give one with ``--end``."""
+        if action.kind not in (ActionKind.ANIMATE, ActionKind.EXTEND) or not action.prompt:
+            return None
+        parsed = parse_prompt(action.prompt, option_sets=self.resolved_settings(user).option_sets)
+        if not parsed.params.end:
+            return None
+        scratch = self._scratch()
+        sent = [str(imaging.prepare_input(path, scratch)) for path in attachments]
+        found: list[str] = []
+        for ref in parsed.params.end:
+            found.extend(await self._ref_images(ref, "end", sent, set(), scratch, allow_paths))
+        if not found:
+            raise DreambotError("`--end` takes an image: a link, or an image sent along with the message.")
+        return found[0]
 
     def _plan_action(
         self,
@@ -1125,10 +1196,21 @@ class Dreambot:
         user: str,
         channel: str,
         allow_paths: bool = False,
+        end: str | None = None,
     ) -> tuple[Job, Plan]:
         settings = self.resolved_settings(user)
         kind = action.kind
         scratch = self._scratch()
+        clip = job.clip(image.index)
+        if clip is not None and kind not in (ActionKind.ANIMATE, ActionKind.EXTEND):
+            raise DreambotError(
+                "That is a video, and this works on pictures. `extend` continues a video, and `animate` "
+                "starts another one on its first frame."
+            )
+        if clip is None and kind is ActionKind.EXTEND:
+            raise DreambotError(
+                "That is a picture, not a video. `animate` turns it into one, which `extend` can then continue."
+            )
         text, negative, params = self._scene_text(job), job.negative, Params()
         if image.prompt and action.kind in (
             ActionKind.VARY,
@@ -1288,6 +1370,63 @@ class Dreambot:
             prompt = wanted
             detail["instruction"] = True
             new_kind = JobKind.EDIT
+        elif kind in (ActionKind.ANIMATE, ActionKind.EXTEND):
+            # What should happen is said in words of its own, or left to the model; it is not
+            # the description the picture was made from, which says what is in it.
+            wanted, avoid, given = "", [], []
+            if action.prompt:
+                parsed = parse_prompt(action.prompt, option_sets=settings.option_sets)
+                wanted, avoid = parsed.positive_text, parsed.negative_terms
+                params, given = parsed.params, parsed.given
+            motion = action.value if action.value in MOTIONS else None
+            if motion and params.motion is None:
+                given = [*given, f"--motion {motion}"]
+            if kind is ActionKind.ANIMATE:
+                plan = self.planner.animate(
+                    source=image.path,
+                    text=wanted,
+                    motion=motion,
+                    params=params,
+                    hd=settings.video_hd,
+                    videos=settings.videos,
+                    end=end,
+                    avoid=avoid,
+                    directed=settings.enhance and not settings.raw,
+                    # What the picture is of, for the model that says what happens in it. A
+                    # video's first frame is of what that video was of.
+                    about=job.text if clip is None else "",
+                )
+                new_kind = JobKind.ANIMATE
+            else:
+                assert clip is not None
+                if not Path(clip.path).is_file():
+                    raise DreambotError("That video's file is no longer on disk.")
+                earlier = job.detail.get("video") or {}
+                if params.loop:
+                    if end is not None:
+                        raise DreambotError(
+                            "A video that loops ends on the frame it starts on, so `--loop` and `--end` "
+                            "can't both be given."
+                        )
+                    # Continued as a loop, it is led back to the frame it started on.
+                    end = image.path
+                plan = self.planner.extend(
+                    clip=clip,
+                    size=(image.width, image.height),
+                    text=wanted,
+                    model=job.model,
+                    motion=motion or earlier.get("motion"),
+                    params=params,
+                    avoid=avoid,
+                    # What it was made from: left to itself, a video goes on as it was going.
+                    before=image.prompt or job.text,
+                    directed=settings.enhance and not settings.raw,
+                    end=end,
+                    videos=settings.videos,
+                )
+                new_kind = JobKind.EXTEND
+            # Shown under the words of the picture or the video it was made of, so that it can be told which.
+            prompt = " ".join([wanted or _words(job.prompt), *given]).strip()
         else:  # pragma: no cover - GENERATIVE is exhaustive above
             raise DreambotError("I don't know how to do that yet.")
 
@@ -1296,7 +1435,7 @@ class Dreambot:
             new_kind, plan, user=user, channel=channel, prompt=prompt, params=params
         )
         new_job.parent, new_job.parent_index = job.id, image.index
-        new_job.inputs = {"source": image.path}
+        new_job.inputs = {"source": image.path, **({"sent": [end]} if end else {})}
         return new_job, plan
 
     def _without_triggers(self, text: str, job: Job) -> str:
@@ -1365,7 +1504,7 @@ class Dreambot:
 
     async def _reroll(self, job: Job, *, user: str, channel: str, allow_paths: bool = False) -> list[Job]:
         """Run a job again with fresh seeds."""
-        if job.kind is JobKind.IMAGINE:
+        if job.kind in (JobKind.IMAGINE, JobKind.VIDEO):
             # Fresh seeds, and one job: rerolling one result of a `--repeat 4` runs it once, as in Midjourney.
             prompt = re.sub(r"\s--(?:seed|sameseed|repeat)\s+\d+", "", f" {job.prompt}").strip()
             attachments = [p for p in job.inputs.get("attachments", []) if Path(p).is_file()]
@@ -1378,7 +1517,12 @@ class Dreambot:
         again = Action(
             ActionKind(saved["kind"]), job.parent, job.parent_index, saved.get("value"), saved.get("prompt")
         )
-        return (await self.act(user=user, channel=channel, action=again, allow_paths=allow_paths)).jobs
+        # An animation that ends on a picture sent with it ends on that picture again.
+        sent = [path for path in job.inputs.get("sent", []) if Path(path).is_file()]
+        result = await self.act(
+            user=user, channel=channel, action=again, allow_paths=allow_paths, attachments=sent
+        )
+        return result.jobs
 
     # --------------------------------------------------------------------- blend ----
 
@@ -1528,9 +1672,173 @@ class Dreambot:
                         job.detail["style"] = _jsonable(final.detail["style"])
             if final.brief is not None and replan is not None:
                 final = await self._enhance(job, final, replan)
-            await self._run_plan(job, final)
+            begun = 0.0
+            try:
+                if final.first is not None:
+                    final = await self._start(job, final, replan)
+                    begun = FIRST_SHARE
+                if final.shoot is not None:
+                    final = await self._direct(job, final)
+                await self._run_plan(job, final, begun=begun)
+            finally:
+                shutil.rmtree(self._first_dir(job), ignore_errors=True)
 
         return run
+
+    def _first_dir(self, job: Job) -> Path:
+        """Where the pictures a job's videos start on are kept until the videos are made."""
+        return self.config.scratch_dir / "jobs" / f"{job.id}.first"
+
+    async def _board(self, render: Render, target: Path) -> str | None:
+        """Cut the style board a render shows its model, if it has one, and say where it is."""
+        if render.board is None:
+            return None
+        cut = await asyncio.to_thread(imaging.style_board, render.board.tiles, render.board.seed, target)
+        return str(cut)
+
+    async def _start(self, job: Job, plan: Plan, replan: Callable[..., Plan] | None) -> Plan:
+        """Make the pictures the videos of a job start on, and plan the videos from them.
+
+        A video asked for in words alone is made the way Midjourney's are: from a picture. The
+        words are drawn first, as any prompt is (art direction and all), one picture for each
+        video, and each video then starts on its own.
+        """
+        first = plan.first
+        assert first is not None
+        if first.brief is not None and replan is not None:
+
+            def again(*, directions: Sequence[str]) -> Plan:
+                return replan(directions=directions).first or first
+
+            first = await self._enhance(job, first, again)
+        work_dir = self._first_dir(job)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        total = max(1, first.work)
+        pictures: dict[int, str] = {}
+        prompts: dict[str, str] = {}
+        last_progress = 0.0
+
+        async def on_event(event: Event) -> None:
+            nonlocal last_progress
+            if isinstance(event, Loading):
+                await self._emit(
+                    JobEvent(EventType.LOADING, job, fraction=FIRST_SHARE * len(pictures) / total)
+                )
+            elif isinstance(event, Progress):
+                now = time.monotonic()
+                if now - last_progress < PROGRESS_INTERVAL:
+                    return
+                last_progress = now
+                drawn = len(pictures) + event.index + event.step / max(1, event.total)
+                fraction = FIRST_SHARE * min(1.0, drawn / total)
+                await self._emit(JobEvent(EventType.PROGRESS, job, fraction=fraction))
+
+        for number, render in enumerate(first.renders):
+            request = render.request(
+                request_id=new_request_id(),
+                out_dir=str(work_dir),
+                basename=f"p{number}",
+                board=await self._board(render, work_dir / f"board{number}.png"),
+            )
+            self._current_request = request.id
+            result = await self.engine.generate(request, on_event=on_event)
+            for produced in result.images:
+                slot = render.slots[produced.index]
+                pictures[slot] = produced.path
+                prompts[str(slot)] = render.prompt
+                # Shown where its video will be, until that is made.
+                await self._emit(
+                    JobEvent(
+                        EventType.PREVIEW,
+                        job,
+                        fraction=FIRST_SHARE * len(pictures) / total,
+                        preview=produced.path,
+                        slot=slot,
+                    )
+                )
+        missing = [slot for render in plan.renders for slot in render.slots if slot not in pictures]
+        if missing:
+            raise DreambotError(f"{first.model} made no picture to start on.")
+        # What each was drawn from, for `info`: it is what the video's first frame is a picture of.
+        job.detail.setdefault("video", {})["drawn"] = prompts
+        return started(plan, pictures)
+
+    async def _direct(self, job: Job, plan: Plan) -> Plan:
+        """Have a model on the Mac say what happens in each video, and film what it wrote.
+
+        It is shown the picture the video starts on (or, for one that is being continued, the
+        frame it has reached); videos that each start on a picture of their own are each
+        directed from theirs. A video made from words alone is directed from the words. Like
+        art direction, this refines a job and is never a reason for one to fail: whatever goes
+        wrong, the video is made from the plan it already has.
+        """
+        shoot = plan.shoot
+        vision = self.catalog.vision_model()
+        if shoot is None or vision is None:
+            return plan
+        await self._emit(JobEvent(EventType.THINKING, job))
+        lines: list[str] = []
+        try:
+            reached: str | None = None
+            if shoot.clip:
+                target = self._scratch() / f"reached-{job.id}.png"
+                frame = await asyncio.to_thread(video_files.last_frame, shoot.clip)
+                await asyncio.to_thread(frame.save, target)
+                reached = str(target)
+            for render in plan.renders:
+                # One render makes every video that starts on the same picture.
+                one = replace(shoot, count=len(render.seeds), start=render.image or shoot.start)
+                # Seeded like the videos, so the same prompt and seed give the same direction.
+                seed = render.seeds[0] if render.seeds else None
+                written = await self._lines(one, vision, reached or one.start, seed)
+                # Each picture's lines are checked on their own: a line is for the picture it was written for.
+                lines += direct.parse(written, one)
+        except EngineCancelled:
+            raise
+        except (EngineError, video_files.VideoError, OSError) as exc:
+            log.warning("job %s: the director failed (%s); filming the prompt as planned", job.id, exc)
+            return plan
+        if not any(lines):
+            log.warning("job %s: the director returned nothing usable", job.id)
+            return plan
+        job.detail["enhanced"] = True
+        settings = self.settings(job.user)
+        if "direct" not in settings.hints:
+            job.notes.append(DIRECT_HINT)
+            settings.hints.append("direct")
+            self.store.save_settings(job.user, settings.to_dict())
+        return filmed(plan, lines)
+
+    async def _lines(
+        self, shoot: direct.Shoot, vision: str, picture: str | None, seed: int | None
+    ) -> Sequence[str]:
+        """What the director writes for one shoot: shown ``picture``, or asked about the words alone."""
+        if picture:
+            look = DescribeRequest(
+                id=new_request_id(),
+                image=picture,
+                count=shoot.count,
+                weights=vision,
+                instruction=direct.instruction(shoot),
+                max_tokens=direct.LINE_TOKENS,
+                seed=seed,
+            )
+            self._current_request = look.id
+            return await self.engine.describe(look)
+        ask = TextRequest(
+            id=new_request_id(),
+            weights=vision,
+            system=direct.SYSTEM,
+            prompt=direct.request(shoot),
+            max_tokens=direct.LINE_TOKENS * shoot.count,
+            temperature=direct.TEMPERATURE,
+            top_p=enhance.TOP_P,
+            repetition_penalty=enhance.REPETITION_PENALTY,
+            seed=seed,
+        )
+        self._current_request = ask.id
+        answers = await self.engine.text(ask)
+        return parse_numbered(answers[0] if answers else "", shoot.count)
 
     async def _enhance(self, job: Job, plan: Plan, replan: Callable[..., Plan]) -> Plan:
         """Have the local language model art-direct each image, and plan again with what it wrote.
@@ -1583,50 +1891,78 @@ class Dreambot:
             self.store.save_settings(job.user, settings.to_dict())
         return directed
 
-    async def _run_plan(self, job: Job, plan: Plan) -> None:
+    @staticmethod
+    def _poster(clip: Path, target: Path, frames: int, looping: bool) -> str | None:
+        """Keep the picture a video is shown by among others, and say where it is.
+
+        The frame it ends on, as on Midjourney's site: its first frame is the picture it was made
+        from, and a video shown by that cannot be told from the picture. A loop ends on its first
+        frame too, so it is shown by the frame it turns round on.
+        """
+        try:
+            picture = video_files.frame(clip, frames // 2) if looping else video_files.last_frame(clip)
+            picture.save(target, quality=90)
+        except (video_files.VideoError, OSError) as exc:
+            log.warning("no poster for %s (%s)", clip.name, exc)
+            return None
+        return str(target)
+
+    async def _run_plan(self, job: Job, plan: Plan, *, begun: float = 0.0) -> None:
+        """Carry a plan out. ``begun`` is how much of the job's progress was done before it."""
         day = datetime.fromtimestamp(job.created).strftime("%Y-%m-%d")
         out_dir = self.config.output_dir / day
         out_dir.mkdir(parents=True, exist_ok=True)
         work_dir = self.config.scratch_dir / "jobs" / job.id
-        stem = f"{_slug(job.text or job.kind.value)}_{job.id}"
+        stem = f"{_slug(job.text or _words(job.prompt) or job.kind.value)}_{job.id}"
+        filming = plan.op in VIDEO_OPS
+        # A video's first frame is kept as a picture, for everything that shows a job's images.
+        # It is Dreambot's own: what goes in the pictures folder is the video.
+        stills = self.config.home / "stills" / day
+        # A new video that loops ends where it starts; one that is continued into a loop does not.
+        looping = plan.op is Op.IMG2VID and bool((plan.detail.get("video") or {}).get("loop"))
         units = plan.work + (plan.count if plan.finish else 0)
         done = 0
         last_progress = 0.0
         # Whether each render's prompt describes its picture and so is worth keeping with it.
         scene = plan.op in _SCENE_OPS and plan.canvas is None and plan.keep_outside_mask is None
+        scene = scene or filming
+
+        def overall(part: float) -> float:
+            return begun + (1 - begun) * part
 
         async def on_event(event: Event, base: int) -> None:
             nonlocal last_progress
             if isinstance(event, Loading):
-                await self._emit(JobEvent(EventType.LOADING, job, fraction=done / units))
+                await self._emit(JobEvent(EventType.LOADING, job, fraction=overall(done / units)))
             elif isinstance(event, Progress):
                 now = time.monotonic()
                 if now - last_progress < PROGRESS_INTERVAL:
                     return
                 last_progress = now
                 fraction = (base + event.index + event.step / max(1, event.total)) / units
-                await self._emit(JobEvent(EventType.PROGRESS, job, fraction=min(0.99, fraction)))
+                await self._emit(JobEvent(EventType.PROGRESS, job, fraction=min(0.99, overall(fraction))))
             elif isinstance(event, Preview) and plan.tiles is None:
-                await self._emit(JobEvent(EventType.PREVIEW, job, fraction=done / units, preview=event.path))
+                await self._emit(
+                    JobEvent(EventType.PREVIEW, job, fraction=overall(done / units), preview=event.path)
+                )
 
+        renders = plan.renders
+        if filming:
+            # One video at a time, so that each can be watched while the next is being made.
+            renders = [
+                replace(render, seeds=[seed], slots=[slot])
+                for render in plan.renders
+                for seed, slot in zip(render.seeds, render.slots, strict=True)
+            ]
         try:
             pieces: dict[int, str] = {}
-            for number, render in enumerate(plan.renders):
-                board: str | None = None
-                if render.board is not None:
-                    cut = await asyncio.to_thread(
-                        imaging.style_board,
-                        render.board.tiles,
-                        render.board.seed,
-                        work_dir / f"board{number}.png",
-                    )
-                    board = str(cut)
+            for number, render in enumerate(renders):
                 request = render.request(
                     request_id=new_request_id(),
                     out_dir=str(work_dir),
                     basename=f"r{number}",
                     preview_every=self.config.engine.preview_every,
-                    board=board,
+                    board=await self._board(render, work_dir / f"board{number}.png"),
                 )
                 self._current_request = request.id
                 base = done
@@ -1641,7 +1977,21 @@ class Dreambot:
                     if plan.tiles is not None:
                         pieces[slot] = produced.path  # a tile, assembled below
                         continue
-                    final = out_dir / f"{stem}_{slot}.png"
+                    if filming:
+                        if not produced.video or not produced.frames or not produced.fps:
+                            raise DreambotError(f"{plan.model} made no video.")
+                        kept = out_dir / f"{stem}_{slot}.mp4"
+                        shutil.move(produced.video, kept)
+                        stills.mkdir(parents=True, exist_ok=True)
+                        poster = await asyncio.to_thread(
+                            self._poster, kept, stills / f"{stem}_{slot}_poster.jpg", produced.frames, looping
+                        )
+                        job.keep_clip(
+                            slot, Clip(str(kept), produced.frames, produced.fps, produced.sound, poster)
+                        )
+                        final = stills / f"{stem}_{slot}.png"
+                    else:
+                        final = out_dir / f"{stem}_{slot}.png"
                     shutil.move(produced.path, final)
                     if plan.canvas is not None and plan.source:
                         await asyncio.to_thread(imaging.restore_source, final, plan.canvas, plan.source)
@@ -1659,6 +2009,11 @@ class Dreambot:
                             prompt=render.prompt if scene and render.prompt != job.text else None,
                         )
                     )
+                if filming and done < units:
+                    # The ones that are made are shown, and can be watched, while the rest are
+                    # still to come: so the job is written down with what it has so far.
+                    self.store.save_job(job)
+                    await self._emit(JobEvent(EventType.PROGRESS, job, fraction=overall(done / units)))
 
             if plan.tiles is not None and plan.tile_base:
                 final = out_dir / f"{stem}_1.png"
@@ -1675,7 +2030,7 @@ class Dreambot:
             if plan.finish is not None:
                 await self._finish_pass(job, plan.finish, work_dir, lambda: done, units, on_event)
 
-            if len(job.images) > 1:
+            if len(job.images) > 1 and not filming:
                 grid = out_dir / f"{stem}_grid.jpg"
                 await asyncio.to_thread(imaging.compose_grid, [image.path for image in job.images], grid)
                 job.grid = str(grid)
@@ -1732,6 +2087,7 @@ class Dreambot:
             "running": self._current.id if self._current else None,
             "your_jobs_in_progress": self.queued_for(user),
             "model": model,
+            "video_model": video.id if (video := self.planner.video_model()) else None,
             "installed_models": [spec.id for spec in self.catalog.installed()],
             "backend": self.config.engine.backend,
         }
@@ -1766,7 +2122,19 @@ def describe_job(job: Job, image: JobImage | None = None) -> str:
         lines.append(f"Style: {style.get('summary', '')}" + (f" ({mix})" if "," in mix else ""))
     if used := job.detail.get("loras"):
         lines.append("LoRA: " + ", ".join(f"{lora['name']} ({lora['scale']:g})" for lora in used))
-    if image is not None:
+    clip = job.clip(image.index) if image is not None else None
+    if image is not None and clip is not None:
+        lines.append(
+            f"Video {image.index}: seed {image.seed} · {image.width}x{image.height} · {clip.seconds:.0f}s at "
+            f"{clip.fps:g} frames a second · {'with sound' if clip.sound else 'silent'}"
+        )
+        if image.prompt:
+            lines.append(f"Rendered from: {image.prompt}")
+        filmed_from = job.detail.get("video") or {}
+        if drawn := (filmed_from.get("drawn") or {}).get(str(image.index)):
+            lines.append(f"Starts on a picture by {filmed_from.get('picture', 'a picture model')}: {drawn}")
+        lines.append(f"File: {clip.path}")
+    elif image is not None:
         lines.append(f"Image {image.index}: seed {image.seed} · {image.width}x{image.height}")
         if image.prompt:
             lines.append(f"Rendered from: {image.prompt}")

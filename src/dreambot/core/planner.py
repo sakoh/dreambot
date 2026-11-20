@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import random
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -23,13 +23,14 @@ from typing import Any
 from PIL import Image
 
 from dreambot.config import Config
-from dreambot.core import enhance, fingerprint, lookbook, styles
+from dreambot.core import direct, enhance, fingerprint, lookbook, styles
 from dreambot.core.fingerprint import StyleFingerprint
 from dreambot.core.imaging import Canvas, Tile
-from dreambot.core.params import MAX_SEED, LoraRef, Params, parse_loras
+from dreambot.core.jobs import Clip
+from dreambot.core.params import MAX_SEED, LoraRef, Params, find_param, parse_loras
 from dreambot.core.prompt import ParsedPrompt
 from dreambot.core.settings import ResolvedSettings
-from dreambot.core.sizes import dimensions, snap, working_size
+from dreambot.core.sizes import aspect_of, dimensions, snap, video_dimensions, video_frames, working_size
 from dreambot.engine import loras as lora_library
 from dreambot.engine import weights as weights_module
 from dreambot.engine.protocol import GenerateRequest, Lora, Op
@@ -54,6 +55,18 @@ RETEXTURE_HOLD = 0.5
 #: the pictures as well where a model can take them; 3 uses the fingerprint's words alone.
 STYLE_LEGACY, STYLE_BLEND, STYLE_WORDS = 1, 2, 3
 DEFAULT_STYLE_VERSION = STYLE_BLEND
+#: Seconds an extension adds to a video unless ``--seconds`` says (Midjourney adds about four).
+EXTEND_SECONDS = 4.0
+#: How long a video may get by being extended. Midjourney stops at the same place: five
+#: seconds, extended four times.
+MAX_VIDEO_SECONDS = 21.0
+#: A video in HD is this much larger on each side: 1248x704 where the standard is 832x480.
+VIDEO_HD_SCALE = 1.5
+#: Parameters that shape a picture and have nothing to say about a video.
+_PICTURE_ONLY = (
+    "stylize", "chaos", "weird", "exp", "quality", "stop", "draft", "tile", "iw", "sw", "sv", "cw", "ow",
+    "niji", "style", "steps", "guidance", "strength", "negative",
+)  # fmt: skip
 
 
 class PlanError(Exception):
@@ -197,6 +210,12 @@ class Render:
     images: list[str] = field(default_factory=list)
     image_weights: list[float] | None = None
     mask: str | None = None
+    #: Video: the frames to make (or to add), their rate, an image to end on, and the video
+    #: to continue.
+    frames: int | None = None
+    fps: float | None = None
+    end_image: str | None = None
+    video: str | None = None
     loras: list[Lora] = field(default_factory=list)
     weights: str | None = None
     quantize: int | None = None
@@ -232,6 +251,10 @@ class Render:
             images=[*self.images, board] if board else self.images,
             image_weights=self.image_weights,
             mask=self.mask,
+            frames=self.frames,
+            fps=self.fps,
+            end_image=self.end_image,
+            video=self.video,
             loras=self.loras,
             weights=self.weights,
             quantize=self.quantize,
@@ -267,6 +290,13 @@ class Plan:
     #: Set when a language model should write art direction for each image before rendering
     #: (see :mod:`dreambot.core.enhance`). The renders above already work without it.
     brief: enhance.Brief | None = None
+    #: Set when a model on the Mac should say what happens in each video before it is made
+    #: (see :mod:`dreambot.core.direct`). The renders above already work without it.
+    shoot: direct.Shoot | None = None
+    #: Set for a video asked for in words alone: the plan of the pictures its videos start on,
+    #: one for each. They are made when the job runs, and the renders above, which start on
+    #: nothing yet, are then given one each (see :func:`started`).
+    first: Plan | None = None
     notes: list[str] = field(default_factory=list)
     detail: dict[str, Any] = field(default_factory=dict)
 
@@ -352,6 +382,8 @@ class ResolvedRefs:
     style: list[str] = field(default_factory=list)
     #: ``--sref`` codes, with the ``random`` ones already drawn.
     style_codes: list[str] = field(default_factory=list)
+    #: ``--end``: the image a video is to end on.
+    end: list[str] = field(default_factory=list)
     #: Every style ingredient in the order given, with its weight (style version 2 and up).
     #: Left empty, it is derived from ``style`` and ``style_codes`` at equal weights.
     sources: list[StyleSource] = field(default_factory=list)
@@ -483,6 +515,56 @@ def _closing(text: str, sentence: str) -> str:
         return text
     base = text.rstrip().rstrip(".")
     return f"{base}. {sentence}" if base else sentence
+
+
+def _videos(plan: Plan) -> list[tuple[Render, int, int]]:
+    """Every video of a plan, in order: the render that makes it, its seed and its number."""
+    return [
+        (render, seed, slot)
+        for render in plan.renders
+        for seed, slot in zip(render.seeds, render.slots, strict=True)
+    ]
+
+
+def filmed(plan: Plan, lines: Sequence[str]) -> Plan:
+    """A video plan with each of its videos given its own line of direction.
+
+    One render makes every video of a job from one prompt. Directed, each is made from its
+    own, so there is a render for each. ``lines`` are in the order of the videos.
+    """
+    shoot = plan.shoot
+    if shoot is None or not plan.renders:
+        return plan
+    renders = [
+        replace(
+            render,
+            prompt=direct.compose(shoot, lines[position] if position < len(lines) else ""),
+            seeds=[seed],
+            slots=[slot],
+        )
+        for position, (render, seed, slot) in enumerate(_videos(plan))
+    ]
+    return replace(plan, renders=renders, shoot=None)
+
+
+def started(plan: Plan, pictures: Mapping[int, str]) -> Plan:
+    """A video plan whose starting pictures have been made (:attr:`Plan.first`).
+
+    ``pictures`` are their files, by the number of the video each is for. Every video gets a
+    render of its own, which starts on its picture and, for a loop, comes back to it.
+    """
+    looping = bool((plan.detail.get("video") or {}).get("loop"))
+    renders = [
+        replace(
+            render,
+            image=pictures[slot],
+            end_image=pictures[slot] if looping else render.end_image,
+            seeds=[seed],
+            slots=[slot],
+        )
+        for render, seed, slot in _videos(plan)
+    ]
+    return replace(plan, renders=renders, first=None)
 
 
 # --------------------------------------------------------------------------------------
@@ -1735,6 +1817,466 @@ class Planner:
                 f"{family[0].title}: `dreambot models pull {family[0].id}`."
             )
         return ready
+
+    # ------------------------------------------------------------------- video ----
+
+    def video(
+        self,
+        parsed: ParsedPrompt,
+        settings: ResolvedSettings,
+        refs: ResolvedRefs | None = None,
+        *,
+        directions: Sequence[str] | None = None,
+        seeds: Sequence[int] | None = None,
+        allow_paths: bool = False,
+    ) -> Plan:
+        """Plan a prompt that asks for a video (``--video``).
+
+        With an image at the start of the prompt (or attached), the video starts on it, as in
+        Midjourney, where every video starts on a picture. Without one, a picture is made from
+        the words first, one for each video, and the videos start on those: the plan of those
+        pictures is the result's :attr:`Plan.first`, and they are made when the job runs.
+        ``directions`` and ``seeds`` plan them again once their art direction is written, as
+        for :meth:`imagine`. Everything that shapes a picture (``--sref``, ``--lora``,
+        ``--stylize``...) then shapes those.
+
+        ``--from words`` has the video model film the words itself instead, and so does a
+        person's setting or the config (``[video] picture_first``). A video that is given a
+        picture to end on and none to start on is filmed that way too: a start made from the
+        words would have nothing to do with where it has to end.
+        """
+        refs = refs or ResolvedRefs()
+        params = parsed.params
+        notes: list[str] = []
+        if len(refs.image_prompts) > 1:
+            notes.append("A video starts on one image; the first one was used.")
+        start = refs.image_prompts[0] if refs.image_prompts else None
+        end = refs.end[0] if refs.end else None
+        if not parsed.positive_text and start is None and end is None:
+            raise PlanError("Give me something to film: a description, an image to start on, or both.")
+        pictured = start is None and end is None and self._picture_first(params, settings)
+        asked = [
+            f"`--{name}`"
+            for name, given in (
+                ("edit", refs.edit or params.edit),
+                ("oref", params.oref),
+                ("cref", params.cref),
+                ("sref", params.sref),
+                ("p", params.personalize is not None),
+                ("lora", params.loras),
+            )
+            # What shapes a picture shapes the one a video from words starts on. `--edit` is
+            # different: it changes a picture that is already there.
+            if given and (name == "edit" or not pictured)
+        ]
+        if asked:
+            raise PlanError(
+                f"{' and '.join(asked)} shape{'s' if len(asked) == 1 else ''} a picture, and this asks for a video. "
+                "Make the picture first, then turn it into a video with `animate`."
+            )
+        picture_model: str | None = None
+        if pictured and params.model is not None and self.catalog.lookup(params.model).video is None:
+            # A picture model named in a video prompt is the one that makes the picture it starts on.
+            picture_model, params = params.model, replace(params, model=None)
+
+        def film(pictured: bool) -> Plan:
+            return self._video(
+                text=parsed.positive_text,
+                params=params,
+                hd=settings.video_hd,
+                videos=settings.videos,
+                start=start,
+                end=end,
+                avoid=parsed.negative_terms,
+                notes=list(notes),
+                directed=settings.enhance,
+                seeds=seeds,
+                pictured=pictured,
+            )
+
+        if not pictured:
+            return film(False)
+        plan = film(True)
+        try:
+            first = self._first_pictures(parsed, settings, refs, plan, picture_model, directions, allow_paths)
+        except PlanError as exc:
+            if picture_model or params.video_from or self._shapes_picture(parsed.params):
+                # A picture was asked for, or something only a picture can be given.
+                raise
+            # No model to make a picture with, say: the words can still be filmed as they are.
+            # (Not as a loop, which needs a picture to come back to: that says so itself.)
+            plan = film(False)
+            plan.notes.append(f"No picture could be made to start on, so the words were filmed. ({exc})")
+            return plan
+        plan.first = first
+        plan.notes.extend(first.notes)
+        plan.detail["video"]["picture"] = first.model
+        for key in ("style", "loras"):
+            if key in first.detail:
+                plan.detail[key] = first.detail[key]
+        return plan
+
+    def _picture_first(self, params: Params, settings: ResolvedSettings) -> bool:
+        """Whether a video asked for in words alone starts on a picture made from them."""
+        # What the prompt says, then what the person has set, then how Dreambot is set up.
+        if params.video_from is not None:
+            return params.video_from == "picture"
+        if settings.picture_first is not None:
+            return settings.picture_first
+        return self.config.video.picture_first
+
+    @staticmethod
+    def _shapes_picture(params: Params) -> bool:
+        """Whether a prompt asks for something only a picture can be given."""
+        return (
+            bool(params.oref or params.cref or params.sref or params.loras) or params.personalize is not None
+        )
+
+    def _first_pictures(
+        self,
+        parsed: ParsedPrompt,
+        settings: ResolvedSettings,
+        refs: ResolvedRefs,
+        plan: Plan,
+        model: str | None,
+        directions: Sequence[str] | None,
+        allow_paths: bool,
+    ) -> Plan:
+        """The plan of the pictures the videos of ``plan`` start on: the prompt as a picture prompt.
+
+        One picture for each video, with its seed, in the video's shape and at the size the
+        picture model draws best: a video takes its first frame from it scaled down.
+        """
+        shared = math.gcd(plan.width, plan.height)
+        params = replace(
+            parsed.params,
+            video=None,
+            motion=None,
+            loop=None,
+            end=[],
+            bs=None,
+            seconds=None,
+            video_from=None,
+            model=model,
+            count=len(plan.seeds),
+            # The video's own shape, which is the one asked for moved onto the video model's grid.
+            aspect=(plan.width // shared, plan.height // shared),
+            # `--hd` in a video prompt is the size of the video; its first frame needs no enlarging.
+            hd=False,
+        )
+        first = self.imagine(
+            replace(parsed, params=params),
+            settings,
+            refs,
+            directions=directions,
+            seeds=plan.seeds,
+            allow_paths=allow_paths,
+        )
+        return replace(first, finish=None)
+
+    def animate(
+        self,
+        *,
+        source: str,
+        text: str,
+        motion: str | None = None,
+        params: Params | None = None,
+        hd: bool | None = None,
+        videos: int | None = None,
+        end: str | None = None,
+        avoid: Sequence[str] = (),
+        directed: bool = True,
+        about: str = "",
+    ) -> Plan:
+        """Turn a picture into a video that starts on it (Midjourney's Animate).
+
+        ``text`` says what should happen. Empty, it is left to the director, the model on the
+        Mac that looks at the picture and says what moves (Midjourney's "auto"); ``directed``
+        says whether the person lets it, and ``about`` is the prompt the picture was made from,
+        which tells the director what it is looking at. ``hd`` and ``videos`` are the person's
+        settings for the size and the number of videos, where they have any.
+        """
+        params = params or Params()
+        if params.motion is None and motion is not None:
+            params = replace(params, motion=motion)
+        return self._video(
+            text=text,
+            params=params,
+            hd=hd,
+            videos=videos,
+            start=source,
+            end=end,
+            avoid=avoid,
+            notes=[],
+            directed=directed,
+            about=about,
+        )
+
+    def _video(
+        self,
+        *,
+        text: str,
+        params: Params,
+        hd: bool | None,
+        videos: int | None,
+        start: str | None,
+        end: str | None,
+        avoid: Sequence[str],
+        notes: list[str],
+        directed: bool = True,
+        about: str = "",
+        seeds: Sequence[int] | None = None,
+        pictured: bool = False,
+    ) -> Plan:
+        """Plan a new video. ``pictured`` says that the picture it starts on is still to be made."""
+        # What the prompt says, then what the person has set, then how Dreambot is set up.
+        hd = bool(next(value for value in (params.hd, hd, self.config.video.hd) if value is not None))
+        if params.loop:
+            if end is not None:
+                raise PlanError(
+                    "A video that loops ends on the frame it starts on, so `--loop` and `--end` can't both be given."
+                )
+            if start is None and not pictured:
+                raise PlanError(
+                    "`--loop` needs an image to start on and come back to: attach one, `animate` a picture "
+                    "with `--loop`, or leave out `--from words` so that one is made."
+                )
+            end = start
+        op = Op.IMG2VID if start is not None or end is not None or pictured else Op.TXT2VID
+        spec = self._video_model(params, op)
+        traits = spec.video
+        assert traits is not None
+        if end is not None and not params.loop and not traits.ends:
+            raise PlanError(
+                f"{spec.title} can start a video on a picture but can't lead one up to a picture, so `--end` "
+                "has nothing to work with. `--loop` makes a video that comes back to the picture it starts on."
+            )
+        if not pictured:
+            # (With a picture still to be made, what shapes a picture shapes that one.)
+            self._picture_only(params, notes)
+        count = params.bs or params.count or videos or self.config.video.count
+        seeds = list(seeds) if seeds else self._seeds(params, count)
+        seconds = params.seconds or self.config.video.seconds
+        frames = video_frames(
+            seconds, fps=traits.fps, step=traits.step, minimum=traits.carry, maximum=traits.max_frames
+        )
+        # Like a picture made from a picture: the shape of what it starts on, unless one is given.
+        shape = start or end
+        if params.aspect is not None or shape is None:
+            aspect = params.aspect or (16, 9)
+            ratio = aspect[0] / aspect[1]
+        else:
+            # (As the shape it would be called by: a 16:9 picture of Dreambot's is 1456x816, and
+            # is filmed at the size 16:9 is filmed at, not at the next one along.)
+            with Image.open(shape) as first:
+                across, down = aspect_of(first.width, first.height)
+            ratio = across / down
+        scale = VIDEO_HD_SCALE if hd else 1.0
+        try:
+            width, height = video_dimensions(ratio, native=spec.native, multiple=spec.multiple, scale=scale)
+        except ValueError as exc:
+            raise PlanError(str(exc)) from exc
+        motion = params.motion or self.config.video.motion
+        location, quantize = self._weights(spec)
+        shoot = direct.Shoot(
+            text=text,
+            count=count,
+            motion=motion,
+            start=start,
+            about=about,
+            seconds=frames / traits.fps,
+            loop=bool(params.loop),
+            avoid=self._avoided(spec, avoid, notes),
+        )
+        render = Render(
+            op=op,
+            model=spec.id,
+            # As it is made if nobody directs it: the words, and how much should move.
+            prompt=direct.compose(shoot, ""),
+            seeds=seeds,
+            slots=list(range(1, count + 1)),
+            width=width,
+            height=height,
+            image=start,
+            end_image=end,
+            frames=frames,
+            fps=traits.fps,
+            weights=location,
+            quantize=quantize,
+            # How much moves is said in the prompt, and it is also how a video model sets about
+            # a video that starts on a picture (from the picture held still, or from nothing).
+            extra={"motion": motion},
+        )
+        detail = {
+            "motion": motion,
+            "seconds": round(frames / traits.fps, 2),
+            **({"loop": True} if params.loop else {}),
+            **({"hd": True} if hd else {}),
+        }
+        return Plan(
+            model=spec.id,
+            op=op,
+            text=text,
+            width=width,
+            height=height,
+            seeds=seeds,
+            renders=[render],
+            source=start,
+            shoot=shoot if directed and not params.raw and direct.wanted(shoot) else None,
+            notes=notes,
+            detail={"video": detail},
+        )
+
+    def extend(
+        self,
+        *,
+        clip: Clip,
+        size: tuple[int, int],
+        text: str,
+        model: str = "",
+        motion: str | None = None,
+        params: Params | None = None,
+        avoid: Sequence[str] = (),
+        before: str = "",
+        directed: bool = True,
+        end: str | None = None,
+        videos: int | None = None,
+    ) -> Plan:
+        """Continue a video past its end (Midjourney's Extend).
+
+        The new frames follow from the video's last second, and ``text`` says what happens in
+        them. Empty, that is left to the director, who is shown the video's last frame and told
+        what it was made from (``before``); with no director, it goes on as it was going. With
+        ``end``, the new frames lead up to that picture: with ``--loop`` that picture is the
+        video's own first frame, and the caller passes it. The result is the whole video,
+        longer; it keeps its size and its frame rate. As many are made
+        as of any video (``videos`` is the person's setting): each is a different continuation.
+        """
+        params = params or Params()
+        notes: list[str] = []
+        made_by = self.catalog.registry.find(model) if model else None
+        if (
+            params.model is None
+            and made_by is not None
+            and made_by.supports(Op.EXTEND)
+            and self.catalog.is_installed(made_by)
+        ):
+            # By the model that made it, when that one is still there.
+            params = replace(params, model=made_by.id)
+        spec = self._video_model(params, Op.EXTEND)
+        traits = spec.video
+        assert traits is not None
+        self._picture_only(params, notes)
+        for name, given in (("ar", params.aspect), ("hd", params.hd)):
+            if given:
+                notes.append(
+                    f"`--{name}` is for a new video; an extension keeps the shape of the one it continues."
+                )
+        if clip.frames < traits.carry:
+            raise PlanError(
+                f"That video is too short to extend: it has {clip.frames} frames, and the next ones "
+                f"follow from its last {traits.carry}."
+            )
+        if end is not None and not traits.ends:
+            raise PlanError(
+                f"{spec.title} can't lead a video up to a picture, so an extension can't end on one "
+                "(`--end`), or come back to where the video started (`--loop`)."
+            )
+        seconds = params.seconds or EXTEND_SECONDS
+        added = traits.step * max(1, round(seconds * clip.fps / traits.step))
+        if added > traits.added:
+            added = traits.step * (traits.added // traits.step)
+            notes.append(
+                f"{spec.title} adds up to {added / clip.fps:.1f} seconds at a time, so that is what was added."
+            )
+        total = (clip.frames + added) / clip.fps
+        if total > MAX_VIDEO_SECONDS + 0.5:
+            raise PlanError(
+                f"That would make it {total:.0f} seconds long, and Dreambot extends a video up to "
+                f"{MAX_VIDEO_SECONDS:.0f}. It is {clip.seconds:.0f} seconds now."
+            )
+        count = params.bs or params.count or videos or self.config.video.count
+        seeds = self._seeds(params, count)
+        motion = params.motion or motion or self.config.video.motion
+        location, quantize = self._weights(spec)
+        shoot = direct.Shoot(
+            text=text,
+            count=count,
+            motion=motion,
+            clip=clip.path,
+            before=before,
+            seconds=added / clip.fps,
+            avoid=self._avoided(spec, avoid, notes),
+        )
+        render = Render(
+            op=Op.EXTEND,
+            model=spec.id,
+            prompt=direct.compose(shoot, ""),
+            seeds=seeds,
+            slots=list(range(1, count + 1)),
+            width=size[0],
+            height=size[1],
+            video=clip.path,
+            end_image=end,
+            frames=added,
+            fps=clip.fps,
+            weights=location,
+            quantize=quantize,
+            extra={"motion": motion},
+        )
+        detail = {
+            "motion": motion,
+            "seconds": round(total, 2),
+            "added": round(added / clip.fps, 2),
+            **({"loop": True} if params.loop else {}),
+        }
+        return Plan(
+            model=spec.id,
+            op=Op.EXTEND,
+            text=text,
+            width=size[0],
+            height=size[1],
+            seeds=seeds,
+            renders=[render],
+            shoot=shoot if directed and not params.raw and direct.wanted(shoot) else None,
+            notes=notes,
+            detail={"video": detail},
+        )
+
+    def _video_model(self, params: Params, op: Op) -> ModelSpec:
+        if params.model is not None:
+            spec = self.catalog.lookup(params.model)
+            self._require(spec, op)
+            return spec
+        spec = self.catalog.any_with(op, self.config.prefer.video)
+        if spec is None:
+            raise PlanError(
+                "Videos need a video model, and none is installed. On the Mac, run "
+                "`dreambot models pull wan-2.2` (about 17 GB)."
+            )
+        return spec
+
+    def video_model(self) -> ModelSpec | None:
+        """The model a video would be made by now, if one is installed."""
+        return self.catalog.any_with(Op.IMG2VID, self.config.prefer.video)
+
+    @staticmethod
+    def _picture_only(params: Params, notes: list[str]) -> None:
+        """Say which of the parameters given shape pictures and were left out of a video."""
+        given = params.given()
+        idle = [f"`--{name}`" for name in _PICTURE_ONLY if (spec := find_param(name)) and spec.dest in given]
+        if idle:
+            listed = idle[0] if len(idle) == 1 else ", ".join(idle[:-1]) + f" and {idle[-1]}"
+            notes.append(
+                f"{listed} shape{'s' if len(idle) == 1 else ''} pictures and did nothing for this video."
+            )
+
+    @staticmethod
+    def _avoided(spec: ModelSpec, avoid: Sequence[str], notes: list[str]) -> tuple[str, ...]:
+        """What to keep out of a video. It is said in the prompt: these models take no negative prompt."""
+        if avoid:
+            notes.append(f"{spec.title} has no negative prompt, so `--no` is best-effort.")
+        return tuple(avoid)
 
     # -------------------------------------------------------------------- edit ----
 

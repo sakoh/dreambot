@@ -458,6 +458,44 @@ async def test_oversized_files_are_sent_as_jpeg(server: Server, tmp_path: Path, 
     assert server.visible[-1].files[0].endswith(".jpg")
 
 
+async def test_videos_are_uploaded_as_videos_and_shrunk_to_what_discord_takes(server: Server, monkeypatch):
+    import dreambot.frontends.discord_bot as module
+
+    server.service.config.video.count = 1  # four are made unless something says otherwise
+    await server.slash("imagine", prompt="a fox running --video --seconds 1")
+    job = server.service.store.recent_jobs(limit=1)[0]
+    sent = server.visible[-1]
+    assert job.kind is JobKind.VIDEO and sent.files == [Path(job.clip(1).path).name]
+    assert sent.labels() == ["Extend (Low motion)", "Extend (High motion)", "❤️", "🔄"]
+    assert "Video (low motion)" in sent.content
+
+    await server.press(sent, "Extend (Low motion)")
+    longer = server.service.store.recent_jobs(limit=1)[0]
+    assert longer.kind is JobKind.EXTEND and server.visible[-1].files == [Path(longer.clip(1).path).name]
+
+    # Under a picture, Animate shares the last of Discord's five rows.
+    await server.slash("imagine", prompt="a fox --n 1")
+    picture = server.visible[-1]
+    assert {"Animate (Low motion)", "Animate (High motion)", "Retexture"} <= set(picture.labels())
+    assert len({item.row for item in picture.view.children}) == 5
+    await server.press(picture, "Animate (High motion)")
+    animated = server.service.store.recent_jobs(limit=1)[0]
+    assert animated.kind is JobKind.ANIMATE and animated.detail["video"]["motion"] == "high"
+
+    # A video over the upload limit is sent as a smaller copy, never as a picture of itself.
+    asked: list[int] = []
+
+    def smaller(source, out, *, limit):
+        asked.append(limit)
+        Path(out).write_bytes(b"smaller")
+        return Path(out)
+
+    monkeypatch.setattr(module, "UPLOAD_LIMIT", 1000)
+    monkeypatch.setattr(module.video, "fit", smaller)
+    await server.slash("imagine", prompt="a fox walking --video --seconds 1 --bs 1")
+    assert asked == [1000] and server.visible[-1].files[0].endswith(".mp4")
+
+
 # --------------------------------------------------------------------------------------
 # What only the real Discord does
 # --------------------------------------------------------------------------------------

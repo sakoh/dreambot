@@ -414,3 +414,221 @@ async def test_the_language_model_art_directs_a_prompt(mlx_engine: Engine):
     assert all(wild) and len(set(wild)) == 4, wild
     words = " ".join(wild).lower().split()
     assert len(set(words)) > len(words) * 0.4, f"the model is looping: {wild}"
+
+
+# --------------------------------------------------------------------------------------
+# Video: Wan 2.2 through Dreambot's own engine (skipped unless its weights are installed)
+# --------------------------------------------------------------------------------------
+
+VIDEO = "wan-2.2"
+
+
+def video_request(tmp_path: Path, op: Op, **overrides) -> GenerateRequest:
+    """A short video at the model's own size: two seconds of 832x480."""
+    values = {
+        "op": op,
+        "prompt": "A red fox trots through fresh snow at golden hour, the camera tracking beside it",
+        "width": 832,
+        "height": 480,
+        "frames": 49,
+        "fps": 24,
+        "seeds": [5],
+        "basename": "video",
+    }
+    return request(tmp_path, VIDEO, **{**values, **overrides})
+
+
+def frame_difference(one: Image.Image, other: Image.Image) -> float:
+    """How far apart two frames are, from 0 (the same picture) to 255."""
+    size = (256, 160)
+    stat = ImageStat.Stat(
+        ImageChops.difference(one.convert("RGB").resize(size), other.convert("RGB").resize(size))
+    )
+    return sum(stat.mean) / 3
+
+
+def colours(picture: Image.Image) -> tuple[float, float]:
+    """How much contrast and how much colour a picture has."""
+    y, cb, cr = (ImageStat.Stat(band) for band in picture.convert("YCbCr").resize((256, 160)).split())
+    return y.stddev[0], (cb.stddev[0] + cr.stddev[0]) / 2
+
+
+async def test_wan_films_from_words_from_a_picture_and_continues(
+    mlx_engine: Engine, tmp_path: Path, photo: str
+):
+    from dreambot.core import video
+
+    installed(VIDEO)
+    events = []
+    made = await mlx_engine.generate(
+        video_request(tmp_path, Op.TXT2VID, basename="words"), on_event=events.append
+    )
+    (clip,) = made.images
+    info = video.probe(clip.video)
+    assert (info.width, info.height, info.frames, info.fps, info.sound) == (832, 480, 49, 24.0, False)
+    assert (clip.width, clip.height, clip.frames, clip.sound) == (832, 480, 49, False)
+    assert looks_like_a_picture(clip.path), "the picture it starts on"
+    moved = frame_difference(video.first_frame(clip.video), video.last_frame(clip.video))
+    assert moved > 3, "something happens between the first frame and the last"
+    # The three passes are reported as they run; the fourth step is the writing.
+    assert [(event.step, event.total) for event in events if isinstance(event, Progress)] == [
+        (step, 4) for step in (1, 2, 3)
+    ]
+    assert [type(event) for event in events[:2]] == [Loading, Loaded]
+    with Image.open(clip.path) as still:
+        notes = json.loads(still.text["dreambot"])
+    assert notes["model"] == VIDEO and notes["seed"] == 5 and notes["frames"] == 49
+    print(f"\n[video] words: {made.seconds:.1f}s (load {made.load_seconds or 0:.1f}s), moved {moved:.1f}")
+
+    # The same prompt and seed again give the same video, and the prompt is not read twice.
+    began = time.perf_counter()
+    again = await mlx_engine.generate(video_request(tmp_path, Op.TXT2VID, basename="again"))
+    assert again.load_seconds is None, "the model stays loaded between videos"
+    assert frame_difference(video.last_frame(again.images[0].video), video.last_frame(clip.video)) < 1
+    print(f"[video] the same again: {time.perf_counter() - began:.1f}s")
+
+    # From a picture: it is the first frame, and the frames after it keep its colours.
+    began = time.perf_counter()
+    started = await mlx_engine.generate(
+        video_request(
+            tmp_path, Op.IMG2VID, image=photo, prompt="Clouds drift over the field.", basename="picture"
+        )
+    )
+    (from_picture,) = started.images
+    with Image.open(photo) as source:
+        # (The picture is 3:2 and the video 16:9: it is scaled to cover the frame and cut to it.)
+        shown = source.convert("RGB").resize((832, 555)).crop((0, 37, 832, 517))
+    first, last = video.first_frame(from_picture.video), video.last_frame(from_picture.video)
+    assert frame_difference(first, shown) < 8, "it starts on the picture"
+    (contrast, colour), (contrast_after, colour_after) = colours(first), colours(last)
+    print(
+        f"[video] picture: {time.perf_counter() - began:.1f}s; contrast {contrast:.0f} -> {contrast_after:.0f}, "
+        f"colour {colour:.0f} -> {colour_after:.0f}"
+    )
+    assert abs(contrast_after - contrast) < 0.35 * contrast and abs(colour_after - colour) < 0.5 * colour + 4
+
+    # Continued: the video as it was, to the pixel, and a second more.
+    began = time.perf_counter()
+    longer = await mlx_engine.generate(
+        video_request(tmp_path, Op.EXTEND, video=clip.video, frames=24, basename="longer")
+    )
+    (extended,) = longer.images
+    assert extended.frames == 49 + 24 == video.probe(extended.video).frames
+    before, after = video.pixels(clip.video), video.pixels(extended.video)
+    assert after[: len(before)] == before, "what was there is not encoded again"
+    size = (832, 480)
+    joint = [
+        Image.frombytes("RGB", size, after[number * 832 * 480 * 3 : (number + 1) * 832 * 480 * 3])
+        for number in (47, 48, 49, 50, 72)
+    ]
+    step_before, step_at, step_after = (frame_difference(joint[i], joint[i + 1]) for i in range(3))
+    print(
+        f"[video] continued by a second: {time.perf_counter() - began:.1f}s; frame to frame "
+        f"{step_before:.1f} before the joint, {step_at:.1f} at it, {step_after:.1f} after"
+    )
+    assert step_at < 3 * max(step_before, step_after, 1.0), "it goes on without a jump"
+    assert frame_difference(joint[2], joint[4]) > 1, "and something happens in what was added"
+
+
+async def test_a_video_is_stopped_between_passes_and_the_next_one_still_runs(
+    mlx_engine: Engine, tmp_path: Path
+):
+    from dreambot.core import video
+
+    installed(VIDEO)
+    req = video_request(tmp_path, Op.TXT2VID, frames=121, seeds=[1, 2, 3, 4], basename="stopped")
+    under_way = asyncio.Event()
+    task = asyncio.create_task(
+        mlx_engine.generate(
+            req, on_event=lambda e: under_way.set() if isinstance(e, Progress) and e.step >= 1 else None
+        )
+    )
+    await asyncio.wait_for(under_way.wait(), 180)
+    began = time.perf_counter()
+    await mlx_engine.cancel(req.id)
+    with pytest.raises(EngineCancelled):
+        await asyncio.wait_for(task, 60)
+    took = time.perf_counter() - began
+    print(f"\n[video] stopped {took:.2f}s after the request")
+    assert took < 10, "it stops at the next pass, not at the end of the video"
+    assert not list(tmp_path.glob("stopped*.mp4")), "nothing is left of the one that was stopped"
+
+    after = await mlx_engine.generate(video_request(tmp_path, Op.TXT2VID, frames=25, basename="after"))
+    assert video.probe(after.images[0].video).frames == 25
+
+
+async def test_wan_loop_moves_and_comes_back_to_its_first_frame(
+    mlx_engine: Engine, tmp_path: Path, photo: str
+):
+    """The model cannot be led back to a picture, so the way out is filmed and played back."""
+    from dreambot.core import video
+
+    installed(VIDEO)
+    prompt = "The clouds are drifting to the right, and the grass is swaying."
+    loop = await mlx_engine.generate(
+        video_request(
+            tmp_path, Op.IMG2VID, image=photo, end_image=photo, prompt=prompt, frames=73, basename="loop"
+        )
+    )
+    (clip,) = loop.images
+    assert clip.frames == 73
+    first, last = video.first_frame(clip.video), video.last_frame(clip.video)
+    away, back = frame_difference(first, video.frame(clip.video, 36)), frame_difference(first, last)
+    print(f"\n[video] loop: {away:.1f} from its first frame halfway, {back:.1f} at the end")
+    assert away > 1.5, "it moves"
+    assert back < 1.5, "and ends on the frame it started on"
+
+
+async def test_wan_makes_the_other_shapes_and_the_larger_size(mlx_engine: Engine, tmp_path: Path):
+    from dreambot.core import video
+
+    installed(VIDEO)
+    for width, height in ((480, 832), (608, 608), (1248, 704)):
+        began = time.perf_counter()
+        made = await mlx_engine.generate(
+            video_request(tmp_path, Op.TXT2VID, width=width, height=height, frames=25, basename=f"s{width}")
+        )
+        (clip,) = made.images
+        info = video.probe(clip.video)
+        assert (info.width, info.height, info.frames) == (width, height, 25)
+        assert looks_like_a_picture(clip.path), (width, height)
+        print(f"\n[video] {width}x{height}, one second: {time.perf_counter() - began:.1f}s")
+
+
+async def test_the_vision_model_directs_a_picture(mlx_engine: Engine, photo: str):
+    """What the director is asked, answered by the real model: the one /describe uses."""
+    from dreambot.config import Config
+    from dreambot.core import direct
+    from dreambot.core.planner import Catalog
+    from dreambot.engine.protocol import DescribeRequest
+
+    director = Catalog(Config()).vision_model()
+    if director is None:
+        pytest.skip("no vision model is installed")
+
+    async def ask(shoot: direct.Shoot) -> list[str]:
+        look = DescribeRequest(
+            id=new_request_id(),
+            image=photo,
+            count=shoot.count,
+            weights=director,
+            instruction=direct.instruction(shoot),
+            max_tokens=direct.LINE_TOKENS,
+            seed=3,
+        )
+        return direct.parse(await mlx_engine.describe(look), shoot)
+
+    low = direct.Shoot(text="", count=2, motion="low", start=photo)
+    lines = await ask(low)
+    print("\n[director] low: " + " | ".join(lines))
+    # A line for each video, or none where the model had no more to say: the picture is a sky,
+    # a field and a sun, and a video with no line is given a fixed sentence instead.
+    written = [line for line in lines if line]
+    assert len(lines) == 2 and written and len(set(written)) == len(written)
+    for line in written:
+        assert 5 <= len(line.split()) <= direct.MAX_WORDS and "ing" in line, line
+    assert lines == await ask(low), "the same seed gives the same direction"
+
+    (high,) = await ask(direct.Shoot(text="a bird flies past", count=1, motion="high", start=photo))
+    print("[director] high: " + high)
+    assert "camera" in high.lower(), "high motion says what the camera does"

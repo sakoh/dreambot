@@ -1,8 +1,8 @@
 # Dreambot
 
 A free, open-source alternative to Midjourney that runs **completely locally and privately on your Mac**.
-Text it from **iMessage**, **Discord** or **Telegram**, or open its **web app**; it answers with images made
-on your own GPU by [MLX](https://github.com/ml-explore/mlx) models.
+Text it from **iMessage**, **Discord** or **Telegram**, or open its **web app**; it answers with images and
+videos made on your own GPU by [MLX](https://github.com/ml-explore/mlx) models.
 
 ```
 you:       a red fox in the snow, golden hour --ar 16:9 --chaos 20
@@ -10,6 +10,7 @@ dreambot:  [grid of four images]   U1 U2 U3 U4 🔄   V1 V2 V3 V4
 you:       V3            → four variations of image 3
 you:       upscale 2     → image 2 at twice the size
 you:       zoom 2x · pan left · region the sky: an aurora · edit: make it night
+you:       animate 2     → image 2 set in motion: four five-second videos
 ```
 
 No account, no subscription, no cloud. Prompts and images never leave the Mac except through the chat
@@ -23,20 +24,24 @@ Lookbook, and a plain prompt.*
 > **Status: early (0.1).** The core, the command line and the image pipeline are verified on real models,
 > and all three bots (Telegram, Discord and iMessage) have been used on the live services. Not every
 > button and command has been pressed on each of them yet. The web app has been driven end to end in
-> WebKit. See [what is verified](#what-is-verified).
+> WebKit. Video is new: it has been run on real weights on one Mac, and no video has been sent through
+> a live chat service yet. See [what is verified](#what-is-verified).
 
 ## Contents
 
 - [Requirements](#requirements) · [Install](#install) · [Quick start](#quick-start)
-- [Models](#models) · [LoRAs](#loras) · [Prompts and parameters](#prompts-and-parameters) · [The prompt enhancer](#the-prompt-enhancer) · [Styles and Lookbooks](#styles-and-lookbooks) · [Working with results](#working-with-results)
+- [Models](#models) · [LoRAs](#loras) · [Prompts and parameters](#prompts-and-parameters) · [The prompt enhancer](#the-prompt-enhancer) · [Styles and Lookbooks](#styles-and-lookbooks) · [Working with results](#working-with-results) · [Video](#video)
 - [Web app](#web-app) · [Chat frontends](#chat-frontends): [Telegram](#telegram) · [Discord](#discord) · [iMessage](#imessage)
 - [Privacy](#privacy) · [How it works](#how-it-works) · [Midjourney parity](#midjourney-parity) · [Development](#development)
 
 ## Requirements
 
 - A Mac with Apple Silicon. 16 GB of memory runs the small models; 32 GB or more is comfortable.
+  [Video](#video) takes about 17 GB for a second or two while it reads a prompt and about 8 GB after
+  that; it has only been run on a Mac with 96 GB.
 - macOS 14 or newer, and [uv](https://docs.astral.sh/uv/) (Python 3.11+ is fetched by uv if needed).
-- Disk space for models: from 5 GB for a small quantized model to 30 GB+ for the largest.
+- Disk space for models: from 5 GB for a small quantized model to 30 GB+ for the largest, and 17 GB more
+  for video.
 
 ## Install
 
@@ -55,19 +60,22 @@ dreambot models pull z-image-turbo        # ~11 GB; skip if you already use mflu
 dreambot imagine "an astronaut tending a rooftop garden above a neon city at dusk --ar 16:9"
 dreambot web                              # the web app, in your browser
 dreambot chat                             # the full chat experience in your terminal
+
+dreambot models pull wan-2.2              # optional, 17 GB: video
+dreambot imagine "a red fox trotting through fresh snow at dawn --video"
 ```
 
-Images are saved to `~/Pictures/Dreambot/<date>/`. On an M5 Ultra a grid of four 1-megapixel images takes
-about 30 seconds with Z-Image Turbo.
+Images and videos are saved to `~/Pictures/Dreambot/<date>/`. On an M5 Ultra a grid of four 1-megapixel images takes
+about 30 seconds with Z-Image Turbo, and four five-second videos take about a minute and a half.
 
 Dreambot shares the standard Hugging Face cache with [mflux](https://github.com/mflux-community/mflux), so
 models you already downloaded for mflux are picked up automatically and nothing is stored twice.
 
 ## Models
 
-Dreambot drives **every image model mflux implements** — 52 of them — through one interface, and picks a
-suitable installed model for each kind of request. `dreambot models list --all` shows the full table with
-licenses; the families are:
+Dreambot drives **every image model mflux implements** — 52 of them — and one video model through
+one interface, and picks a suitable installed model for each kind of request. `dreambot models list --all`
+shows the full table with licenses; the families are:
 
 | Family | Models | Used for |
 | --- | --- | --- |
@@ -81,6 +89,7 @@ licenses; the families are:
 | Ming-Image Design | | graphic design with transparency |
 | FIBO, FIBO 2 | generate, edit, background removal | structured prompting |
 | SeedVR2 | 3B, 7B | faithful upscaling |
+| Wan 2.2 | TI2V-5B, in FastVideo's three-step build | **[video](#video)**: from words, from a picture, and continued |
 
 ```sh
 dreambot models                      # what is installed
@@ -89,6 +98,7 @@ dreambot models info flux2-klein-4b  # details for one model
 dreambot models pull flux2-klein-4b  # download (picks a quantization that suits this Mac)
 dreambot models pull seedvr2-3b      # the upscaler behind Upscale (Subtle) and --hd
 dreambot models pull describe        # the vision model behind /describe and /shorten
+dreambot models pull wan-2.2         # video
 ```
 
 A good starting set is **`z-image-turbo`** (generation), **`flux2-klein-4b`** (edits, references, zoom and pan)
@@ -96,9 +106,12 @@ and **`seedvr2-3b`** (upscaling): about 27 GB together, all Apache-2.0. **`z-ima
 (15 GB, Apache-2.0) adds [Retexture](#retexture).
 
 **Licenses.** Dreambot is MIT, but each model has its own license, and many are non-commercial
-(`dreambot models list --all` marks them). Every operation has at least one Apache/MIT option.
+(`dreambot models list --all` marks them). Every picture operation has at least one Apache/MIT option,
+and so has video: Wan 2.2 and the build of it that Dreambot runs are Apache 2.0, as is the text encoder
+that reads its prompts, and the small autoencoder that decodes its frames is MIT.
 
-Other MLX image libraries (for example the generators in `mlx-vlm`, or SDXL ports) are not integrated yet.
+Other MLX image libraries (for example the generators in `mlx-vlm`, or SDXL ports) are not integrated yet,
+and neither are other video models (LTX-2, HunyuanVideo, the larger Wan models).
 
 ## LoRAs
 
@@ -175,12 +188,12 @@ a lighthouse at dusk, oil painting --ar 3:2 --stylize 250 --no people --seed 42
 
 | | Parameters |
 | --- | --- |
-| **Native** — same behaviour, done by the local model | `--ar` `--seed` `--sameseed` `--repeat` `--stop` `--raw` `--no` `--edit` |
+| **Native** — same behaviour, done by the local model | `--ar` `--seed` `--sameseed` `--repeat` `--stop` `--raw` `--no` `--edit` `--video` `--loop` `--bs` |
 | **Art direction** — done by [the prompt enhancer](#the-prompt-enhancer) | `--stylize` `--chaos` `--weird` `--exp` |
-| **Approximated** — Midjourney's version lives inside its own model | `--quality` `--hd` `--draft` `--iw` `--sref` `--sw` `--sv` `--p` `--cref` `--cw` `--oref` `--ow` `--niji` |
+| **Approximated** — Midjourney's version lives inside its own model | `--quality` `--hd` `--draft` `--iw` `--sref` `--sw` `--sv` `--p` `--cref` `--cw` `--oref` `--ow` `--niji` `--motion` |
 | **Accepted, no effect locally** | `--v` `--fast` `--relax` `--turbo` `--stealth` `--public` `--preview` |
-| **Planned** | `--tile` `--video` `--motion` `--loop` `--end` `--bs` |
-| **Dreambot extensions** | `--model` `--steps` `--cfg` `--strength` `--lora` `--neg` `--n` |
+| **Planned** | `--tile` `--end` |
+| **Dreambot extensions** | `--model` `--steps` `--cfg` `--strength` `--lora` `--neg` `--n` `--seconds` `--from` |
 
 Also supported: permutations (`a {red, blue} bird --ar {1:1, 16:9}` makes four jobs), multi-prompts with
 weights (`space:: ship::2`), image prompts (attach an image or start the prompt with a link), and the em
@@ -194,6 +207,7 @@ dash that iPhones substitute for `--`.
 | `her portrait as an astronaut --oref` | keep this person or object |
 | `a cottage on a cliff --sref` | borrow the image's style, not its content |
 | `a castle` (image attached, no flag) | use it as an image prompt |
+| `it starts to snow --video` | make [videos](#video) that start on it |
 
 With several attachments, `@1`, `@2` pick which is which: `... --oref @1 --sref @2`. Styles blend by
 weight — see [Styles and Lookbooks](#styles-and-lookbooks).
@@ -337,6 +351,8 @@ buttons — you can type the same things:
 | `region the sky: an aurora` | …or describe the part instead |
 | `edit: make it night` | change the whole image by instruction |
 | `retexture --lora pixel-art` | draw it again in another look, keeping its layout ([Retexture](#retexture)) |
+| `animate`, `animate high`, `animate: she waves` | set it in motion: four five-second videos ([Video](#video)) |
+| `extend`, `extend: it starts to rain` | make a video four seconds longer |
 | `look: autumn diner` | add the image to that Lookbook (and start it, if it is new) |
 | `fav`, `info`, `cancel` | favourite, show seed and job id, cancel |
 
@@ -385,6 +401,170 @@ it keeps the layout exactly and irons the look flat: the pixel-art LoRA then dra
 it for a quarter of them, it draws crisp pixel art and loses the small things: the lighthouse stays, the
 keeper goes.
 
+## Video
+
+Dreambot makes short videos with an open video model, [Wan 2.2](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B)
+(the 5-billion-parameter one, in [FastVideo's three-step build for Apple Silicon](https://huggingface.co/FastVideo/FastMetal-5B-QAD)),
+the way Midjourney makes them: a video starts on a picture.
+
+```
+animate 2                                         a picture Dreambot made, set in motion
+it starts to snow --video                         (with an image attached) videos that start on your image
+a red fox trotting through fresh snow --video     the words are drawn first, and a video starts on each picture
+extend                                            a video, four seconds longer
+```
+
+```sh
+dreambot models pull wan-2.2      # 17 GB: the model (5 GB) and the text encoder that reads its prompts (11 GB)
+```
+
+The model, the build, the text encoder and the small decoder are all Apache 2.0 or MIT.
+
+![One frame a second from six videos: a cat animated at low motion, at high motion and as a loop, and extended twice until it jumps down; a lighthouse keeper at high motion; and a fox made from words](docs/screenshots/video.jpg)
+
+*One frame a second from six videos made on Wan 2.2. The first four start on the same picture.*
+
+A prompt makes **four videos**, as it does in Midjourney: results differ a good deal from one to the next.
+`--bs 1`, `2` or `4` says how many; *Videos per prompt* in the web app's settings, or `/settings videos 1`,
+says it for every prompt. Each is five seconds long at 24 frames a second, silent, and an MP4 beside your
+pictures. It has the shape of the picture it starts on: 832×480 for 16:9, about the size Midjourney's
+are. On an M5 Ultra a video takes about ten seconds, so four of a picture take about 40, and four from
+words about a minute and a half, because the words are drawn first. They are made one after another,
+and in the web app each can be watched as soon as it is made.
+
+| Type | What happens |
+| --- | --- |
+| `animate 2` | image 2 as videos: the image is their first frame |
+| `animate 2 high` | …with a lot of movement, and a camera that moves too |
+| `animate 2: she turns to the camera and smiles` | …doing what you say |
+| `animate 2 --loop` | …ending on the frame they start on, to play round and round |
+| `extend` | the video, four seconds longer, going on as it was going |
+| `extend: it starts to rain` | …with what happens next in your words; also `extend high`, `extend --seconds 2` |
+| `R`, `fav`, `info` | as for a picture: run it again, like it, see what it was made from |
+
+| Parameter | |
+| --- | --- |
+| `--video` | Film this prompt. Any parameter below says so too. |
+| `--motion low`, `high` | How much moves. Low (the default): the frame stays where it is, and what is in it moves. High: the camera moves too, and more happens. High goes wrong more often, as it does in Midjourney. |
+| `--loop` | End on the frame it starts on, to play round and round. Half of a loop is filmed, and the other half is that half played backwards, so it always closes. |
+| `--bs 1…4` | How many videos (four unless you say). `--n` does the same. |
+| `--seconds 1…5` | How long. `extend --seconds` is how much is added (four seconds unless you say); a video can be extended up to 21 seconds. |
+| `--hd` | 1248×704 instead of 832×480, in about three times the time. *Resolution* in the web app's settings, or `/settings video-hd on`, says it for every prompt. |
+| `--ar` | The shape of a video made from words: 16:9 unless you say, and at most 3:1 either way. |
+| `--from picture`, `words` | What a video with no image starts on (see below). |
+| `--raw` | Film your words as they are (see below). |
+
+Midjourney's ending frame (`--end`) is not there: this model can start a video on a picture and cannot
+be led up to one. Held to a picture as its last frame, it filmed what it would have filmed anyway and
+cut to the picture a fifth of a second before the end. `--end` says so.
+
+**Low and high motion.** Told in words that the camera holds still, this model moved in on two hikers
+on a ridge all the same, ten times of ten: three steps without guidance follow a prompt only so far.
+So `--motion` is also how a video is begun. At low motion it starts as its picture, held still, under
+the noise the model works from, and the model keeps the frame where it is and moves what is in it. At
+high motion it starts as noise alone, and the camera goes where the model takes it. Measured over five
+pictures, two videos each way, the frame travelled about ten times as far in five seconds at high
+motion as at low. Low is for a picture that should come alive as it is. An action that would take its
+subject out of the frame (*they walk on down the ridge*) is only begun at low motion; ask for high.
+
+**From words.** Midjourney makes a video from a picture and from nothing else: you make the picture,
+then animate it. `a red fox trotting through fresh snow --video` does both steps. The words are drawn
+first, by your picture model and as any prompt is (art direction, `--stylize`, `--sref`, `--lora`, a
+Lookbook, a picture model named with `--model`), one picture for each video. Each video then starts on
+its own picture, so the four are four different takes. The pictures take about ten seconds each; the
+web app shows each in its video's place until the video is made.
+
+A video model can also be given the words alone, with nothing to start on: `--from words`, or *From
+words → Words alone* in the web app, or `/settings picture-first off` for every prompt. It is half the
+time (four in 44 seconds) and the weaker way. Asked for *two polar bears fighting in the octagon*, Wan
+2.2 on its own made two polar bears wrestling in all four videos, in a boxing ring with ropes in two
+of them and against a blue wall in the other two, and in its own bright, saturated colours. Started on
+pictures of two polar bears in an octagon, eight videos of eight were in the cage or on the mat that
+was drawn, and looked the way the picture model draws. What only words can say (something that is not
+there at the start and arrives, a change over time) is what `--from words` is for.
+
+Buttons: under a picture, Discord and Telegram have **Animate (Low motion)** and **Animate (High motion)**;
+under a video, **Extend (Low motion)** and **Extend (High motion)**. Several videos arrive one message
+each, so that each has its own buttons. What works on pictures only (variations, upscales, zoom, pan,
+edits, retexture) says so when it is tried on a video. With an image of your own to start on, `--sref`,
+`--oref`, `--p` and `--lora` have nothing to shape and are refused: the picture is already made.
+
+**In the web app** video is where Midjourney's site has it:
+
+- A picture's lightbox has **Animate Image**: *Auto* (low or high motion), *Loop* (low or high), and
+  *Animate manually…*, which puts the picture in the prompt bar as the starting frame with its prompt, to
+  change before you send it. The feed's tiles have an animate button of their own.
+- A video's lightbox has **Extend Video**: *Auto* (low or high), and *Extend manually…*, which puts the
+  video in the prompt bar, where the words can be changed and how much is added chosen.
+- The prompt bar's **Video** button films what is in the bar: with a picture in the *Starting frame* box
+  it starts on that; with words alone it draws one first.
+- In the feed a video is shown by its last frame (its first is the picture it came from). It plays while
+  the pointer is over it. Hold ⌘ or Ctrl and move across one, and every video of that prompt is held at
+  the same moment, to compare them. Right-click a video to download it, or a GIF of it.
+- The settings panel has *Videos per prompt* (1, 2, 4), *Resolution* (SD, HD) and *From words*.
+
+| | |
+| --- | --- |
+| ![The Create page with the Video button lit and a prompt of four videos part-way: two are made, two are still shown by the pictures they will start on](docs/screenshots/video-feed.jpg) | ![A picture in the lightbox, with Animate Image under its other actions: Auto and Loop, each at low or high motion, and Animate manually](docs/screenshots/video-animate.jpg) |
+| Four videos from one prompt of words, part-way: two are made, and two are still shown by the pictures they will start on | **Animate Image** in a picture's lightbox |
+| ![The prompt bar with the Video button lit: a picture as the starting frame, low or high motion, loop and length, and a box for a starting frame](docs/screenshots/video-bar.jpg) | ![The lightbox with a video of a fox: what it was rendered from, the picture it starts on, and Extend Video beside it](docs/screenshots/video-lightbox.jpg) |
+| *Animate manually…*: the picture is in the prompt bar as the starting frame, with its prompt to change | A video in the lightbox, with what the director wrote for it and **Extend Video** |
+
+**The director.** A picture says what is in it and nothing about what happens next. Midjourney's
+Animate writes the motion prompt itself, from the image and the prompt it was made from. Dreambot does
+the same with the vision model on your Mac (the one `/describe` uses: `dreambot models pull describe`):
+before a video is made it is shown the starting frame, told what the picture was made from, and writes
+one line saying what moves. The video model is given the picture's own prompt, then that line:
+
+```
+animate 2          a ginger cat sitting on a windowsill beside a steaming cup of tea, rain on the
+                   window. The cat's whiskers are twitching slightly. The camera stays still.
+animate 2 high     a ginger cat sitting on a windowsill beside a steaming cup of tea, rain on the
+                   window. The ginger cat is turning its head as it sniffs the steaming tea, its fur
+                   swaying slightly in the breeze. The camera is panning slowly to the right, keeping
+                   the cat in view.
+```
+
+The picture's prompt is there because a model that is told only what moves is free with everything
+else: told that waves were breaking at the foot of a lighthouse and no more, it put a hand and a glass
+of water in front of the lighthouse. `--motion` is what the director is told about how much should
+move. Your own words are never rewritten or dropped: its line is added after them, and what you asked
+for is not toned down to suit. `info` shows what it wrote. Each video of a prompt gets a line of its
+own, from its own picture. A video filmed from words alone is directed from the words. `extend` with
+nothing said continues from the prompt the video was made from, as Midjourney's Extend Auto does, and
+nobody is asked; `extend: …` with words of yours is directed from the video's last frame. `--raw` films
+your words as they are, and `/settings enhance off` switches the director off along with
+[the prompt enhancer](#the-prompt-enhancer); then a fixed sentence says how much should move. It adds
+a second or two to a job.
+
+**What to expect.** Low motion is the dependable one. Tried on five pictures of different kinds (two
+hikers in a wide landscape, a portrait, a lake with nobody in it, a cat, a watercolour fox), two videos
+each: the frame stayed where it was in all ten, and what was in it moved gently and stayed itself. The
+hikers shifted their weight, the woman turned her head to the camera, mist drifted over the lake, steam
+rose from the cup and the cat looked round, the fox turned its head, still a watercolour. One of the
+lake's two grew a twig in the foreground for two seconds. High motion did something coherent in all ten
+as well and strays further: the camera closed in on the hikers, the woman turned and walked towards it,
+the cat turned its back on the window, and the fox walked up through the birches and, in one of its
+two, was less of a watercolour by the time it arrived. Like every video model it is weakest where it
+has to invent what the picture does not show.
+
+The model has a look of its own (more contrast, more colour, whites that lean to yellow), and left to
+itself a video drifts from its picture to that look over the first second or two: two white bears were
+lemon yellow by the end of five seconds. Dreambot measures every frame's colour and contrast against
+the picture's and sets them back, so a video keeps the colours it starts on. How things are drawn is
+not something that can be set back: a pencil sketch may not stay one.
+
+Extending keeps what is there: the frames a video had are not touched (they are not encoded again),
+and what is added goes on from its last five frames, so it keeps moving the way it was moving. A cat
+that watched the rain for five seconds went on for four more as the same cat, and then, told to and at
+high motion, got up and stepped down from the sill. What is added is drawn a little crisper than what
+was there, and in a quiet video that can be seen at the joint.
+
+A loop goes out and comes back the way it came. That is deliberate, and it is not how Midjourney's
+loops are made: its model films one whose last frame is its first. This one cannot be led back to a
+picture. Played backwards, the way back is as smooth as the way out, and what does not look right
+backwards (rain, pouring, walking) is what the director is told to leave out of a loop.
+
 ## Web app
 
 ```sh
@@ -396,9 +576,9 @@ Midjourney's website, for one Mac: <http://127.0.0.1:7373/>.
 
 | Page | What is there |
 | --- | --- |
-| **Create** | The prompt bar, with drop zones for an image prompt, a style reference and a subject reference; an uploads library; settings (shape, model, stylize, variety, weirdness, raw, HD); the **P** button; the **LoRA** button, to give every prompt a fine-tuned look. Below it, everything that has been made, newest first, with jobs drawing themselves as they run. |
-| **Lightbox** | Click an image: vary (subtle, strong, remix), retexture (the same picture in a LoRA's look), upscale (subtle, creative), zoom, pan, make square, edit, rerun, describe; copy the prompt, seed or job id; download; like; file it in a folder or a Lookbook; use it in the next prompt. ← → move through the feed. |
-| **Organize** | Every image, to search and to filter by liked, model, kind of job, Lookbook, folder and day. Select many (shift-click for a range) to like, trash, file or download as a zip. Trash only hides. |
+| **Create** | The prompt bar, with drop zones for an image prompt, a style reference and a subject reference; an uploads library; settings (shape, model, stylize, variety, weirdness, raw, HD); the **P** button; the **LoRA** button, to give every prompt a fine-tuned look; the **Video** button, which makes the prompt a [video](#video) and the drop zones its starting and ending frames. Below it, everything that has been made, newest first, with jobs drawing themselves as they run and videos appearing one by one. A video plays while the pointer is over it; with ⌘ or Ctrl held, moving across one scrubs every video of its prompt together. |
+| **Lightbox** | Click an image: vary (subtle, strong, remix), retexture (the same picture in a LoRA's look), upscale (subtle, creative), zoom, pan, make square, animate (auto, as a loop, or manually through the prompt bar), edit, rerun, describe; copy the prompt, seed or job id; download; like; file it in a folder or a Lookbook; use it in the next prompt. A video plays here, with Extend Video beside it (auto, or manually through the prompt bar) and a download as video or GIF. ← → move through the feed. |
+| **Organize** | Every image and video, to search and to filter by liked, model, kind of job, Lookbook, folder and day. Select many (shift-click for a range) to like, trash, file or download as a zip. Trash only hides. |
 | **Lookbooks** | Make, fill, rename and delete Lookbooks; choose your defaults; see what Dreambot reads in a book. |
 | **Styles** | Explore style codes (shuffle, search, like, the styles one step away, try one on your latest prompt), your saved styles, and the **blend bench**: put codes, pictures and Lookbooks together, set their weights, read what the blend comes to before anything is rendered, then try it or save it under a name. |
 
@@ -502,6 +682,11 @@ who sent them.
 Limits that come from iMessage itself: no buttons, no editing a sent message (so no live progress bar), and
 one attachment per message.
 
+**Videos** arrive as videos in all three: a video message on Telegram, an MP4 on Discord and in Messages.
+Each app takes files up to a size (Discord about 10 MB, Telegram 50 MB from a bot). A five-second video
+is a megabyte or two; a long one in HD can be over Discord's limit, and is then sent as a smaller copy,
+while the one on the Mac stays as it was made.
+
 ## Privacy
 
 - Generation runs with networking disabled: the worker process sets `HF_HUB_OFFLINE=1`, so a model that is
@@ -510,7 +695,7 @@ one attachment per message.
   *you* reference by link (links to private/local addresses are refused).
 - Bot tokens live in the macOS Keychain. Jobs and settings live in a SQLite file under
   `~/Library/Application Support/Dreambot/`, next to the pictures you put in Lookbooks and saved
-  styles. Images live in `~/Pictures/Dreambot/`.
+  styles, and the first frame of each video. Images and videos live in `~/Pictures/Dreambot/`.
 - The web app listens on `127.0.0.1` only and has no accounts: it is for the person at the Mac.
   Other web pages open in the same browser are kept out of it (see [Web app](#web-app)).
 - No telemetry.
@@ -522,16 +707,16 @@ one attachment per message.
 ```
  iMessage ─┐
  Discord  ─┼─► frontends ─► commands ─► service ─► planner ─► engine client ══► worker process
- Telegram ─┤   (thin)       (text UI)   (queue,     (which model,              (MLX: mflux, mlx-vlm;
- terminal ─┤                    ▲        jobs)       which operation)           models stay loaded)
+ Telegram ─┤   (thin)       (text UI)   (queue,     (which model,              (MLX: mflux, mlx-vlm, and
+ terminal ─┤                    ▲        jobs)       which operation)           Wan; models stay loaded)
  web app  ─┴────────────────────┘ (buttons are the same actions as chat buttons)
 ```
 
 - **Worker process.** All MLX inference happens in a subprocess that keeps models loaded between jobs. The
   bot stays responsive, a job can always be cancelled, and stopping the worker (automatically after 15 idle
   minutes) returns all memory to the system.
-- **Planner.** Maps each request to an operation — text-to-image, variation, edit, inpaint, upscale — and to
-  the best installed model for it, falling back gracefully (for example outpainting through an edit model
+- **Planner.** Maps each request to an operation — text-to-image, variation, edit, inpaint, upscale,
+  video — and to the best installed model for it, falling back gracefully (for example outpainting through an edit model
   when no inpainting model is installed) and telling you what it did.
 - **One codebase for every platform.** Platform adapters only send, edit and delete messages, and the web
   app sends the same actions a chat button does; everything else is shared, so they cannot drift apart.
@@ -550,6 +735,13 @@ edit = ["flux2-klein-9b", "flux2-klein-4b"]
 [models."flux2-klein-4b"]
 weights = "~/models/my-klein-finetune"
 
+[video]
+count = 4                   # videos per prompt, unless it says --bs
+seconds = 5
+motion = "low"
+hd = false                  # 1248×704 instead of 832×480
+picture_first = true        # a video asked for in words starts on a picture made from them
+
 [engine]
 idle_unload_seconds = 900
 
@@ -564,14 +756,17 @@ port = 7373
 
 - **Works:** `/imagine` grids, U/V/reroll, variations (subtle/strong, remix), upscales, zoom out, pan, make
   square, vary region, retexture, instruction edits, image/style/character references, `/blend`, `/describe`,
-  `/shorten`, `/settings`, `/prefer`, permutations, repeat, seeds (exactly reproducible), job history, and
-  a web app with the create page, lightbox, gallery, folders and trash.
+  `/shorten`, `/settings`, `/prefer`, permutations, repeat, seeds (exactly reproducible), job history, video
+  (four to a prompt; animate auto and manual, low and high motion, a starting frame, extend auto and manual, batch
+  size and resolution settings), and a web app with the create page, lightbox, gallery, folders and trash.
 - **Approximated:** the aesthetic dials (`--stylize`, `--chaos`, `--weird`, `--exp`), which steer
-  Midjourney's proprietary model; here a local language model art-directs the prompt instead. Style
+  Midjourney's proprietary model; here a local language model art-directs the prompt instead. Video is
+  made by a different model from Midjourney's: low motion is a video begun from its picture held still,
+  and a loop is half a video played forwards and then backwards. Style
   references blend by weight, moodboards exist as Lookbooks and there is a style explorer — all by
   Dreambot's own mechanism, and its style codes are its own, not Midjourney's.
-- **Not yet:** video (Animate), personalization by ranking images, the Style Creator, the Editor canvas,
-  `--tile`.
+- **Not yet:** personalization by ranking images, the Style Creator, the Editor canvas, `--tile`, an ending
+  frame for a video (`--end`).
 
 ## What is verified
 
@@ -587,6 +782,7 @@ port = 7373
 | Blending by weight | real weights, two prompts: the same two references at 3:1, 1:1 and 1:3 give a visible progression from one style to the other; a style code with a picture gives a plausible mix. More than two references: automated tests only |
 | What the vision model says about a style | nine real images. It names a medium and five short phrases, drops the labels about half the time (the parser then reads by position), and calls most generated images "digital painting". Asked to fuse two styles into one, it joined their phrases with "and" or copied the worked example, so blending is done by rule |
 | Lookbooks | real weights: a four-picture book gave each image of a grid a different lead and a visibly different look; a one-picture book at `--stylize` 0, 20, 100 and 400 gave no look, a touch, the look, and more of it. With a book whose lead was photograph-like the three strengths looked alike, because the look was already close to the model's own. Larger books, several books at once, the `liked` book: automated tests only |
+| Video | real weights (Wan 2.2 TI2V-5B as FastVideo's FastMetal-5B-QAD, with the umT5 text encoder that comes with it and TAEHV for its frames; Z-Image Turbo for the pictures and Qwen2.5-VL 7B as the director; on an M5 Ultra with 96 GB), through the service, every video with a seed of its own. **The engine** is Dreambot's own code, checked against numbers from FastVideo's MLX runtime, which is what these weights were made to run under (`tests/test_wan.py`): one pass of the transformer, with and without a clean first frame, gave the same numbers to the last digit; the autoencoder's frames were the same to the level, decoded a few at a time as they are here or all at once; the text encoder read a prompt to the fifth decimal of the reference with the same copy of its weights, and 0.02 away at most (on numbers 0.07 in size) with the copy that ships with this model, which is rounded more coarsely. Decoding a clip all at once, as the reference runtime does, took its process to 75 to 84 GB; a few frames at a time it stays under 10. **From words**: one prompt, *two polar bears fighting in the octagon*, both ways. A picture drawn first, four videos at low motion and four at high: two polar bears in the cage or on the mat that was drawn, in all eight. The words alone, four videos: two polar bears wrestling in all four, in a boxing ring in two and against a blue wall in two. **Animate**: five pictures of different kinds (two hikers in a wide landscape, a portrait, a lake, a cat, a watercolour fox), two videos each at low and at high motion, with the director: all twenty moved coherently (see [Video](#video)). **Low and high motion**: told in words alone to hold the camera still (five wordings, two videos each, on the hikers) the model moved in on them every time; started from the picture held still under the noise, it kept the frame in all ten low-motion videos of the twenty above. How much of the start is noise was settled on the fight: at 0.94 the bears touched noses, at 0.97 (which is used) they tussled where they stood, at 0.985 the frame began to wander. **What the video model is told about its picture**: with the director's line alone, two videos of four of a lighthouse had something in front of it that was not there (a hand with a glass of water, a hand with a camera); with the picture's own prompt before the line, one of four (sea birds flying close past). **Colours**: uncorrected, the white of two bears had gone yellow by the end of five seconds and the colours' spread had doubled; corrected once, from the first frames, it still went; corrected frame by frame, it held, on that video and on the twenty above. **Extend**: holding the video's last frame alone, the new part started from rest; holding its last five frames it went on moving (with nine, the first new frame came out blurred). One video continued four ways at once, and a cat continued twice (5 s to 9 s to 13 s, the second with words and at high motion: it stepped down from the sill). The frames a video had were the same to the pixel after it was extended. At the joint of the cat's quiet video the picture changed about twice as much from one frame to the next as it did after, and what was added was crisper. **An ending frame**: four videos held to a picture at their end, two of them with a starting picture as well: all four cut to it in the last five frames, so it is not offered. **Loops**: two (a lighthouse, the cat): both moved and came back to their first frame. **Also run**: words of one's own at low and at high motion; `--from words`; other shapes (480×832, 608×608, 736×544) and lengths (two, three and four seconds); `--hd` (1248×704, 24 s a video against 8); stopping a video part-way (2.5 s). Times, model loaded: about ten seconds for five seconds of 832×480, nine or ten to add four seconds to a video, six for a loop; four videos from one prompt of words in 82 to 86 s (the four pictures were there after 40 s, and a video followed every 10 s), four from the words alone in 44 s. The worker's memory peaked at 30 GB, with the picture model, the vision model and the video model loaded. **The web app**, in WebKit, on real weights: a prompt of words with the Video button made four videos in 86 s, each shown by its picture until it was made (two were made after 67 s); a video was opened in the lightbox; a picture was sent to the prompt bar with *Animate manually…* (one box, for a starting frame) and a video with *Extend manually…* (no picture can be added, and Loop is off). On the stand-in backend, in WebKit, the rest of the controls: animating from a tile, Animate Image (loop, and manually with words and a length), Extend manually with words, *Picture first* and *Words alone*, hover to play, ⌘ to scrub four videos together, the downloads (a GIF came back as a GIF), and the three video settings. **Not run**: any Mac with less memory (below 32 GB the transformer makes way for the text encoder while a prompt is read, and none of that has been exercised); a starting frame that is a photograph of one's own (every one here was a picture Dreambot made); a video extended past 13 seconds, or extended in HD; a picture model other than Z-Image Turbo for the pictures, and style references, Lookbooks and LoRAs in a video prompt (automated tests only); a director other than Qwen2.5-VL 7B. Videos in Telegram, Discord and iMessage: automated tests with stand-ins for the services, **not sent on the live ones** |
 | Web app | every route against the real service on the stand-in backend (automated, including who is let in); the pages driven end to end in WebKit, the engine Safari uses, on the stand-in backend, and one real job with a Lookbook. **Not tried** in Safari itself, Chrome or Firefox, nor on a phone |
 | `/looks` and `look: <name>` from the chat apps | automated tests through the shared command layer; **not run on the live services** |
 | The other 46 models | class paths, arguments and defaults checked against mflux; **not run** (weights not installed during development) |
@@ -600,7 +796,7 @@ port = 7373
 
 ```sh
 uv sync
-uv run pytest                 # ~650 tests, no model weights needed (about a minute)
+uv run pytest                 # ~760 tests, no model weights needed (about two minutes)
 uv run pytest -m mlx -s       # real inference with whatever models are installed
 uv run ruff check . && uv run ruff format .
 DREAMBOT_BACKEND=fake uv run dreambot chat    # try everything without any weights
@@ -611,10 +807,17 @@ DREAMBOT_BACKEND=fake uv run dreambot web     # ...or in the browser
 behaviour, and `frontends` are the chat adapters and the web app. The web app has no build step: its pages
 are plain ES modules in `frontends/web/static`, and the one library they use is vendored there. `tests/test_registry.py` pins the model table to the
 installed mflux, so an mflux upgrade that adds or renames a model fails a test rather than silently going
-unsupported.
+unsupported. mflux has no video models, so the video model is run by code of Dreambot's own
+(`src/dreambot/engine/wan`): Wan 2.2's transformer, its text encoder and a small autoencoder, written
+against MLX and NumPy and nothing else. `tests/test_wan.py` checks each part, on small random weights
+(the text encoder against the umT5 in `transformers`) and on the real ones against numbers from the
+runtime the weights were made for. Videos are written and read with `ffmpeg`, and Dreambot brings its
+own (the `imageio-ffmpeg` package), so nothing has to be installed on the Mac.
 
 ## License
 
-MIT for Dreambot itself. Model weights are licensed separately by their authors.
+MIT for Dreambot itself. Model weights are licensed separately by their authors. The video engine
+follows two open-source projects' arithmetic, FastVideo's (Apache 2.0) and TAEHV's (MIT):
+[THIRD_PARTY.md](THIRD_PARTY.md) has their notices.
 
 Dreambot is not affiliated with Midjourney, Inc.

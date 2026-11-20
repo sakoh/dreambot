@@ -7,7 +7,7 @@ import asyncio
 import itertools
 import json
 import subprocess
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -73,7 +73,7 @@ class FakeBotAPI(BaseRequest):
     def _result(self, endpoint: str, params: dict[str, Any]) -> Any:
         if endpoint == "getMe":
             return BOT
-        if endpoint in ("sendMessage", "sendPhoto", "sendDocument", "editMessageText"):
+        if endpoint in ("sendMessage", "sendPhoto", "sendVideo", "sendDocument", "editMessageText"):
             return self._message(params)
         if endpoint == "sendMediaGroup":
             return [self._message(params) for _ in params.get("media", [0])]
@@ -115,6 +115,18 @@ class Chat:
                 await asyncio.sleep(0.05)
                 return
         raise AssertionError("jobs did not finish")
+
+    async def until(self, done: Callable[[], bool]) -> None:
+        """Wait for something that takes longer to arrive than `settle` allows for.
+
+        Several videos go out one message after another once their job has finished, and each
+        is measured first, by a program of its own.
+        """
+        for _ in range(400):
+            if done():
+                return
+            await asyncio.sleep(0.02)
+        raise AssertionError("what was waited for did not happen")
 
     async def feed(self, payload: dict[str, Any]) -> None:
         update = Update.de_json({"update_id": next(self._update_ids), **payload}, self.front.app.bot)
@@ -219,6 +231,71 @@ async def test_buttons_and_original_files(chat: Chat):
     varied = chat.service.store.recent_jobs(limit=1)[0]
     assert varied.kind is JobKind.VARIATION and (varied.parent, varied.parent_index) == (job.id, 4)
     assert chat.api.of("answerCallbackQuery"), "every button press is acknowledged"
+
+
+async def test_a_video_is_sent_as_a_video_under_its_own_buttons(chat: Chat):
+    chat.service.config.video.count = 1  # four are made unless something says otherwise
+    await chat.message("a fox running --video --seconds 1")
+    job = chat.service.store.recent_jobs(limit=1)[0]
+    (sent,) = chat.api.of("sendVideo")
+    assert job.kind is JobKind.VIDEO and f"#{job.id}" in sent["caption"]
+    assert "Video (low motion)" in sent["caption"] and "1s long" in sent["caption"]
+    # Told its shape and its length, Telegram shows it right before any of it has arrived.
+    assert (int(sent["width"]), int(sent["height"]), int(sent["duration"])) == (832, 480, 1)
+    # The message is the file itself, so there is no "Original" to ask for.
+    assert chat.api.labels(sent) == ["Extend (Low motion)", "Extend (High motion)", "❤️", "🔄"]
+    assert chat.api.uploads[-1] == ("sendVideo", [Path(job.clip(1).path).stat().st_size])
+    assert not chat.api.of("sendPhoto")
+
+    await chat.press(sent, "Extend (High motion)")
+    longer = chat.service.store.recent_jobs(limit=1)[0]
+    assert longer.kind is JobKind.EXTEND and longer.parent == job.id
+    assert len(chat.api.of("sendVideo")) == 2 and "Extended by 4s" in chat.api.of("sendVideo")[-1]["caption"]
+
+    # A picture is animated from its buttons, and several videos come one by one.
+    await chat.message("a fox --n 1")
+    picture = chat.api.of("sendPhoto")[-1]
+    assert {"Animate (Low motion)", "Animate (High motion)"} <= set(chat.api.labels(picture))
+    await chat.press(picture, "Animate (Low motion)")
+    assert chat.service.store.recent_jobs(limit=1)[0].kind is JobKind.ANIMATE
+    await chat.message("a fox --video --seconds 1 --bs 2")
+    await chat.until(lambda: "Video (low motion)" in chat.api.of("sendMessage")[-1]["text"])
+    two = chat.api.of("sendVideo")[-2:]
+    assert [video["caption"] for video in two] == ["Video 1", "Video 2"]
+    assert all(chat.api.labels(video)[0] == "Extend (Low motion)" for video in two)
+    assert "Video (low motion)" in chat.api.of("sendMessage")[-1]["text"]
+
+
+async def test_a_video_too_large_for_telegram_is_sent_smaller_or_explained(
+    chat: Chat, monkeypatch: pytest.MonkeyPatch
+):
+    import dreambot.frontends.telegram_bot as module
+
+    asked: list[tuple[str, int]] = []
+
+    def smaller(source, out, *, limit):
+        asked.append((Path(source).name, limit))
+        Path(out).write_bytes(b"smaller")
+        return Path(out)
+
+    monkeypatch.setattr(module, "VIDEO_MAX_BYTES", 1000)
+    monkeypatch.setattr(module.video, "fit", smaller)
+    await chat.message("a fox running --video --seconds 1 --bs 1")
+    job = chat.service.store.recent_jobs(limit=1)[0]
+    assert asked == [(Path(job.clip(1).path).name, 1000)]
+    assert chat.api.uploads[-1] == ("sendVideo", [len(b"smaller")]), "the copy is what is sent"
+    assert Path(job.clip(1).path).stat().st_size > 1000, "and the video on the Mac is as it was"
+
+    def refuse(source, out, *, limit):
+        raise module.video.VideoError("That video is too long to be made small enough to send here.")
+
+    monkeypatch.setattr(module.video, "fit", refuse)
+    before = len(chat.api.of("sendVideo"))
+    await chat.message("a fox walking --video --seconds 1 --bs 1")
+    job = chat.service.store.recent_jobs(limit=1)[0]
+    told = chat.api.of("sendMessage")[-1]["text"]
+    assert len(chat.api.of("sendVideo")) == before and job.status is JobStatus.DONE
+    assert "too long to be made small enough" in told and str(Path(job.clip(1).path).parent) in told
 
 
 async def test_photo_with_caption_is_downloaded_and_used(chat: Chat):

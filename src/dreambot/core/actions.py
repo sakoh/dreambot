@@ -45,7 +45,11 @@ class ActionKind(StrEnum):
     LOOK = "look"
     INFO = "info"
     CANCEL = "cancel"
+    #: Turn the image into a video. ``value`` is how much should move (``low`` or ``high``),
+    #: ``prompt`` what should happen, with parameters such as ``--loop``; both are optional.
     ANIMATE = "animate"
+    #: Continue a video past its end. ``value`` and ``prompt`` as for ``ANIMATE``.
+    EXTEND = "extend"
 
 
 #: Actions that start a new generation job (the rest answer immediately).
@@ -63,10 +67,13 @@ GENERATIVE = frozenset(
         ActionKind.ZOOM,
         ActionKind.PAN,
         ActionKind.SQUARE,
+        ActionKind.ANIMATE,
+        ActionKind.EXTEND,
     }
 )
 
 PAN_DIRECTIONS = ("left", "right", "up", "down")
+MOTIONS = ("low", "high")
 
 
 @dataclass(frozen=True)
@@ -110,6 +117,7 @@ _CODES = {
     ActionKind.INFO: "i",
     ActionKind.CANCEL: "x",
     ActionKind.ANIMATE: "a",
+    ActionKind.EXTEND: "xt",
 }
 _KINDS = {code: kind for kind, code in _CODES.items()}
 ENCODED_PREFIX = "db"
@@ -167,7 +175,6 @@ _PATTERNS: list[tuple[re.Pattern[str], ActionKind]] = [
     (re.compile(rf"(?:fav|fave|favorite|favourite|like|love|❤️?|♥️?)\s*(?:{_INDEX})?"), ActionKind.FAVORITE),
     (re.compile(rf"(?:info|seed|✉️?)\s*(?:{_INDEX})?"), ActionKind.INFO),
     (re.compile(r"(?:cancel|stop|❌)"), ActionKind.CANCEL),
-    (re.compile(rf"animate\s*(?:{_INDEX})?\s*(?P<motion>low|high)?"), ActionKind.ANIMATE),
 ]
 
 # Commands that take free text need an explicit marker so prompts are never mistaken for them:
@@ -175,6 +182,8 @@ _PATTERNS: list[tuple[re.Pattern[str], ActionKind]] = [
 #   region 2 the sky: an aurora        (a description, then what to paint)
 #   edit 2: make it night
 #   retexture 2: an oil painting --lora inkwash     (or `retexture 2 --lora pixel-art`, or `retexture 2`)
+#   animate 2 high: she turns to the camera --loop  (or `animate 2`, `animate high`, `animate --loop`)
+#   extend: the camera pulls back                   (or `extend`, `extend 2 high`)
 #   look 2: autumn diner               (add the image to that Lookbook)
 # They are matched against the text as typed, to keep a prompt's capitals, so they ignore case
 # themselves: a phone capitalises the first word, and "Edit: make it night" is still an edit.
@@ -185,6 +194,13 @@ _EDIT = re.compile(rf"edit\s*(?:{_INDEX})?\s*:\s*(?P<prompt>.+)", re.S | re.I)
 # Its words come after a colon; parameters alone may follow directly. Anything else after the
 # word ("retexture the walls of a cave") is a prompt, not this.
 _RETEXTURE = re.compile(rf"retexture\s*(?:{_INDEX})?\s*(?:(?::\s*|(?=--))(?P<prompt>.+))?", re.S | re.I)
+# The same shape as retexture, with how much should move in front of the words: `animate 2 high`,
+# `animate high motion`. "animate the statue" and "extend the bridge" are prompts.
+_MOVING = re.compile(
+    rf"(?P<verb>animate|extend)\s*(?:{_INDEX})?\s*(?:(?P<motion>low|high)(?:\s+motion)?)?"
+    r"\s*(?:(?::\s*|(?=--))(?P<prompt>.+))?",
+    re.S | re.I,
+)
 _LOOK = re.compile(rf"(?:lookbook|look)\s*(?:{_INDEX})?\s*:\s*(?P<name>[^\n]+)", re.I)
 
 
@@ -218,6 +234,16 @@ def parse_action(text: str) -> Action | None:
         if index is not None and index < 1:
             return None
         return Action(ActionKind.RETEXTURE, index=index, prompt=(match.group("prompt") or "").strip() or None)
+    if match := _MOVING.fullmatch(body):
+        index = int(match.group("index")) if match.group("index") else None
+        if index is not None and index < 1:
+            return None
+        return Action(
+            ActionKind(match.group("verb").lower()),
+            index=index,
+            value=(match.group("motion") or "").lower() or None,
+            prompt=(match.group("prompt") or "").strip() or None,
+        )
     if match := _LOOK.fullmatch(body):
         index = int(match.group("index")) if match.group("index") else None
         return Action(ActionKind.LOOK, index=index, prompt=match.group("name").strip())
@@ -246,7 +272,5 @@ def parse_action(text: str) -> Action | None:
             value = f"{factor:g}"
         elif kind is ActionKind.PAN:
             value = groups["direction"]
-        elif kind is ActionKind.ANIMATE:
-            value = groups.get("motion") or "low"
         return Action(kind, index=index, value=value, prompt=prompt)
     return None

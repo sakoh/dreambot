@@ -1,13 +1,17 @@
 // The Create page: the prompt bar, its reference tray and settings, and the feed of everything
-// that has been made, newest first, with jobs in progress drawing themselves as they run.
+// that has been made, pictures and videos, newest first, with jobs in progress drawing themselves
+// as they run.
 
 import { html, useEffect, useRef, useState } from "./vendor/preact-htm.js";
 import { api, thumb } from "./api.js";
 import {
+  EXTEND_SECONDS,
   act,
   addRef,
+  animateManually,
   attempt,
   compose,
+  extendManually,
   imagine,
   loadFeed,
   openLightbox,
@@ -16,12 +20,30 @@ import {
   removeRef,
   saveSettings,
   setDraft,
+  setVideo,
   store,
   toast,
   updateRef,
   useStore,
+  videoFrom,
 } from "./store.js";
-import { Dialog, Empty, Icon, IconButton, Menu, Swatches, copy, dayKey, dayLabel, pictures, splitPrompt } from "./ui.js";
+import {
+  ClipBadge,
+  ClipPreview,
+  ContextMenu,
+  Dialog,
+  Empty,
+  Icon,
+  IconButton,
+  Menu,
+  Swatches,
+  clipLength,
+  copy,
+  dayKey,
+  dayLabel,
+  pictures,
+  splitPrompt,
+} from "./ui.js";
 
 const RATIOS = ["1:1", "4:3", "3:2", "16:9", "2:1", "3:4", "2:3", "9:16"];
 const ROLES = {
@@ -29,12 +51,31 @@ const ROLES = {
   style: { title: "Style reference", hint: "how it should look", icon: "styles" },
   subject: { title: "Subject reference", hint: "a person or object to keep", icon: "person" },
 };
+// What a picture can be to a video. The starting frame is the image prompt under another name.
+const VIDEO_ROLES = {
+  image: { title: "Starting frame", hint: "the picture the video starts on", icon: "image" },
+  end: { title: "Ending frame", hint: "the picture it ends on", icon: "image" },
+};
+// A video that is being continued already has its start: the picture it can be given is where it ends.
+const EXTEND_ROLES = { end: VIDEO_ROLES.end };
+/**
+ * The roles a picture can be given in the prompt bar as it is now, and the one that is chosen
+ * (none, when a picture has no part to play). `ends` says whether the video model can lead a
+ * video up to a picture: without that, a video has no ending frame.
+ */
+const rolesNow = (draft, role, ends) => {
+  const filming = ends ? VIDEO_ROLES : { image: VIDEO_ROLES.image };
+  const roles = draft.extend ? (ends ? EXTEND_ROLES : {}) : draft.video.on ? filming : ROLES;
+  return { roles, role: roles[role] ? role : Object.keys(roles)[0] };
+};
+const SECONDS = [2, 3, 4, 5];
+const MORE_SECONDS = [2, 3, 4];
 
 // --------------------------------------------------------------------------- the prompt bar
 
-function RefChip({ item }) {
-  const label =
-    item.role === "look" ? "Lookbook" : item.picture ? ROLES[item.role].title : item.saved ? "Saved style" : "Style code";
+function RefChip({ item, filming }) {
+  const role = (filming && VIDEO_ROLES[item.role]) || ROLES[item.role] || VIDEO_ROLES[item.role];
+  const label = item.role === "look" ? "Lookbook" : item.picture ? role.title : item.saved ? "Saved style" : "Style code";
   return html`<div class=${`ref-chip role-${item.role}`} title=${`${label}: ${item.name || item.code || ""}`}>
     ${item.url
       ? html`<img src=${thumb(item.url, 256)} alt="" />`
@@ -58,9 +99,8 @@ function RefChip({ item }) {
   </div>`;
 }
 
-function DropZone({ role, onFiles }) {
+function DropZone({ role, info, onFiles }) {
   const [over, setOver] = useState(false);
-  const info = ROLES[role];
   const drop = (event) => {
     event.preventDefault();
     setOver(false);
@@ -87,7 +127,7 @@ function DropZone({ role, onFiles }) {
   </div>`;
 }
 
-function ReferenceTray({ onFiles, role, setRole }) {
+function ReferenceTray({ onFiles, role, roles, setRole }) {
   const { uploads, draft } = useStore();
   const input = useRef(null);
   const [link, setLink] = useState("");
@@ -107,9 +147,9 @@ function ReferenceTray({ onFiles, role, setRole }) {
   };
   return html`<div class="tray">
     <div class="tray-zones">
-      ${Object.keys(ROLES).map(
-        (name) => html`<div class=${`tray-zone ${role === name ? "is-chosen" : ""}`} onClick=${() => setRole(name)}>
-          <${DropZone} role=${name} onFiles=${onFiles} />
+      ${Object.keys(roles).map(
+        (name) => html`<div key=${name} class=${`tray-zone ${role === name ? "is-chosen" : ""}`} onClick=${() => setRole(name)}>
+          <${DropZone} role=${name} info=${roles[name]} onFiles=${onFiles} />
         </div>`,
       )}
     </div>
@@ -145,7 +185,7 @@ function ReferenceTray({ onFiles, role, setRole }) {
         </button>
       </div>
       <p class="muted small">
-        Click a picture to add it as ${ROLES[role].title.toLowerCase()} (pick a box above to change that), or drag it
+        Click a picture to add it as ${roles[role].title.toLowerCase()} (pick a box above to change that), or drag it
         into a box. Pictures from your feed can be dragged in too.
       </p>
       <div class="library">
@@ -263,6 +303,68 @@ function SettingsPanel() {
       </div>
       <div class="toggles">${toggle("remix", "Remix", "Ask for a new prompt before making variations")}</div>
     </section>
+    ${app.video.model &&
+    html`<section>
+      <h4>Video</h4>
+      <div class="field">
+        <span title="How many videos each prompt makes. Each is a different take, and each takes about as long as a grid of pictures.">
+          Videos per prompt
+        </span>
+        <div class="ratios">
+          ${[1, 2, 4].map(
+            (count) =>
+              html`<button
+                type="button"
+                class=${`chip ${settings.videos === count ? "is-on" : ""}`}
+                aria-pressed=${settings.videos === count}
+                onClick=${() => saveSettings({ videos: count })}
+              >
+                ${count}
+              </button>`,
+          )}
+        </div>
+      </div>
+      <div class="field">
+        <span title="SD is 896×512 for a 16:9 video; HD is 1280×704, in about twice the time.">Resolution</span>
+        <div class="ratios">
+          ${[
+            [false, "SD"],
+            [true, "HD"],
+          ].map(
+            ([hd, label]) =>
+              html`<button
+                type="button"
+                class=${`chip ${settings.video_hd === hd ? "is-on" : ""}`}
+                aria-pressed=${settings.video_hd === hd}
+                onClick=${() => saveSettings({ video_hd: hd })}
+              >
+                ${label}
+              </button>`,
+          )}
+        </div>
+      </div>
+      <div class="field">
+        <span title="What a video starts on when you give it words and no picture. Picture first: your words are drawn as a picture, and the video starts on it. Words alone: the video model films the words itself.">
+          From words
+        </span>
+        <div class="ratios">
+          ${[
+            [true, "Picture first"],
+            [false, "Words alone"],
+          ].map(
+            ([first, label]) =>
+              html`<button
+                type="button"
+                class=${`chip ${settings.picture_first === first ? "is-on" : ""}`}
+                aria-pressed=${settings.picture_first === first}
+                onClick=${() => saveSettings({ picture_first: first })}
+              >
+                ${label}
+              </button>`,
+          )}
+        </div>
+      </div>
+    </section>`}
   </div>`;
 }
 
@@ -394,13 +496,139 @@ function LoraChip({ lora, chosen }) {
   </div>`;
 }
 
+/** The prompt bar's Video button: the prompt makes a video instead of pictures while it is lit. */
+function VideoButton() {
+  const { draft, app } = useStore();
+  const on = draft.video.on;
+  const ready = Boolean(app && app.video.model);
+  const label = on
+    ? "Video is on: this prompt makes a video. Click to go back to pictures."
+    : ready
+      ? "Video: make a video from the words, or one that starts on an image"
+      : "Video: needs a video model (in Terminal: dreambot models pull wan-2.2)";
+  return html`<button
+    type="button"
+    class=${`button video-button ${on ? "is-on" : ""}`}
+    title=${label}
+    aria-label=${label}
+    aria-pressed=${on}
+    onClick=${() => setVideo({ on: !on })}
+  >
+    <${Icon} name="video" size=${15} /><span>Video</span>
+  </button>`;
+}
+
+/** What kind of video the prompt makes: how much moves, whether it loops, and its length. */
+function VideoOptions() {
+  const { draft, app } = useStore();
+  if (!app) return null;
+  const video = draft.video;
+  const usual = app.video;
+  if (!usual.model) {
+    return html`<div class="video-row">
+      <span class="note small">
+        No video model is installed yet. In Terminal on this Mac: <code>dreambot models pull wan-2.2</code> (about 17 GB).
+      </span>
+    </div>`;
+  }
+  const extending = Boolean(draft.extend);
+  const starts = draft.refs.some((ref) => ref.role === "image");
+  const ends = draft.refs.some((ref) => ref.role === "end");
+  const motion = video.motion || usual.motion;
+  // With no picture given, one is drawn from the words first, as Midjourney's videos all start
+  // on a picture; or the video model is given the words alone.
+  const wordsOnly = !extending && !starts && !ends;
+  const from = videoFrom(draft);
+  // A new video loops back to the picture it starts on; one that is continued, to its first
+  // frame, which takes a model that can lead a video up to a picture.
+  const canLoop = (starts || (extending && usual.ends) || (wordsOnly && from === "picture")) && !ends;
+  const what = extending ? "Continues your video" : starts ? "Starts on your picture" : "Ends on your picture";
+  const lengths = extending ? MORE_SECONDS : SECONDS;
+  const usually = extending ? EXTEND_SECONDS : usual.seconds;
+  return html`<div class="video-row">
+    ${wordsOnly
+      ? html`<div class="segmented video-from" role="group" aria-label="What the video starts on">
+          ${[
+            ["picture", "Picture first", "Your words are drawn as a picture first, and the video starts on it"],
+            ["words", "Words alone", "The video model films your words itself, with no picture to start on"],
+          ].map(
+            ([name, text, hint]) => html`<button
+              type="button"
+              class=${from === name ? "is-on" : ""}
+              aria-pressed=${from === name}
+              title=${hint}
+              onClick=${() => setVideo({ from: name })}
+            >
+              ${text}
+            </button>`,
+          )}
+        </div>`
+      : html`<span class="video-what">${what}</span>`}
+    <div class="segmented" role="group" aria-label="How much moves">
+      ${[
+        ["low", "Low motion", "The camera holds still and things move gently"],
+        ["high", "High motion", "The camera and everything in front of it move"],
+      ].map(
+        ([name, text, hint]) => html`<button
+          type="button"
+          class=${motion === name ? "is-on" : ""}
+          aria-pressed=${motion === name}
+          title=${hint}
+          onClick=${() => setVideo({ motion: name })}
+        >
+          ${text}
+        </button>`,
+      )}
+    </div>
+    <button
+      type="button"
+      class=${`chip ${video.loop && canLoop ? "is-on" : ""}`}
+      aria-pressed=${video.loop && canLoop}
+      disabled=${!canLoop}
+      title=${canLoop
+        ? extending
+          ? "Lead it back to the frame the video started on, so that it plays round and round"
+          : "End on the frame it starts on, so that it plays round and round"
+        : ends
+          ? "A loop ends where it starts, so it has no ending frame of its own"
+          : extending
+            ? "This video model can't lead a video back to the frame it started on"
+            : "A loop needs a picture to start on and come back to: give it one, or have one drawn first"}
+      onClick=${() => setVideo({ loop: !video.loop })}
+    >
+      <${Icon} name="loop" size=${13} /> Loop
+    </button>
+    <label class="video-length" title=${extending ? "How many seconds are added" : "How long the video is"}>
+      <span>${extending ? "Add" : "Length"}</span>
+      <select value=${String(video.seconds || "")} onChange=${(event) => setVideo({ seconds: event.target.value })}>
+        <option value="">${usually} seconds</option>
+        ${lengths.filter((each) => each !== usually).map((each) => html`<option value=${String(each)}>${each} seconds</option>`)}
+      </select>
+    </label>
+  </div>`;
+}
+
+/** The video the prompt bar is set to continue, and a way to let go of it. */
+function ExtendChip({ extend }) {
+  return html`<div class="ref-chip role-end" title="What you send continues this video">
+    <img src=${thumb(extend.poster, 256)} alt="" />
+    <div class="ref-text">
+      <span class="ref-role">Extending</span>
+      <span class="ref-name">#${extend.job} · ${clipLength(extend.seconds)}</span>
+    </div>
+    <${IconButton} icon="x" label="Stop extending this video" size=${14} onClick=${() => setDraft({ extend: null })} />
+  </div>`;
+}
+
 export function PromptBar() {
   const { draft, app } = useStore();
   const [tray, setTray] = useState(false);
   const [panel, setPanel] = useState(false);
-  const [role, setRole] = useState("image");
+  const [picked, setRole] = useState("image");
   const [busy, setBusy] = useState(false);
   const area = useRef(null);
+  const filming = draft.video.on;
+  const { roles, role } = rolesNow(draft, picked, Boolean(app && app.video.ends));
 
   useEffect(() => {
     refreshLookbooks();
@@ -414,7 +642,8 @@ export function PromptBar() {
   }, [draft.text]);
 
   const addFiles = async (files, as = role) => {
-    if (!files.length) return;
+    // (With no role to give it, a picture has no part to play: a video that is being continued.)
+    if (!files.length || !as) return;
     const answer = await attempt(() => api.upload(files));
     if (!answer) return;
     await refreshUploads();
@@ -422,7 +651,19 @@ export function PromptBar() {
   };
 
   const submit = async (keep = false) => {
-    const { prompt, attachments } = compose();
+    const { prompt, attachments, action } = compose();
+    if (action) {
+      // Animating one of Dreambot's pictures, or continuing a video: what its button would
+      // send, with what the bar holds.
+      setBusy(true);
+      const more = { index: action.index, value: action.motion, prompt: prompt || undefined, attachments };
+      const answer = await act(action.job, action.kind, more);
+      setBusy(false);
+      if (answer && answer.jobs.length && !keep) {
+        setDraft({ text: "", refs: draft.pinned && !draft.extend ? draft.refs : [], extend: null });
+      }
+      return;
+    }
     if (!prompt && !attachments.length) return;
     setBusy(true);
     const jobs = await imagine(prompt, attachments);
@@ -443,27 +684,43 @@ export function PromptBar() {
     }
   };
   const loras = app ? app.settings.loras.map(readLora) : [];
+  const shown = draft.refs;
+  // What is added to the prompt without being typed. A video takes the shape of the picture it
+  // starts on, and the picture-making parameters do nothing for one, so they are left out.
+  const framed = Boolean(draft.extend) || shown.some((ref) => ref.role === "image" || ref.role === "end");
   const sticky = [
-    draft.params.ar && `--ar ${draft.params.ar}`,
-    Number(draft.params.chaos) > 0 && `--chaos ${draft.params.chaos}`,
-    Number(draft.params.weird) > 0 && `--weird ${draft.params.weird}`,
+    draft.params.ar && !(filming && framed) && `--ar ${draft.params.ar}`,
+    !filming && Number(draft.params.chaos) > 0 && `--chaos ${draft.params.chaos}`,
+    !filming && Number(draft.params.weird) > 0 && `--weird ${draft.params.weird}`,
   ].filter(Boolean);
 
   return html`<div
     class="prompt-bar"
     onDragOver=${(event) => {
-      if ([...event.dataTransfer.types].some((type) => type === "Files" || type === "application/x-dreambot-picture")) {
+      if (role && [...event.dataTransfer.types].some((type) => type === "Files" || type === "application/x-dreambot-picture")) {
         event.preventDefault();
         setTray(true);
       }
     }}
   >
     <div class="prompt-row">
-      <${IconButton} icon="image" label="Reference images" active=${tray} onClick=${() => setTray(!tray)} />
+      <${IconButton}
+        icon="image"
+        label=${role ? "Reference images" : "A video that is being continued takes no picture"}
+        active=${tray && Boolean(role)}
+        disabled=${!role}
+        onClick=${() => setTray(!tray)}
+      />
       <textarea
         ref=${area}
         rows="1"
-        placeholder="What will you imagine?"
+        placeholder=${!filming
+          ? "What will you imagine?"
+          : draft.extend
+            ? "What happens next? Leave it empty to let it go on as it was going."
+            : draft.refs.some((ref) => ref.role === "image")
+              ? "What should happen? Leave it empty to let the picture move as it will."
+              : "What will you film?"}
         value=${draft.text}
         onInput=${(event) => setDraft({ text: event.target.value })}
         onKeyDown=${onKey}
@@ -471,22 +728,25 @@ export function PromptBar() {
         aria-label="Prompt"
       ></textarea>
       ${draft.text && html`<${IconButton} icon="x" label="Clear the prompt" onClick=${() => setDraft({ text: "" })} />`}
-      <${Personalize} />
-      <${Loras} />
+      <${VideoButton} />
+      ${!filming && html`<${Personalize} />`}
+      ${!filming && html`<${Loras} />`}
       <${IconButton} icon="sliders" label="Settings" active=${panel} onClick=${() => setPanel(!panel)} />
       <button type="button" class="button is-primary send" disabled=${busy} onClick=${() => submit(false)} title="Enter sends; ⌘Enter sends and keeps the prompt">
-        Imagine
+        ${!filming ? "Imagine" : draft.extend ? "Extend" : "Make video"}
       </button>
     </div>
-    ${(draft.refs.length > 0 || sticky.length > 0 || loras.length > 0) &&
+    ${filming && html`<${VideoOptions} />`}
+    ${(shown.length > 0 || sticky.length > 0 || draft.extend || (loras.length > 0 && !filming)) &&
     html`<div class="ref-row">
-      ${draft.refs.map((item) => html`<${RefChip} key=${item.id} item=${item} />`)}
-      ${loras.map((lora) => html`<${LoraChip} key=${`lora-${lora.name}`} lora=${lora} chosen=${loras} />`)}
+      ${draft.extend && html`<${ExtendChip} extend=${draft.extend} />`}
+      ${shown.map((item) => html`<${RefChip} key=${item.id} item=${item} filming=${filming} />`)}
+      ${!filming && loras.map((lora) => html`<${LoraChip} key=${`lora-${lora.name}`} lora=${lora} chosen=${loras} />`)}
       ${sticky.map(
         (text) => html`<span class="chip is-param" title="Added to every prompt; change it in Settings">${text}</span>`,
       )}
     </div>`}
-    ${tray && html`<${ReferenceTray} onFiles=${addFiles} role=${role} setRole=${setRole} />`}
+    ${tray && role && html`<${ReferenceTray} onFiles=${addFiles} role=${role} roles=${roles} setRole=${setRole} />`}
     ${panel && html`<${SettingsPanel} />`}
   </div>`;
 }
@@ -509,27 +769,65 @@ function dragPicture(event, job, image) {
   );
 }
 
-function ImageTile({ job, image }) {
+/** Bring the prompt bar into view after something was put in it. */
+const toTheBar = () => window.scrollTo({ top: 0, behavior: "smooth" });
+
+/**
+ * One result in the feed. A video is shown by the frame it ends on, plays, without sound, while
+ * the pointer is over it, and is held at `scrub` (0 to 1 of its length) while that is a number.
+ */
+function ImageTile({ job, image, scrub = null }) {
   const many = job.images.length > 1;
+  const [over, setOver] = useState(false);
+  const [menu, setMenu] = useState(null);
+  const clip = Boolean(image.video);
   return html`<div
-    class="tile"
+    class=${`tile ${clip ? "is-video" : ""}`}
     style=${{ aspectRatio: `${image.width} / ${image.height}` }}
     draggable="true"
     onDragStart=${(event) => dragPicture(event, job, image)}
     onClick=${() => openLightbox(job.id, image.index)}
+    onMouseEnter=${() => clip && setOver(true)}
+    onMouseLeave=${() => clip && setOver(false)}
+    onContextMenu=${(event) => {
+      if (!clip) return;
+      event.preventDefault();
+      setMenu({ x: event.clientX, y: event.clientY });
+    }}
   >
-    <img src=${thumb(image.url, many ? 512 : 1024)} alt=${job.text} loading="lazy" />
+    <img src=${thumb(clip ? image.poster : image.url, many ? 512 : 1024)} alt=${job.text} loading="lazy" />
+    ${clip && (over || scrub != null) && html`<${ClipPreview} src=${image.video} at=${scrub} />`}
+    <${ClipBadge} image=${image} />
     <div class="tile-actions">
-      <${IconButton}
-        icon="wand"
-        label="Vary (subtle)"
-        onClick=${() => act(job.id, "vary_subtle", { index: image.index })}
-      />
-      <${IconButton}
-        icon="refresh"
-        label="Vary (strong)"
-        onClick=${() => act(job.id, "vary_strong", { index: image.index })}
-      />
+      ${clip
+        ? html`<${IconButton}
+              icon="forward"
+              label="Extend Auto: make it four seconds longer"
+              onClick=${() => act(job.id, "extend", { index: image.index })}
+            />
+            <${IconButton}
+              icon="edit"
+              label="Extend Manual: say what happens next, in the prompt bar"
+              onClick=${() => {
+                extendManually(job, image);
+                toTheBar();
+              }}
+            />`
+        : html`<${IconButton}
+              icon="wand"
+              label="Vary (subtle)"
+              onClick=${() => act(job.id, "vary_subtle", { index: image.index })}
+            />
+            <${IconButton}
+              icon="refresh"
+              label="Vary (strong)"
+              onClick=${() => act(job.id, "vary_strong", { index: image.index })}
+            />
+            <${IconButton}
+              icon="video"
+              label="Animate: turn it into a video"
+              onClick=${() => act(job.id, "animate", { index: image.index })}
+            />`}
       <span class="grow"></span>
       <${IconButton}
         icon="heart"
@@ -551,18 +849,56 @@ function ImageTile({ job, image }) {
         }}
       />
     </div>
+    ${menu &&
+    html`<${ContextMenu}
+      at=${menu}
+      onClose=${() => setMenu(null)}
+      items=${[
+        { label: "Download video", icon: "download", href: `${image.video}?download=1` },
+        { label: "Download GIF", icon: "download", href: `${image.video}?as=gif` },
+      ]}
+    />`}
   </div>`;
 }
 
-function Placeholders({ job, live }) {
-  const count = Math.max(1, job.count || 1);
+/** A result that is still to come. `preview` is the picture so far, when there is one. */
+function PendingTile({ job, preview = null }) {
   const ratio = job.width && job.height ? `${job.width} / ${job.height}` : "1 / 1";
-  return html`<div class=${`tiles count-${Math.min(count, 4)}`}>
-    ${Array.from({ length: Math.min(count, 16) }, (_, slot) =>
-      html`<div class="tile is-pending" style=${{ aspectRatio: ratio }}>
-        ${live && live.preview && slot === 0 && html`<img src=${live.preview} alt="" />`}
-      </div>`,
-    )}
+  return html`<div class="tile is-pending" style=${{ aspectRatio: ratio }}>
+    ${preview && html`<img src=${preview} alt="" />`}
+  </div>`;
+}
+
+/**
+ * The results of a job side by side: the ones that are made, then a place for each one still
+ * to come. Videos are made one after another, so the first can be watched while the last is
+ * being made. With Command or Control held, moving over one video holds every video of the job
+ * at that point of its length, to compare them moment by moment.
+ */
+function Tiles({ job, shown, live = null, pending = 0 }) {
+  const [scrub, setScrub] = useState(null);
+  const filmed = shown.some((image) => image.video);
+  const move = (event) => {
+    if (!(event.metaKey || event.ctrlKey)) return scrub != null && setScrub(null);
+    const tile = event.target.closest && event.target.closest(".tile.is-video");
+    if (!tile) return undefined;
+    const box = tile.getBoundingClientRect();
+    return setScrub(Math.min(1, Math.max(0, (event.clientX - box.left) / box.width)));
+  };
+  const count = Math.min(shown.length + pending, 16);
+  return html`<div
+    class=${`tiles count-${Math.min(count, 4)}`}
+    onMouseMove=${filmed ? move : undefined}
+    onMouseLeave=${filmed ? () => setScrub(null) : undefined}
+  >
+    ${shown.map((image) => html`<${ImageTile} key=${image.index} job=${job} image=${image} scrub=${image.video ? scrub : null} />`)}
+    ${Array.from({ length: Math.max(0, count - shown.length) }, (_, slot) => {
+      // A video that is still to come is shown by the picture it is going to start on, once
+      // that is drawn. Videos are made in order, so this place is the next one's but `slot`.
+      const start = live && live.starts ? live.starts[shown.length + slot + 1] : null;
+      const preview = start || (slot === 0 && live ? live.preview : null);
+      return html`<${PendingTile} key=${`pending-${slot}`} job=${job} preview=${preview} />`;
+    })}
   </div>`;
 }
 
@@ -591,7 +927,9 @@ function JobSide({ job }) {
       <span>${job.kind}</span>
       ${job.model && html`<span>${job.model}</span>`}
       ${(job.loras || []).map((lora) => html`<span title="LoRA">${lora.name}${lora.scale === 1 ? "" : ` ×${lora.scale}`}</span>`)}
-      ${job.seconds != null && html`<span>${Math.round(job.seconds)}s</span>`}
+      ${job.video && job.video.seconds && html`<span title="How long the video is">${clipLength(job.video.seconds)} long</span>`}
+      ${job.seconds != null &&
+      html`<span title="How long it took to make">${job.video ? "made in " : ""}${Math.round(job.seconds)}s</span>`}
       ${!job.user.startsWith("web:") && html`<span title="Made from a chat app">${job.user.split(":")[0]}</span>`}
       <span>#${job.id}</span>
     </div>
@@ -611,8 +949,9 @@ function JobCard({ job }) {
   let body;
   if (running) {
     const say = WAITING[(state && state.type) || job.status] || (() => "Working…");
+    const wanted = Math.max(1, job.count || 1);
     body = html`<div class="job-media">
-      <${Placeholders} job=${job} live=${state} />
+      <${Tiles} job=${job} shown=${shown} live=${state} pending=${Math.max(0, wanted - job.images.length)} />
       <div class="progress">
         <div class="progress-bar"><span style=${{ width: `${Math.round(((state && state.fraction) || 0) * 100)}%` }}></span></div>
         <span class="small">${say(state || { position: 0, fraction: 0 })}</span>
@@ -641,11 +980,7 @@ function JobCard({ job }) {
   } else if (!shown.length) {
     return null; // every image of it is in the trash
   } else {
-    body = html`<div class="job-media">
-      <div class=${`tiles count-${Math.min(shown.length, 4)}`}>
-        ${shown.map((image) => html`<${ImageTile} key=${image.index} job=${job} image=${image} />`)}
-      </div>
-    </div>`;
+    body = html`<div class="job-media"><${Tiles} job=${job} shown=${shown} /></div>`;
   }
   return html`<article class=${`job is-${job.status}`}>${body}<${JobSide} job=${job} /></article>`;
 }
@@ -694,7 +1029,7 @@ export function CreatePage() {
       ? html`<${Empty} title="Nothing matches">No prompt has all of those words in it.<//>`
       : html`<${Empty} title="Nothing here yet">
           Type what you want to see and press Enter. Add Midjourney-style parameters at the end if you like:
-          <code>a red fox in the snow --ar 16:9 --stylize 250</code>
+          <code>a red fox in the snow --ar 16:9 --stylize 250</code>. The Video button makes it move.
         <//>`)}
     ${days.map(
       (day) => html`<section key=${day.key} class="day">

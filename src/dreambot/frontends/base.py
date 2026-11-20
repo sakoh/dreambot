@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from dreambot.core import render
 from dreambot.core.actions import ENCODED_PREFIX, Action, ActionKind, decode_action, encode_action
-from dreambot.core.commands import Commands, Reply, job_reply
+from dreambot.core.commands import Commands, Reply, job_reply, picked_reply
 from dreambot.core.jobs import EventType, Job, JobEvent, JobStatus
 from dreambot.core.service import Dreambot, DreambotError
 from dreambot.core.store import MessageLink
@@ -122,7 +123,10 @@ class ChatFrontend:
         ask_reply: bool = False,
     ) -> list[str]:
         """Send a message. Returns one reference per message sent (one per image when images
-        are sent separately), usable later with :meth:`edit`, :meth:`delete` and as a reply target."""
+        are sent separately), usable later with :meth:`edit`, :meth:`delete` and as a reply target.
+
+        ``images`` are the files to show with it: pictures, or a video (see :func:`is_video`),
+        which is always sent on its own."""
         raise NotImplementedError
 
     async def edit(self, conversation: str, ref: str, text: str, buttons: Buttons | None = None) -> None:
@@ -299,11 +303,7 @@ class ChatFrontend:
         if result.jobs:
             return None
         if action.kind is ActionKind.SELECT and result.job and result.image:
-            caption = f"Image {result.image.index} of #{result.job.id} — {render.job_title(result.job, 160)}"
-            await self._send_reply(
-                conversation,
-                Reply(text=caption, images=[result.image.path], job=result.job, image=result.image),
-            )
+            await self._send_reply(conversation, picked_reply(result.job, result.image))
             return None
         if action.kind is ActionKind.INFO and result.message:
             await self.send_text(conversation, result.message)
@@ -355,6 +355,15 @@ class ChatFrontend:
         if conversation is None:
             return
         reply = job_reply(job)
+        if job.status is JobStatus.DONE and job.is_video:
+            try:
+                await self._deliver_videos(conversation, job, reply)
+            except DreambotError as exc:
+                # Made, but not something this app takes (too large, say): say so, and where it is.
+                folder = os.path.dirname(job.media(job.images[0].index)) if job.images else ""
+                where = f" It is on the Mac, in {folder}." if folder else ""
+                await self.send_text(conversation, f"⚠️ {render.job_caption(job)}\n{exc}{where}")
+            return
         if job.status is JobStatus.DONE and len(job.images) > 1 and not self.grid_as_one_image:
             # No buttons and no grid: one message per image, so each can be replied to or
             # reacted to on its own, followed by the caption.
@@ -365,6 +374,17 @@ class ChatFrontend:
             await self.send_text(conversation, f"{render.job_caption(job)}\n{hint}")
             return
         await self._send_reply(conversation, reply)
+
+    async def _deliver_videos(self, conversation: str, job: Job, reply: Reply) -> None:
+        if len(job.images) < 2:
+            await self._send_reply(conversation, reply)
+            return
+        # Several videos: one message each, with its own buttons, then what they are.
+        for image in job.images:
+            one = Reply(text=f"Video {image.index}", images=[job.media(image.index)], job=job, image=image)
+            await self._send_reply(conversation, one)
+        hint = "" if self.has_buttons else "\nReply to a video with `extend` to make it longer (more: /help)"
+        await self.send_text(conversation, f"{render.job_caption(job)}{hint}")
 
     # ------------------------------------------------------------ job events ----
 
@@ -437,4 +457,12 @@ class _suppress_errors:
         return False
 
 
-__all__ = ["ENCODED_PREFIX", "PICK_PREFIX", "Buttons", "ChatFrontend", "Incoming"]
+VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v"})
+
+
+def is_video(path: str | os.PathLike[str]) -> bool:
+    """Whether a file a reply carries is a video rather than a picture."""
+    return os.path.splitext(os.fspath(path))[1].lower() in VIDEO_SUFFIXES
+
+
+__all__ = ["ENCODED_PREFIX", "PICK_PREFIX", "Buttons", "ChatFrontend", "Incoming", "is_video"]

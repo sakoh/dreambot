@@ -96,6 +96,51 @@ def working_size(width: int, height: int, *, native: int = 1024, multiple: int =
     return snap(width * factor, multiple), snap(height * factor, multiple)
 
 
+#: The widest and the tallest a video may be, as width over height.
+VIDEO_RATIOS = (1 / 3, 3.0)
+
+
+def video_dimensions(
+    ratio: float, *, native: int = 624, multiple: int = 32, scale: float = 1.0
+) -> tuple[int, int]:
+    """Width and height for a video of a given shape (``ratio`` is width over height).
+
+    A video model works at a pixel budget, like an image model, but on a coarse grid: both
+    sides have to be multiples of ``multiple`` (32 for Wan 2.2). So the size is the one on that
+    grid whose shape is closest to the shape asked for, among those of about ``native``
+    squared pixels: 832x480 for 16:9 at 624, 1248x704 at ``scale`` 1.5.
+    """
+    if not VIDEO_RATIOS[0] <= ratio <= VIDEO_RATIOS[1]:
+        raise PromptError(
+            "A video can be at most three times as wide as it is tall, or as tall as it is wide."
+        )
+    pixels = (native * scale) ** 2
+    width, height = math.sqrt(pixels * ratio), math.sqrt(pixels / ratio)
+    candidates = {
+        (w, h)
+        for w in (math.floor(width / multiple) * multiple, math.ceil(width / multiple) * multiple)
+        for h in (math.floor(height / multiple) * multiple, math.ceil(height / multiple) * multiple)
+        if w >= multiple and h >= multiple
+    }
+    # Closest in shape first; then closest in area, so that an exact shape is not bought with
+    # a video half or twice the size.
+    return min(
+        candidates,
+        key=lambda size: (abs(math.log(size[0] / size[1] / ratio)), abs(size[0] * size[1] - pixels)),
+    )
+
+
+def video_frames(seconds: float, *, fps: int, step: int, minimum: int = 1, maximum: int | None = None) -> int:
+    """How many frames a video of about ``seconds`` has: one, then whole groups of ``step``."""
+    groups = max(1, round((seconds * fps - 1) / step))
+    frames = 1 + step * groups
+    while frames < minimum:
+        frames += step
+    while maximum is not None and frames > maximum and frames - step >= 1 + step:
+        frames -= step
+    return frames
+
+
 def aspect_of(width: int, height: int) -> tuple[int, int]:
     """A human-friendly aspect ratio for a pixel size (1456x816 -> 16:9)."""
     target = width / height

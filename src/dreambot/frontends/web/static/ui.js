@@ -42,6 +42,11 @@ const PATHS = {
   info: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18z M12 11v6 M12 7.5v.5",
   text: "M5 6h14 M5 12h14 M5 18h9",
   stop: "M7 7h10v10H7z",
+  play: "M8 5l11 7-11 7z",
+  video: "M4 7h11v10H4z M15 10.5l5-3v9l-5-3",
+  sound: "M4 10v4h3l5 4V6l-5 4z M16 9a4 4 0 0 1 0 6 M18.5 6.5a7.5 7.5 0 0 1 0 11",
+  loop: "M17 3l3 3-3 3 M4 11V9a3 3 0 0 1 3-3h13 M7 21l-3-3 3-3 M20 13v2a3 3 0 0 1-3 3H4",
+  forward: "M5 6l7 6-7 6z M13 6l7 6-7 6z",
 };
 
 export function Icon({ name, size = 18, fill = false }) {
@@ -265,6 +270,93 @@ export function splitPrompt(prompt) {
     .split(/\s+(?=--[a-zA-Z])/)
     .map((piece) => piece.replace(/^--/, ""));
   return { text: prompt.slice(0, at).trim(), params };
+}
+
+/** How long a video is, the way it is written on it: "5s". */
+export const clipLength = (seconds) => `${Math.max(1, Math.round(seconds))}s`;
+
+/**
+ * What marks a tile as a video: a play sign, how long it is, and whether it has sound.
+ * `image` is a picture as the server describes it; nothing is drawn for one that is not a video.
+ */
+export function ClipBadge({ image }) {
+  if (!image.video) return null;
+  return html`<span class="clip-badge" title=${image.sound ? "A video, with sound" : "A video"}>
+    <${Icon} name="play" size=${10} fill=${true} /><span>${clipLength(image.seconds)}</span>
+    ${image.sound && html`<${Icon} name="sound" size=${12} />`}
+  </span>`;
+}
+
+/**
+ * A video over the picture that stands for it, without sound, for as long as it is drawn. It
+ * is drawn while the pointer is over a tile, so that a page of videos loads none of them.
+ * `at` (0 to 1) holds it at that point of its length instead of playing it: that is scrubbing.
+ */
+export function ClipPreview({ src, at = null }) {
+  const node = useRef(null);
+  useEffect(() => {
+    const video = node.current;
+    if (!video) return undefined;
+    video.muted = true; // set by hand: a browser only starts a video on its own when it is silent
+    if (at == null) {
+      const playing = video.play();
+      if (playing) playing.catch(() => {});
+      return undefined;
+    }
+    video.pause();
+    const seek = () => {
+      if (video.duration) video.currentTime = Math.min(Math.max(0, video.duration - 0.04), at * video.duration);
+    };
+    if (video.readyState >= 1) seek();
+    else video.addEventListener("loadedmetadata", seek, { once: true });
+    return () => video.removeEventListener("loadedmetadata", seek);
+  }, [at, src]);
+  return html`<video class="clip-preview" ref=${node} src=${src} muted loop playsinline preload="auto"></video>`;
+}
+
+/**
+ * A small menu where the pointer is, as a right-click gives one. `at` is { x, y } in the
+ * window; `items` are { label, icon, href, download, onClick }.
+ */
+export function ContextMenu({ at, items, onClose }) {
+  useEffect(() => {
+    const close = () => onClose();
+    const key = (event) => event.key === "Escape" && onClose();
+    document.addEventListener("mousedown", close);
+    document.addEventListener("scroll", close, true);
+    document.addEventListener("keydown", key);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("scroll", close, true);
+      document.removeEventListener("keydown", key);
+    };
+  }, []);
+  const left = Math.min(at.x, window.innerWidth - 220);
+  const top = Math.min(at.y, window.innerHeight - 44 * items.length - 12);
+  return html`<div
+    class="menu-list is-floating"
+    role="menu"
+    style=${{ left: `${left}px`, top: `${top}px` }}
+    onMouseDown=${(event) => event.stopPropagation()}
+    onClick=${(event) => event.stopPropagation()}
+  >
+    ${items.map((item) =>
+      item.href
+        ? html`<a role="menuitem" href=${item.href} download=${item.download || true} onClick=${() => onClose()}>
+            ${item.icon && html`<${Icon} name=${item.icon} size=${16} />`}<span>${item.label}</span>
+          </a>`
+        : html`<button
+            type="button"
+            role="menuitem"
+            onClick=${() => {
+              onClose();
+              item.onClick();
+            }}
+          >
+            ${item.icon && html`<${Icon} name=${item.icon} size=${16} />`}<span>${item.label}</span>
+          </button>`,
+    )}
+  </div>`;
 }
 
 /** Whether a file being dragged or pasted is a picture. */

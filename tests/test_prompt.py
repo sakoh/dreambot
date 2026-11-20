@@ -386,9 +386,11 @@ def test_niji_and_personalize_take_optional_values():
 
 def test_planned_and_ignored_parameters_are_reported_not_rejected():
     parsed = parse_prompt("x --video --motion high --stealth --turbo --tile")
-    assert parsed.planned == ["video", "motion", "tile"]
+    # Video is built; `--tile` is the one parameter still to come.
+    assert parsed.planned == ["tile"]
     assert parsed.ignored == ["stealth", "turbo"]
     assert parsed.params.speed == "turbo" and parsed.params.visibility == "stealth"
+    assert parsed.params.video is True and parsed.params.motion == "high"
 
 
 def test_given_and_merge():

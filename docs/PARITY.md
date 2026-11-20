@@ -53,7 +53,8 @@ platforms, which is how iMessage works.
 | Favorite ❤️ | ✅ | `fav 2` | Stored with the job. Favourites form the `liked` Lookbook: `--p liked`, and what a bare `--p` uses when no default is chosen. |
 | Envelope ✉️ (seed and job id) | ✅ | `info 2` | Also the ✉️ / ❓ reaction. |
 | Cancel ❌ | ✅ | `cancel` | Stops mid-generation within a step. |
-| Animate (High/Low motion), Extend | ⏳ | | Video is not built yet. |
+| Animate (Low motion) / (High motion) | 🟡 | `animate 2`, `animate 2 high`, `animate 2: she turns and smiles` | Four five-second videos that start on the image. With no words it is Midjourney's "auto": a model on the Mac looks at the picture and writes what happens. See [Video](#video). |
+| Extend (Low motion) / (High motion) | 🟡 | `extend`, `extend high`, `extend: it starts to rain` | Four seconds more, up to 21 in all. Each answer is the whole video, longer. |
 | Web | 🟡 | | There is no button, but every job from every chat app is in the web app (`dreambot web`). |
 | — | Edit | `edit: make it night` | Dreambot addition: instruction edit of a finished image. |
 | — | Add to a Lookbook | `look 2: autumn diner` | Dreambot addition: starts the Lookbook if there is none by that name. |
@@ -93,7 +94,14 @@ Tapbacks and reactions on an image: ❤️ favourite, 👍 upscale, ‼️ / �
 | `--fast`, `--relax`, `--turbo`, `--stealth`, `--public` | ⚪ | |
 | `--p`, `--profile`, `--personalize` | 🟡 | Lookbooks (see below): `--p` for your defaults, `--p <name or code>` for particular ones, several with `::weight`. `--stylize` sets how strongly they apply. Also `--look`. |
 | `--tile` | ⏳ | |
-| `--video`, `--motion`, `--loop`, `--end`, `--bs` | ⏳ | |
+| `--video` | ✅ | With an image (attached, or a link at the start of the prompt) the video starts on it. Midjourney takes nothing else. Here a prompt of words alone works too: Dreambot does what you would do by hand in Midjourney, draws the words as pictures first and starts a video on each. |
+| — | `--from picture`, `--from words` | A Dreambot addition. `--from words` gives the words to the video model with no picture to start on. `/settings picture-first off` makes that the rule. |
+| `--motion low`, `--motion high` | 🟡 | Midjourney's is a setting of its model. Here, as there, at low motion the frame stays where it is and what is in it moves, at high motion the camera moves too. It is how the video is started, not only what the model is told: at low motion a video begins as its picture held still under the noise, at high motion as noise alone. The director is told the same (how much moves, and whether the camera does). A video filmed from words alone has no picture to hold still, and there `--motion` is only said in the prompt. |
+| `--loop` | ✅ | The video ends on the frame it starts on. |
+| `--end` | ❌ | Wan 2.2 can start a video on a picture and cannot lead one up to a picture: held to one as its last frame, it films what it would have filmed and cuts to the picture a fifth of a second before the end. `--end` says so and makes nothing. |
+| `--bs` | ✅ | How many videos, 1 to 4. Four unless you say, as in Midjourney; `/settings videos 1`, `2` or `4` changes that for every prompt. |
+| `--raw` on a video | ✅ | Your words alone: nothing is added to them but how much should move. |
+| — | `--seconds 1…5` | A Dreambot addition. Midjourney's videos are five seconds long; so are Dreambot's unless you say. |
 | Multi-prompt weights `a::2 b::1`, negative weights | 🟡 | Parts are ordered by weight; negative parts become things to avoid. (Midjourney removed `::` in V7; Dreambot keeps it.) |
 | Permutations `{a, b}` | ✅ | In text and in parameters, nested, with `\,`; at most 40 jobs. |
 | Image prompts (links or attachments first) | 🟡 | Edit model, FLUX Redux, or plain image-to-image, whichever is installed. |
@@ -140,8 +148,27 @@ Tapbacks and reactions on an image: ❤️ favourite, 👍 upscale, ‼️ / �
 
 ## Video
 
-⏳ Not built. Midjourney's video is image-to-video; MLX has working ports (LTX-2, Wan 2.2) that could back an
-`animate` action.
+Midjourney's video model turns an image into a five-second clip. Dreambot does the same with an open
+video model (Wan 2.2 TI2V-5B, in FastVideo's three-step build for Apple Silicon, run by Dreambot's own
+MLX code), and the results are in the same spirit, not the same: it is a different model.
+
+| Midjourney | Dreambot | Notes |
+| --- | --- | --- |
+| Animate an image, auto | 🟡 | `animate`, the Animate buttons, **Animate Image → Auto** in the web app's lightbox. Midjourney writes the motion prompt itself, from the image and the prompt it was made from; here the vision model on your Mac (the one `/describe` uses) is shown the picture, told that prompt, and writes it. The video model is given the picture's own prompt and then that line. `info` shows what it wrote. |
+| Animate an image, manual (your own motion prompt) | ✅ | `animate 2: she turns to the camera`, or **Animate manually…** in the lightbox, which puts the picture in the prompt bar as the starting frame with its prompt to edit. A short prompt has a line added after it; `--raw` uses yours alone. |
+| Low and high motion | 🟡 | See `--motion` above. Low keeps the frame where it is. High moves the camera as well, and goes wrong more often, as it does in Midjourney. |
+| A starting frame of your own | ✅ | Attach an image to a `--video` prompt, or use the **Starting frame** box in the web app. |
+| An ending frame | ❌ | See `--end` above: this model cannot be led up to a picture. The web app shows no **Ending frame** box while it is the video model. |
+| Loop | 🟡 | `--loop`, and **Animate Image → Loop** in the lightbox. Midjourney's model makes a video whose last frame is its first. This one cannot be led back to a picture, so half is filmed and the other half is that half played backwards: it ends on the frame it starts on without a seam, and it goes out and comes back the way it came. |
+| Extend, auto and manual, up to 21 seconds | ✅ | Four seconds at a time (`--seconds` for another amount, up to 4.8). What is added goes on from the video's last five frames, so it keeps moving the way it was moving, and the frames before are kept exactly as they are: they are not encoded again. Auto continues from the prompt the video was made from, as Midjourney's does. Manual: **Extend manually…** puts the video in the prompt bar, where the words can be changed, as on Midjourney's site; new words are followed by a line from the director, who is shown the video's last frame. There is no `extend --loop`: that would take leading the video back to a picture. |
+| Batch size 1, 2 or 4 | ✅ | `--bs`; four by default. **Videos per prompt** in the web app's settings, `/settings videos`. They are made one after another, and each is shown as soon as it is made. |
+| 480p, and HD (720p) | ✅ | 832×480 for 16:9; `--hd`, or **Resolution** in the settings, makes 1248×704, which takes about three times as long. The sizes are the video model's: sides in steps of 32. |
+| Video from text alone | Dreambot addition | `a fox running through snow --video`: a picture is drawn first for each video, by the picture model, and the video starts on it. `--from words` films the words with no picture. |
+| Style and subject references and LoRAs in a video prompt | 🟡 | In a prompt of words alone they shape the pictures the videos start on. With a starting image of your own they are refused with the reason: the picture is already made. |
+| Playback: hover to play, ⌘ or Ctrl to scrub | ✅ | In the web app's feed. With the key held, every video of the job is held at the same moment. |
+| A video is shown by its last frame | ✅ | Its first frame is the picture it was made from. (A loop is shown by the frame it turns round on.) |
+| Download: for social, raw video, GIF | 🟡 | Right-click a video, or the lightbox's download menu: the video as it is, or a GIF. There is no separate encoding for social sites. |
+| Upscaling a video | ⏳ | `--hd` makes it larger from the start; a finished video cannot be enlarged. |
 
 ## Web app
 
@@ -151,11 +178,13 @@ Tapbacks and reactions on an image: ❤️ favourite, 👍 upscale, ‼️ / �
 | --- | --- | --- |
 | Create: the Imagine bar and the creation feed | ✅ | Enter sends, ⌘Enter sends and keeps the prompt. The feed is grouped by day and draws jobs as they run. One view; no grid/list/thumbnail switch. |
 | Images menu: uploads library, drop zones, pin | ✅ | Zones for image prompt, style reference and subject reference; upload, paste a link, or drag a picture from the feed. `--edit` is typed, or is the lightbox's Edit action. |
-| Settings menu | ✅ | Aspect ratio, model, raw, stylize, variety, weirdness; also images per prompt, HD, art direction, variation mode and remix. |
+| Settings menu | ✅ | Aspect ratio, model, raw, stylize, variety, weirdness; also images per prompt, HD, art direction, variation mode and remix, and the video settings below. |
 | Personalize button with default profiles | ✅ | The **P** button and its Lookbook picker. |
-| Hover actions on an image | ✅ | Vary subtle, vary strong, like, trash. |
+| Hover actions on an image | ✅ | Vary subtle, vary strong, animate, like, trash; on a video, Extend Auto and Extend Manual. A video plays while the pointer is over it. |
 | Prompt panel: rerun, use, copy | ✅ | No Style Creator button. |
-| Lightbox and its creation actions | ✅ | Vary subtle/strong, remix, upscale subtle/creative, zoom, pan, square, edit, rerun, describe; copy prompt, seed or job id; download; like; folders; Lookbooks; what it was made from and what was made from it. |
+| Lightbox and its creation actions | ✅ | Vary subtle/strong, remix, upscale subtle/creative, zoom, pan, square, animate, edit, rerun, describe; copy prompt, seed or job id; download; like; folders; Lookbooks; what it was made from and what was made from it. **Animate Image** has Midjourney's rows: Auto (low, high), Loop (low, high) and Animate manually. A video plays there, with **Extend Video** (Auto, and Extend manually) under it. |
+| Video in the Imagine bar (starting frame, ending frame, motion, loop) | 🟡 | The **Video** button, with a box for a starting frame, low or high motion, loop and length. No ending frame: the video model cannot be led up to one. Midjourney's bar films only once a starting frame is in it; here it also takes words alone (*Picture first* or *Words alone*). |
+| Settings: Video Batch Size, Video Resolution | ✅ | **Videos per prompt** (1, 2, 4) and **Resolution** (SD, HD) in the settings panel; also **From words** (picture first, or words alone). |
 | Organize | ✅ / ⏳ | See [Organisation and social](#organisation-and-social). |
 | Moodboards page | ✅ | The Lookbooks page, which also shows what Dreambot reads in a book. |
 | Explore → Styles | 🟡 | The Styles page: Dreambot's own codes. |
@@ -193,6 +222,7 @@ Tapbacks and reactions on an image: ❤️ favourite, 👍 upscale, ‼️ / �
 | Reactions / tapbacks | ✅ | ✅ | ✅ |
 | Grid | one image | one image | four separate images |
 | Full-quality originals | attached PNG (JPEG above 9.5 MB) | "Original" button sends the file | the PNG itself |
+| Videos | the MP4 (a smaller copy above 9.5 MB) | a video message (a smaller copy above 49 MB) | the MP4 itself |
 
 All three have been used on the live services, though not every action on each. See the README's
 verification table.

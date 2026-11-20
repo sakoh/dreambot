@@ -125,6 +125,8 @@ class Preferences(_Section):
     )
     #: Blending image prompts.
     blend: list[str] = Field(default_factory=lambda: ["dev-redux"])
+    #: Videos: animating a picture, `--video`, extending a video.
+    video: list[str] = Field(default_factory=lambda: ["wan-2.2"])
     #: Image-to-image fallbacks when a job's own model cannot do variations.
     variation: list[str] = Field(
         default_factory=lambda: [
@@ -161,6 +163,26 @@ class Defaults(_Section):
     #: Let a local language model add art direction to prompts. Unset: on when the Mac has the
     #: memory to keep that model loaded next to the image model (24 GB or more).
     enhance: bool | None = None
+
+
+class VideoConfig(_Section):
+    """How videos are made until a prompt says otherwise."""
+
+    #: Videos per job (``--bs``, and "Videos per prompt" in a person's settings). Four, as in
+    #: Midjourney: results differ a good deal from one to the next, and each takes about as long
+    #: as a grid of four pictures.
+    count: int = Field(default=4, ge=1, le=4)
+    #: Whether videos are made one size up (720p for 16:9, which takes three times as long)
+    #: unless a person's settings say.
+    hd: bool = False
+    #: Length in seconds (``--seconds``).
+    seconds: float = Field(default=5, ge=1, le=5)
+    #: How much moves (``--motion``).
+    motion: Literal["low", "high"] = "low"
+    #: Whether a video asked for in words alone starts on a picture made from those words first
+    #: (``--from picture``), as every video of Midjourney's starts on a picture. Off, the video
+    #: model films the words itself (``--from words``).
+    picture_first: bool = True
 
 
 class AccessConfig(_Section):
@@ -214,6 +236,7 @@ class Config(_Section):
     output_dir: Path = Field(default_factory=default_output_dir)
     engine: EngineConfig = Field(default_factory=EngineConfig)
     defaults: Defaults = Field(default_factory=Defaults)
+    video: VideoConfig = Field(default_factory=VideoConfig)
     prefer: Preferences = Field(default_factory=Preferences)
     models: dict[str, ModelOverride] = Field(default_factory=dict)
     assist: AssistConfig = Field(default_factory=AssistConfig)

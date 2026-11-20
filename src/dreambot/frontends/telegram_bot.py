@@ -44,10 +44,11 @@ from telegram.ext import (
 )
 from telegram.request import BaseRequest
 
+from dreambot.core import video
 from dreambot.core.commands import Reply
 from dreambot.core.imaging import flatten
 from dreambot.core.service import Dreambot, DreambotError
-from dreambot.frontends.base import Buttons, ChatFrontend, Incoming
+from dreambot.frontends.base import Buttons, ChatFrontend, Incoming, is_video
 
 log = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -55,6 +56,8 @@ T = TypeVar("T")
 #: Telegram shows a photo at up to 1280px and rejects photos over 10 MB or 10,000px combined.
 PHOTO_MAX_BYTES = 9 * 1024 * 1024
 PHOTO_MAX_DIMENSIONS = 9500
+#: Telegram takes files of up to 50 MB from a bot.
+VIDEO_MAX_BYTES = 49 * 1024 * 1024
 #: Messages of one album arrive separately; wait this long for the rest before acting.
 ALBUM_WAIT = 0.8
 FILE_PREFIX = "tg:file"
@@ -220,6 +223,8 @@ class TelegramFrontend(ChatFrontend):
     def _buttons_for(self, reply: Reply) -> Buttons | None:
         """Add an "original file" button: Telegram recompresses photos, and people want the PNG."""
         buttons = super()._buttons_for(reply)
+        if reply.images and is_video(reply.images[0]):
+            return buttons  # a video is sent as the file it is
         if buttons and reply.job is not None and reply.job.images and reply.images:
             label = "⬇️ Original" if reply.image else "⬇️ Originals"
             index = reply.image.index if reply.image else ""
@@ -250,6 +255,8 @@ class TelegramFrontend(ChatFrontend):
             )
             return [str(message.message_id)]
         caption = text[:1024] or None
+        if any(is_video(path) for path in images):
+            return await self._send_videos(images, caption, self._keyboard(buttons), common)
         # Files are passed as paths, not open handles: each attempt then reads the file afresh.
         photos = [self._photo(path) for path in images[:10]]
         if len(photos) == 1:
@@ -268,6 +275,39 @@ class TelegramFrontend(ChatFrontend):
             )
         )
         return [str(message.message_id) for message in messages]
+
+    async def _send_videos(
+        self, paths: Sequence[str], caption: str | None, markup: InlineKeyboardMarkup | None, common: dict
+    ) -> list[str]:
+        """Send videos, each as a message of its own: only then can one carry buttons."""
+        bot = self.app.bot
+        refs: list[str] = []
+        for position, path in enumerate(paths[:10]):
+            source = Path(path)
+            try:
+                # Told the size and the length, Telegram shows the video at its shape from the start.
+                info = await asyncio.to_thread(video.probe, source)
+                if source.stat().st_size > VIDEO_MAX_BYTES:
+                    self._downloads.mkdir(parents=True, exist_ok=True)
+                    smaller = self._downloads / f"video-{uuid.uuid4().hex[:12]}.mp4"
+                    source = await asyncio.to_thread(video.fit, source, smaller, limit=VIDEO_MAX_BYTES)
+            except video.VideoError as exc:
+                raise DreambotError(str(exc)) from exc
+            last = position == len(paths[:10]) - 1
+            message = await self._call(
+                lambda source=source, info=info, first=position == 0, last=last: bot.send_video(
+                    video=source,
+                    caption=caption if first else None,
+                    reply_markup=markup if last else None,
+                    width=info.width,
+                    height=info.height,
+                    duration=round(info.seconds),
+                    supports_streaming=True,
+                    **common,
+                )
+            )
+            refs.append(str(message.message_id))
+        return refs
 
     async def edit(self, conversation: str, ref: str, text: str, buttons: Buttons | None = None) -> None:
         chat_id, _ = self._address(conversation)
@@ -393,7 +433,8 @@ class TelegramFrontend(ChatFrontend):
             images = [job.image(int(index))] if index else job.images
         except (DreambotError, KeyError, ValueError):
             return "⚠️ Those files are no longer available."
-        paths = [Path(image.path) for image in images if Path(image.path).is_file()]
+        paths = [Path(job.media(image.index)) for image in images]
+        paths = [path for path in paths if path.is_file()]
         if not paths:
             return "⚠️ Those files are no longer on disk."
         chat_id, thread = self._address(conversation)

@@ -1,4 +1,4 @@
-"""Jobs: one unit of work a person asked for, and the images it produced."""
+"""Jobs: one unit of work a person asked for, and the images (or videos) it produced."""
 
 from __future__ import annotations
 
@@ -38,6 +38,16 @@ class JobKind(StrEnum):
     BLEND = "blend"
     DESCRIBE = "describe"
     SHORTEN = "shorten"
+    #: A video made from a prompt (``--video``).
+    VIDEO = "video"
+    #: A video made of one of Dreambot's own pictures.
+    ANIMATE = "animate"
+    #: A video continued past its end.
+    EXTEND = "extend"
+
+
+#: The kinds of job whose results are videos.
+VIDEO_KINDS = frozenset({JobKind.VIDEO, JobKind.ANIMATE, JobKind.EXTEND})
 
 
 class JobStatus(StrEnum):
@@ -64,6 +74,29 @@ class JobImage:
     #: The full prompt this image was rendered from, when it says more than the job's text
     #: (per-image art direction). Variations and upscales of the image start from it.
     prompt: str | None = None
+
+
+@dataclass(frozen=True)
+class Clip:
+    """A video a job made.
+
+    A video is kept beside a picture: the image of the same number in ``Job.images`` is its
+    first frame. So everything that shows or lists a job's images (a gallery, a thumbnail, a
+    Lookbook) works for videos too, and what is specific to a video is asked for here.
+    """
+
+    path: str
+    frames: int
+    fps: float
+    #: Whether it has a soundtrack.
+    sound: bool = False
+    #: A picture to show it by among others: the frame it ends on (the frame it turns round on,
+    #: for a loop). Its first frame is the picture it was made from, and would look like it.
+    poster: str | None = None
+
+    @property
+    def seconds(self) -> float:
+        return self.frames / self.fps if self.fps else 0.0
 
 
 @dataclass
@@ -109,6 +142,33 @@ class Job:
             if image.index == index:
                 return image
         raise KeyError(index)
+
+    def clip(self, index: int) -> Clip | None:
+        """The video whose first frame image ``index`` is, if this job made videos."""
+        # Kept under `detail`, which older builds read without minding what is in it.
+        kept = (self.detail.get("clips") or {}).get(str(index))
+        if not kept:
+            return None
+        return Clip(
+            path=str(kept["path"]),
+            frames=int(kept["frames"]),
+            fps=float(kept["fps"]),
+            sound=bool(kept.get("sound")),
+            poster=kept.get("poster") or None,
+        )
+
+    def keep_clip(self, index: int, clip: Clip) -> None:
+        self.detail.setdefault("clips", {})[str(index)] = asdict(clip)
+
+    @property
+    def is_video(self) -> bool:
+        """Whether what this job made (or is making) are videos."""
+        return self.kind in VIDEO_KINDS or bool(self.detail.get("clips"))
+
+    def media(self, index: int) -> str:
+        """The file to show for result ``index``: its video, or else its picture."""
+        clip = self.clip(index)
+        return clip.path if clip is not None else self.image(index).path
 
     @property
     def is_grid(self) -> bool:
@@ -158,5 +218,8 @@ class JobEvent:
     fraction: float = 0.0
     #: Path of a preview image (PREVIEW).
     preview: str | None = None
+    #: Which result of the job the preview is of, when it is of one and not of the job as a
+    #: whole: the picture one of a job's videos is going to start on.
+    slot: int | None = None
     #: Position in the queue, 0 = next (QUEUED).
     position: int = 0

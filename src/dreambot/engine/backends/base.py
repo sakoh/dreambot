@@ -13,6 +13,7 @@ from typing import Protocol
 from pydantic import BaseModel
 
 from dreambot.engine.protocol import (
+    VIDEO_OPS,
     DescribeRequest,
     ErrorKind,
     GenerateRequest,
@@ -81,6 +82,12 @@ def require_inputs(req: GenerateRequest, max_refs: int = 0) -> None:
     op = req.op
     if op in (Op.IMG2IMG, Op.UPSCALE, Op.CONTROL, Op.INPAINT) and not req.image:
         raise BackendError(f"'{op.value}' needs an input image.", ErrorKind.INVALID)
+    if op is Op.IMG2VID and not (req.image or req.end_image):
+        raise BackendError("'img2vid' needs an image to start on or to end on.", ErrorKind.INVALID)
+    if op is Op.EXTEND and not req.video:
+        raise BackendError("'extend' needs a video to continue.", ErrorKind.INVALID)
+    if op in VIDEO_OPS and (req.frames is None or req.frames < 1 or not req.fps or req.fps <= 0):
+        raise BackendError(f"'{op.value}' needs a number of frames and a frame rate.", ErrorKind.INVALID)
     if op is Op.INPAINT and not req.mask:
         raise BackendError("'inpaint' needs a mask image.", ErrorKind.INVALID)
     if op in (Op.EDIT, Op.REDUX):
@@ -99,11 +106,17 @@ def require_inputs(req: GenerateRequest, max_refs: int = 0) -> None:
         raise BackendError("stop_at must be in (0, 1].", ErrorKind.INVALID)
 
 
+def input_files(req: GenerateRequest) -> list[str]:
+    """Every file a request reads: its pictures, its mask, its video."""
+    return [path for path in (req.image, req.mask, req.end_image, req.video, *req.images) if path]
+
+
 __all__ = [
     "Backend",
     "BackendError",
     "JobCancelled",
     "JobContext",
     "LoadedModel",
+    "input_files",
     "require_inputs",
 ]

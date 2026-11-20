@@ -179,9 +179,9 @@ async def test_chaos_gives_each_image_its_own_direction(bot):
 
 async def test_planned_and_ignored_parameters_do_not_fail_the_job(bot):
     service, recorder = bot
-    job = await imagine(service, recorder, "a fox --video --stealth --turbo --v 8.2 --n 1")
+    job = await imagine(service, recorder, "a fox --tile --stealth --turbo --v 8.2 --n 1")
     assert job.status is JobStatus.DONE
-    assert any("`--video` isn't available yet" in note for note in job.notes)
+    assert any("`--tile` isn't available yet" in note for note in job.notes)
 
 
 async def test_hd_upscales_every_image(bot):
@@ -428,11 +428,13 @@ async def test_reroll_reruns_with_new_seeds(bot, sample_image):
     assert again.kind is JobKind.VARIATION and again.parent == job.id and again.seeds != varied.seeds
 
 
-async def test_animate_is_not_available_yet(bot):
+async def test_animate_turns_the_last_picture_into_a_video(bot):
+    """The typed shortcut on the latest job; everything else about videos is in test_video.py."""
     service, recorder = bot
-    await imagine(service, recorder, "a fox --n 1")
-    with pytest.raises(DreambotError, match="isn't available yet"):
-        await service.act(user=USER, channel=CHANNEL, action=parse_action("animate"))
+    picture = await imagine(service, recorder, "a fox --n 1")
+    made = await act(service, recorder, "animate")
+    assert made.kind is JobKind.ANIMATE and (made.parent, made.parent_index) == (picture.id, 1)
+    assert made.is_video and Path(made.clip(1).path).suffix == ".mp4"
 
 
 # --------------------------------------------------------------------------------------

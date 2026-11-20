@@ -8,12 +8,42 @@ const DRAFT_KEY = "dreambot-draft";
 const listeners = new Set();
 let scheduled = false;
 
+/** What the prompt bar's Video button and its options start as: off, and everything as Dreambot is set up. */
+const NO_VIDEO = { on: false, motion: "", loop: false, seconds: "", from: "" };
+
+/**
+ * What a video made from words alone starts on: "picture" (one drawn from the words first) or
+ * "words" (nothing: the video model films the words itself). The bar's own choice, or else the
+ * person's setting.
+ */
+export function videoFrom(draft = store.draft) {
+  const usual = !store.app || store.app.settings.picture_first ? "picture" : "words";
+  return (draft.video && draft.video.from) || usual;
+}
+/** How many seconds an extension adds unless the bar says otherwise (Midjourney's four). */
+export const EXTEND_SECONDS = 4;
+
 function loadDraft() {
-  const empty = { text: "", refs: [], params: { ar: "", chaos: 0, weird: 0 }, pinned: false };
+  const empty = {
+    text: "",
+    refs: [],
+    params: { ar: "", chaos: 0, weird: 0 },
+    pinned: false,
+    video: NO_VIDEO,
+    /** The video the bar is set to continue ("Extend Manual"): { job, index, poster, seconds } or null. */
+    extend: null,
+  };
   try {
     const saved = JSON.parse(localStorage.getItem(DRAFT_KEY) || "null");
     if (!saved) return empty;
-    return { ...empty, ...saved, params: { ...empty.params, ...(saved.params || {}) }, refs: saved.refs || [] };
+    return {
+      ...empty,
+      ...saved,
+      params: { ...empty.params, ...(saved.params || {}) },
+      video: { ...NO_VIDEO, ...(saved.video || {}) },
+      refs: saved.refs || [],
+      extend: null, // what was being continued does not outlive a reload
+    };
   } catch {
     return empty;
   }
@@ -30,7 +60,10 @@ export const store = {
   search: "",
   /** Progress of jobs that are queued or running: id -> { type, fraction, position, preview }. */
   live: new Map(),
-  /** The prompt being written: its text, its reference pictures and styles, its sticky parameters. */
+  /**
+   * The prompt being written: its text, its reference pictures and styles, its sticky parameters,
+   * and whether it asks for a video (and for what kind of one).
+   */
   draft: loadDraft(),
   /** The image open in the lightbox: { job, index, sequence } with ids, or null. */
   lightbox: null,
@@ -92,9 +125,9 @@ export async function attempt(work, done) {
 // ------------------------------------------------------------------------------- draft
 
 export function saveDraft() {
-  const { text, params, pinned, refs } = store.draft;
+  const { text, params, pinned, refs, video } = store.draft;
   // References are only kept across a reload when the person pinned them.
-  localStorage.setItem(DRAFT_KEY, JSON.stringify({ text, params, pinned, refs: pinned ? refs : [] }));
+  localStorage.setItem(DRAFT_KEY, JSON.stringify({ text, params, pinned, video, refs: pinned ? refs : [] }));
 }
 
 export function setDraft(changes) {
@@ -107,7 +140,8 @@ let refId = 0;
 
 /**
  * Add a reference to the prompt being written.
- * role: "image" (image prompt), "style", "subject" or "look".
+ * role: "image" (image prompt; for a video, the frame it starts on), "style", "subject", "look",
+ * or "end" (the frame a video ends on).
  * A picture reference has `picture` ({upload} or {job, index}) and `url`; a style code has `code`;
  * a saved style has `saved` (its one-word name); a Lookbook has `look` (name or code).
  */
@@ -117,7 +151,52 @@ export function addRef(ref) {
     JSON.stringify([other.picture, other.code, other.saved, other.look]) ===
       JSON.stringify([ref.picture, ref.code, ref.saved, ref.look]);
   if (store.draft.refs.some(same)) return;
-  setDraft({ refs: [...store.draft.refs, { weight: 1, ...ref, id: `r${++refId}-${Date.now()}` }] });
+  // A video starts on one picture and ends on one: a new one takes the place of the last.
+  const single = ref.role === "end" || (ref.role === "image" && store.draft.video.on);
+  const kept = single ? store.draft.refs.filter((other) => other.role !== ref.role) : store.draft.refs;
+  setDraft({ refs: [...kept, { weight: 1, ...ref, id: `r${++refId}-${Date.now()}` }] });
+}
+
+/** Switch the prompt bar between pictures and video. */
+export function setVideo(changes) {
+  const video = { ...store.draft.video, ...changes };
+  // An ending frame belongs to a video: it goes when the bar goes back to pictures. So does
+  // the video that was going to be continued.
+  const refs = video.on ? store.draft.refs : store.draft.refs.filter((ref) => ref.role !== "end");
+  setDraft({ video, refs, extend: video.on ? store.draft.extend : null });
+}
+
+/** The words of a prompt as a job keeps it, without the parameters after them. */
+const wordsOf = (prompt) => {
+  const at = (prompt || "").search(/(^|\s)--[a-zA-Z]/);
+  return (at === -1 ? prompt || "" : prompt.slice(0, at)).trim();
+};
+
+/**
+ * "Animate Manually": put a picture in the prompt bar as the frame a video starts on, with the
+ * words it was made from, to be changed into what should happen before it is sent.
+ */
+export function animateManually(job, image) {
+  const start = { role: "image", picture: { job: job.id, index: image.index }, url: image.url, name: `#${job.id}` };
+  setDraft({
+    text: wordsOf(job.prompt),
+    video: { ...store.draft.video, on: true, loop: false },
+    refs: [{ weight: 1, ...start, id: `r${++refId}-${Date.now()}` }],
+    extend: null,
+  });
+}
+
+/**
+ * "Extend Manual": set the prompt bar to continue a video, with the words it was made from,
+ * to be changed into what happens next. How much is added can be chosen there.
+ */
+export function extendManually(job, image) {
+  setDraft({
+    text: wordsOf(job.prompt),
+    video: { ...store.draft.video, on: true, seconds: "", loop: false },
+    refs: [],
+    extend: { job: job.id, index: image.index, poster: image.poster || image.url, seconds: image.seconds },
+  });
 }
 
 export function updateRef(id, changes) {
@@ -141,11 +220,34 @@ export function compose(draft = store.draft) {
     attachments.push(ref.picture);
     return `@${attachments.length}`;
   };
+  const filming = Boolean(draft.video && draft.video.on);
+  // One of Dreambot's own pictures as the starting frame, and nothing else that shapes a picture.
+  const first = draft.refs.find((ref) => ref.role === "image");
+  const own = first && first.picture && first.picture.job ? first.picture : null;
+  const plain = draft.refs.every((ref) => ref === first || ref.role === "end");
+  if (filming && (draft.extend || (own && plain))) {
+    // A video is continued, and a picture of Dreambot's animated, by the action their buttons
+    // send, with these words: so that what is made is kept with what it was made from.
+    const ends = draft.refs.filter((ref) => ref.role === "end").map((ref) => attach(ref));
+    const { motion, loop, seconds } = draft.video;
+    let words = draft.text.trim();
+    const say = (parameter) => (words = `${words} ${parameter}`.trim());
+    if (ends.length && !typed(words, "end")) say(`--end ${ends[0]}`);
+    // A loop ends on the frame it starts on; a video continued as one is led back to its first.
+    if (loop && !ends.length && !typed(words, "loop")) say("--loop");
+    if (seconds && !typed(words, "seconds") && !typed(words, "sec")) say(`--seconds ${seconds}`);
+    const action = draft.extend
+      ? { kind: "extend", job: draft.extend.job, index: draft.extend.index }
+      : { kind: "animate", job: own.job, index: own.index };
+    return { prompt: words, attachments, action: { ...action, motion: motion || undefined } };
+  }
   const subjects = draft.refs.filter((ref) => ref.role === "subject").map((ref) => attach(ref));
   const styles = draft.refs
     .filter((ref) => ref.role === "style")
     .map((ref) => weighted(ref.code || ref.saved || attach(ref), ref.weight));
-  for (const ref of draft.refs) if (ref.role === "image") attach(ref);
+  // For a video, the image prompt is the frame it starts on.
+  const starts = draft.refs.filter((ref) => ref.role === "image").map((ref) => attach(ref));
+  const ends = filming ? draft.refs.filter((ref) => ref.role === "end").map((ref) => attach(ref)) : [];
   const looks = draft.refs.filter((ref) => ref.role === "look").map((ref) => weighted(ref.look, ref.weight));
 
   let prompt = draft.text.trim();
@@ -155,7 +257,29 @@ export function compose(draft = store.draft) {
   if (looks.length) add(`--p ${looks.join(" ")}`);
   // Sticky parameters apply unless the prompt says otherwise itself.
   const { ar, chaos, weird } = draft.params;
-  if (ar && !typed(prompt, "ar") && !typed(prompt, "aspect")) add(`--ar ${ar}`);
+  const shaped = typed(prompt, "ar") || typed(prompt, "aspect");
+  if (filming) {
+    const { motion, loop, seconds, from } = draft.video;
+    // With no picture given, one is drawn from the words first, unless the words are to be filmed.
+    const wordsOnly = !starts.length && !ends.length;
+    const drawn = wordsOnly && videoFrom(draft) === "picture";
+    if (!typed(prompt, "video")) add("--video");
+    if (wordsOnly && from && !typed(prompt, "from")) add(`--from ${from}`);
+    if (ends.length && !typed(prompt, "end")) add(`--end ${ends[0]}`);
+    if (motion && !typed(prompt, "motion")) add(`--motion ${motion}`);
+    // A loop comes back to the frame it starts on, so it has one, and no other frame to end on.
+    if (loop && (starts.length || drawn) && !ends.length && !typed(prompt, "loop")) add("--loop");
+    if (seconds && !typed(prompt, "seconds") && !typed(prompt, "sec")) add(`--seconds ${seconds}`);
+    // A video has the shape of the picture it starts on; the sticky shape is for one made from words.
+    if (ar && !shaped && wordsOnly) add(`--ar ${ar}`);
+    if (drawn) {
+      // What shapes a picture shapes the one the video starts on.
+      if (Number(chaos) > 0 && !typed(prompt, "chaos") && !typed(prompt, "c")) add(`--chaos ${chaos}`);
+      if (Number(weird) > 0 && !typed(prompt, "weird") && !typed(prompt, "w")) add(`--weird ${weird}`);
+    }
+    return { prompt, attachments };
+  }
+  if (ar && !shaped) add(`--ar ${ar}`);
   if (Number(chaos) > 0 && !typed(prompt, "chaos") && !typed(prompt, "c")) add(`--chaos ${chaos}`);
   if (Number(weird) > 0 && !typed(prompt, "weird") && !typed(prompt, "w")) add(`--weird ${weird}`);
   return { prompt, attachments };
@@ -267,9 +391,13 @@ export async function imagine(prompt, attachments = []) {
   return answer.jobs;
 }
 
-/** Press one of the buttons under an image. Returns the server's answer, or undefined on an error. */
-export async function act(jobId, kind, { index, value, prompt } = {}) {
-  const answer = await attempt(() => api.post(`/api/jobs/${jobId}/act`, { kind, index, value, prompt }));
+/**
+ * Press one of the buttons under an image. Returns the server's answer, or undefined on an error.
+ * `attachments` are pictures that go with the action, as `@1`, `@2` in its words.
+ */
+export async function act(jobId, kind, { index, value, prompt, attachments } = {}) {
+  const body = { kind, index, value, prompt, attachments };
+  const answer = await attempt(() => api.post(`/api/jobs/${jobId}/act`, body));
   if (!answer) return undefined;
   for (const job of answer.jobs) putJob(job);
   if (answer.job) keepJob(answer.job);
@@ -306,6 +434,8 @@ export function connect() {
         fraction: event.type === "progress" || event.type === "preview" ? event.fraction : before.fraction || 0,
         position: event.position,
         preview: event.preview || before.preview,
+        // The pictures its videos are going to start on, by the number of the video.
+        starts: event.starts || before.starts,
       });
     }
     if (store.app) store.app.queue = [...store.live.keys()].length;

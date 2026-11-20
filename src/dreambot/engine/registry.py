@@ -1,4 +1,4 @@
-"""The model registry: every MLX image model Dreambot can drive, and what each one can do.
+"""The model registry: every MLX image and video model Dreambot can drive, and what each one can do.
 
 This module is pure data — it never imports ``mlx`` or ``mflux`` — so the (lightweight) bot
 process can plan jobs without loading the inference stack. The worker process resolves the
@@ -8,6 +8,9 @@ Because the table mirrors mflux's own model list, ``tests/test_registry.py`` che
 the installed mflux (every mflux model is covered, default step counts match, every class path
 imports). An mflux upgrade that adds or moves a model therefore fails a test instead of
 silently going unsupported.
+
+mflux has no video models. The one there is, Wan 2.2, is run by Dreambot's own engine
+(:mod:`dreambot.engine.wan`, ``runtime="wan"``).
 
 Operations map onto Midjourney features like this:
 
@@ -19,6 +22,9 @@ Operations map onto Midjourney features like this:
 ``redux``    image prompts and /blend
 ``control``  retexture (keep structure, repaint)
 ``upscale``  Upscale (Subtle)
+``txt2vid``  /imagine with ``--video``
+``img2vid``  Animate, a start frame, loops
+``extend``   Extend
 ==========  =====================================================================
 """
 
@@ -56,12 +62,49 @@ class Variant:
 
 
 @dataclass(frozen=True)
+class VideoTraits:
+    """What the videos of a model are like."""
+
+    #: Frames per second.
+    fps: int = 24
+    #: A video has ``1 + step * n`` frames: one, then whole groups of this many.
+    step: int = 4
+    #: The longest video made in one go, in frames.
+    max_frames: int = 121
+    #: The frames an extension adds follow from this many at the video's end, so a video needs
+    #: at least this many to be extended, and one go adds at most ``max_frames`` less these.
+    carry: int = 5
+    #: The model can lead a video up to a picture it is given to end on.
+    ends: bool = False
+
+    @property
+    def added(self) -> int:
+        """The most frames one extension adds."""
+        return self.max_frames - self.carry
+
+
+@dataclass(frozen=True)
+class Asset:
+    """A file a model reads that is published somewhere other than Hugging Face."""
+
+    #: The name it is kept under on this Mac (:func:`dreambot.engine.weights.assets_dir`).
+    name: str
+    #: Where it is published. The address names one state of the file for good (a commit).
+    url: str
+    #: The SHA-256 of what is there. Anything else is not kept.
+    sha256: str
+    #: Its licence, as its publisher states it.
+    license: str = ""
+
+
+@dataclass(frozen=True)
 class ModelSpec:
     id: str
     title: str
     family: str
     summary: str
-    #: Key in mflux's ``AVAILABLE_MODELS`` (selects the ``ModelConfig``).
+    #: Key in mflux's ``AVAILABLE_MODELS`` (selects the ``ModelConfig``). Empty for a model
+    #: that mflux does not run.
     mflux_key: str
     #: Upstream Hugging Face repo with the original weights.
     repo: str
@@ -70,13 +113,16 @@ class ModelSpec:
     slug: str | None = None
     #: Additional upstream repos the model needs (ControlNets, adapters).
     extra_repos: tuple[str, ...] = ()
-    #: The files this model reads from the upstream repo, when that repo holds several models
-    #: (SeedVR2 3B and 7B, the Anima variants). The original weights then count as installed
-    #: only if these are present. Empty: the whole repo is the model.
+    #: The files this model reads from a repo that holds more than it needs: the upstream repo
+    #: of several models (SeedVR2 3B and 7B, the Anima variants), or each of its ``exports``.
+    #: The weights then count as installed only if these are present, and only these are
+    #: downloaded. A name may be a pattern (``*.json``). Empty: the whole repo is the model.
     files: tuple[str, ...] = ()
     #: Separate models the model cannot run without, whatever export of it is installed
     #: (FIBO's prompt-writing VLM).
     helper_repos: tuple[str, ...] = ()
+    #: Files the model cannot run without that are not on Hugging Face.
+    assets: tuple[Asset, ...] = ()
     #: Default number of denoising steps.
     steps: int = 25
     #: Default guidance. ``None`` leaves the model's own default in place.
@@ -97,6 +143,13 @@ class ModelSpec:
     aliases: tuple[str, ...] = ()
     #: Exercised end-to-end by Dreambot's own test-suite on real weights.
     verified: bool = False
+    #: What runs it: ``mflux``, or ``wan`` (Dreambot's own engine) for the video model.
+    runtime: str = "mflux"
+    #: The weights as that library reads them, when they are published per quantization in
+    #: repos of their own rather than by the mflux community: ``{"q8": "<repo id>", ...}``.
+    exports: Mapping[str, str] = field(default_factory=dict)
+    #: Set for a video model: what its videos are like.
+    video: VideoTraits | None = None
 
     def supports(self, op: Op) -> bool:
         return op in self.variants
@@ -176,6 +229,8 @@ _MOSS = "moss_image.variants.txt2img.moss_image:MOSSImage"
 _BOOGU = "boogu.variants.txt2img.boogu_image:BooguImage"
 _ANIMA = "anima.variants.txt2img.anima:Anima"
 _SEEDVR2 = "seedvr2.variants.upscale.seedvr2:SeedVR2"
+# The video model is run by Dreambot's own engine, the same way for every operation.
+_WAN = Variant(cls="dreambot.engine.backends.wan:WanVideo")
 
 # -- licenses --------------------------------------------------------------------------
 # License identifiers exactly as each upstream Hugging Face repo reports them.
@@ -1178,6 +1233,50 @@ def _specs() -> list[ModelSpec]:
             distilled=True,
             license=_LIC_APACHE,
             tags=("upscale", "quality"),
+        ),
+        # ------------------------------------------------------------------- Video ----
+        ModelSpec(
+            id="wan-2.2",
+            title="Wan 2.2",
+            family="wan",
+            summary=(
+                "Alibaba's 5B video model in FastVideo's three-step build for Apple Silicon: "
+                "video from words or from a picture."
+            ),
+            mflux_key="",
+            repo="Wan-AI/Wan2.2-TI2V-5B",
+            runtime="wan",
+            # FastMetal: distilled to three steps and trained to run packed to 8 bits. It is the
+            # one form these weights are published in for MLX.
+            exports=MappingProxyType({"q8": "FastVideo/FastMetal-5B-QAD"}),
+            # (The repo also holds Wan's own 2.8 GB autoencoder, which is not read.)
+            files=("mlx_dit.safetensors", "mlx_dit.json", "text_encoder/*", "tokenizer/tokenizer.json"),
+            assets=(
+                # TAEHV, the small autoencoder the frames are decoded by. Its author publishes
+                # it on GitHub; this is the file FastVideo's own runtime fetches.
+                Asset(
+                    name="taew2_2.safetensors",
+                    url=(
+                        "https://raw.githubusercontent.com/madebyollin/taehv/"
+                        "563f40bdc820ed86bcad72ea515ee48f06bd22ec/taew2_2.pth"
+                    ),
+                    sha256="d053e216ca50e2bb837bbcd79b85f0366bea00e5938025572382a773b74c559a",
+                    license=_LIC_MIT,
+                ),
+            ),
+            variants={Op.TXT2VID: _WAN, Op.IMG2VID: _WAN, Op.EXTEND: _WAN},
+            # The model is distilled to exactly these three passes.
+            steps=3,
+            distilled=True,
+            # Sides are multiples of 32, and the size is the one closest to 832x480 in area
+            # (which is what a native side of 624 gives for 16:9; 1248x704 at 1.5 times that).
+            multiple=32,
+            native=624,
+            video=VideoTraits(fps=24, step=4, max_frames=121, carry=5, ends=False),
+            license=_LIC_APACHE,
+            tags=("video", "fast", "default"),
+            aliases=("wan", "wan2.2", "wan-2.2-5b", "wan-video", "fastmetal"),
+            verified=True,
         ),
     ]
 

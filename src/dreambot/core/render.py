@@ -17,6 +17,9 @@ KIND_LABELS = {
     JobKind.BLEND: "Blend",
     JobKind.DESCRIBE: "Describe",
     JobKind.SHORTEN: "Shorten",
+    JobKind.VIDEO: "Video",
+    JobKind.ANIMATE: "Animated",
+    JobKind.EXTEND: "Extended",
 }
 
 
@@ -41,12 +44,23 @@ def job_caption(job: Job, *, markdown: bool = False) -> str:
         label = "Made square" if detail.get("square") else f"Zoomed out {detail.get('factor', 2):g}x"
     elif job.kind is JobKind.PAN and detail.get("direction"):
         label = f"Panned {detail['direction']}"
+    elif job.is_video and detail.get("video"):
+        made = detail["video"]
+        how = [f"{made.get('motion', 'low')} motion"]
+        if made.get("loop"):
+            how.append("looping")
+        if job.kind is JobKind.EXTEND and made.get("added"):
+            label = f"Extended by {made['added']:g}s"
+        label = f"{label} ({', '.join(how)})"
 
     facts = [job.model] if job.model else []
     if job.images:
         facts.append(f"{job.images[0].width}×{job.images[0].height}")
+        if clip := job.clip(job.images[0].index):
+            # How long the video is; the next fact is how long it took to make.
+            facts.append(f"{clip.seconds:.0f}s long")
     if job.seconds is not None:
-        facts.append(f"{job.seconds:.0f}s")
+        facts.append(f"made in {job.seconds:.0f}s" if job.is_video else f"{job.seconds:.0f}s")
     facts.append(f"#{job.id}")
 
     head = f"{bold}{job_title(job)}{bold}"
@@ -100,46 +114,64 @@ def grid_actions(job: Job) -> list[list[tuple[str, Action]]]:
     return rows
 
 
-def image_actions(job: Job, image: JobImage) -> list[list[tuple[str, Action]]]:
-    """Rows of (label, action) under a single image."""
+def video_actions(job: Job, image: JobImage) -> list[list[tuple[str, Action]]]:
+    """Rows of (label, action) under a video: Midjourney's Extend buttons, and what else applies."""
 
     def a(kind: ActionKind, value: str | None = None) -> Action:
         return Action(kind, job.id, image.index, value)
 
-    rows = [
+    return [
         [
-            ("Upscale (Subtle)", a(ActionKind.UPSCALE_SUBTLE)),
-            ("Upscale (Creative)", a(ActionKind.UPSCALE_CREATIVE)),
+            ("Extend (Low motion)", a(ActionKind.EXTEND, "low")),
+            ("Extend (High motion)", a(ActionKind.EXTEND, "high")),
         ],
-        [
-            ("Vary (Subtle)", a(ActionKind.VARY_SUBTLE)),
-            ("Vary (Strong)", a(ActionKind.VARY_STRONG)),
-            ("Vary (Region)", a(ActionKind.VARY_REGION)),
-        ],
-        [
-            ("Zoom Out 2x", a(ActionKind.ZOOM, "2")),
-            ("Zoom Out 1.5x", a(ActionKind.ZOOM, "1.5")),
-            ("Custom Zoom", a(ActionKind.ZOOM, "custom")),
-        ],
-        [
-            ("⬅️", a(ActionKind.PAN, "left")),
-            ("➡️", a(ActionKind.PAN, "right")),
-            ("⬆️", a(ActionKind.PAN, "up")),
-            ("⬇️", a(ActionKind.PAN, "down")),
-        ],
+        [("❤️", a(ActionKind.FAVORITE)), ("🔄", Action(ActionKind.REROLL, job.id))],
+    ]
+
+
+def image_actions(job: Job, image: JobImage) -> list[list[tuple[str, Action]]]:
+    """Rows of (label, action) under a single image (or a single video)."""
+    if job.clip(image.index) is not None:
+        return video_actions(job, image)
+
+    def a(kind: ActionKind, value: str | None = None) -> Action:
+        return Action(kind, job.id, image.index, value)
+
+    upscale = [
+        ("Upscale (Subtle)", a(ActionKind.UPSCALE_SUBTLE)),
+        ("Upscale (Creative)", a(ActionKind.UPSCALE_CREATIVE)),
+    ]
+    vary = [
+        ("Vary (Subtle)", a(ActionKind.VARY_SUBTLE)),
+        ("Vary (Strong)", a(ActionKind.VARY_STRONG)),
+        ("Vary (Region)", a(ActionKind.VARY_REGION)),
+    ]
+    zoom = [
+        ("Zoom Out 2x", a(ActionKind.ZOOM, "2")),
+        ("Zoom Out 1.5x", a(ActionKind.ZOOM, "1.5")),
+        ("Custom Zoom", a(ActionKind.ZOOM, "custom")),
+    ]
+    pan = [
+        ("⬅️", a(ActionKind.PAN, "left")),
+        ("➡️", a(ActionKind.PAN, "right")),
+        ("⬆️", a(ActionKind.PAN, "up")),
+        ("⬇️", a(ActionKind.PAN, "down")),
+    ]
+    animate = [
+        ("Animate (Low motion)", a(ActionKind.ANIMATE, "low")),
+        ("Animate (High motion)", a(ActionKind.ANIMATE, "high")),
     ]
     last = [
         ("❤️", a(ActionKind.FAVORITE)),
         ("Edit", a(ActionKind.EDIT)),
         ("Retexture", a(ActionKind.RETEXTURE)),
     ]
-    if image.width != image.height:
-        last.insert(0, ("Make Square", a(ActionKind.SQUARE)))
-    rows.append(last)
+    # Beside the zooms, as in Midjourney: it is one more way to see more of the scene.
+    square = [("Make Square", a(ActionKind.SQUARE))] if image.width != image.height else []
     if job.kind is JobKind.UPSCALE:
         # An upscaled image is a finished piece: offer what still makes sense on it.
-        rows = [rows[1][:2], rows[-1]]
-    return rows
+        return [vary[:2], animate, [*square, *last]]
+    return [upscale, vary, [*zoom, *square], pan, animate, last]
 
 
 # --------------------------------------------------------------------------------------
@@ -149,40 +181,43 @@ def image_actions(job: Job, image: JobImage) -> list[list[tuple[str, Action]]]:
 TEXT_SHORTCUTS = """\
 After a grid arrives, reply with:
   U1–U4            pull one image out at full size
-  V1–V4            variations of one image (V2: new prompt — to remix)
+  V1–V4            variations of one image (V2: new prompt, to remix)
   R                reroll: same prompt, new images
-With one image picked (add its number when replying to a grid):
+With one image (add its number after a grid):
   upscale [creative]        double its size
   vary subtle | vary strong
   zoom 2x | zoom 1.5x       zoom out
   pan left|right|up|down    extend the picture that way
   square                    fill it out to a square
-  region B2-D4: a red balloon     repaint part of it (send `region` alone to see the cells)
-  region the sky: an aurora       ...or describe the part instead
+  region B2-D4: a red balloon     repaint part of it (`region` shows the cells)
+  region the sky: an aurora       ...or describe the part
   edit: make it night       change it by instruction
   retexture --lora <name>   redraw it in that look
-  look: autumn diner        add it to that Lookbook (a set of pictures used with --p)
+  animate [high]            make a video of it (extend [high]: 4 seconds more)
+  look: autumn diner        add it to that Lookbook (for --p)
   fav · info · cancel"""
 
 
 def help_text(*, direct: bool, slash: str = "/") -> str:
+    """What Dreambot does, in one message: it has to fit the shortest limit of the chat apps (Discord's)."""
     intro = (
         "Send me a description and I'll make four images of it."
         if direct
         else f"Use {slash}imagine followed by a description and I'll make four images of it."
     )
     return f"""\
-Dreambot — image generation that runs entirely on this Mac.
+Dreambot — images and video, made entirely on this Mac.
 
 {intro}
 Add Midjourney-style parameters at the end, for example:
   a red fox in the snow --ar 16:9 --stylize 250 --no people
-Short prompts are art-directed for you (a different shot for each image); --raw uses yours as written.
+Short prompts are art-directed for you; --raw uses yours as written.
 
 Attach an image to use it as an image prompt, or steer with it:
   --edit (change it by instruction) · --oref (keep this person/object) · --sref (borrow its style)
-Styles blend: --sref takes several images, style codes and saved styles, each with an optional ::weight.
-A LoRA is one fine-tuned look (pixel art, anime): --lora <name>, or {slash}settings lora <name> for every prompt.
+--sref blends images, style codes and saved styles, each with an optional ::weight.
+A LoRA is one fine-tuned look (pixel art, anime): --lora <name>.
+--video makes a video: from words, or of an attached image (--loop, --motion, --seconds).
 
 {TEXT_SHORTCUTS}
 

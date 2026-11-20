@@ -1,8 +1,8 @@
 """A deterministic stand-in backend that draws placeholder images with Pillow.
 
 It implements the full backend contract — progress, previews, early stop, cancellation, every
-operation — without loading any model, which makes the rest of Dreambot testable in
-milliseconds and lets people try the bots before downloading weights
+operation, videos included — without loading any model, which makes the rest of Dreambot
+testable in milliseconds and lets people try the bots before downloading weights
 (``DREAMBOT_BACKEND=fake``).
 """
 
@@ -16,8 +16,10 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter
 
-from dreambot.engine.backends.base import BackendError, JobContext, require_inputs
+from dreambot.core import video
+from dreambot.engine.backends.base import BackendError, JobContext, input_files, require_inputs
 from dreambot.engine.protocol import (
+    VIDEO_OPS,
     DescribeRequest,
     ErrorKind,
     GenerateRequest,
@@ -59,9 +61,9 @@ class FakeBackend:
         if variant is None:
             raise BackendError(f"{spec.id} does not support '{req.op.value}'.", ErrorKind.INVALID)
         require_inputs(req, variant.max_refs)
-        for path in [req.image, req.mask, *req.images]:
-            if path and not Path(path).is_file():
-                raise BackendError(f"Input image not found: {path}", ErrorKind.INVALID)
+        for path in input_files(req):
+            if not Path(path).is_file():
+                raise BackendError(f"Input file not found: {path}", ErrorKind.INVALID)
         self._loaded[spec.id] = time.monotonic()
         if os.environ.get("DREAMBOT_FAKE_NOISE"):
             # Real model code prints to stdout (progress bars, warnings). Tests use this to
@@ -72,6 +74,9 @@ class FakeBackend:
         out_dir = Path(req.out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         total = req.steps or spec.steps
+        if req.op in VIDEO_OPS:
+            self._videos(req, ctx, out_dir, total)
+            return
         stop_step = max(1, round(total * req.stop_at)) if req.stop_at else total
 
         for index, seed in enumerate(req.seeds):
@@ -101,6 +106,82 @@ class FakeBackend:
                     seconds=time.perf_counter() - started,
                 )
             )
+
+    def _videos(self, req: GenerateRequest, ctx: JobContext, out_dir: Path, total: int) -> None:
+        """One placeholder video per seed: the picture it starts on, with something moving across it."""
+        assert req.frames and req.fps
+        before = 0
+        size: tuple[int, int] | None = None
+        try:
+            if req.op is Op.EXTEND:
+                # The video as it was, then the frames that are added to it.
+                assert req.video
+                source = video.probe(req.video)
+                before, size = source.frames, (source.width, source.height)
+                opening = video.first_frame(req.video)
+            else:
+                opening = None
+        except video.VideoError as exc:
+            raise BackendError(str(exc), ErrorKind.INVALID) from exc
+        for index, seed in enumerate(req.seeds):
+            started = time.perf_counter()
+            for step in range(1, total + 1):
+                ctx.check_cancelled()
+                if self.step_delay:
+                    time.sleep(self.step_delay)
+                ctx.emit(Progress(id=req.id, index=index, step=step, total=total))
+            scene = self._render(req, seed)
+            if size is None:
+                size = scene.size
+            first = opening or (Image.open(req.image).convert("RGB").resize(size) if req.image else scene)
+            last = Image.open(req.end_image).convert("RGB").resize(size) if req.end_image else None
+            count = before + req.frames
+            path = out_dir / f"{req.basename}_{index}.mp4"
+            try:
+                video.write(
+                    self._frames(first, scene.resize(size), last, before, count),
+                    path,
+                    size=size,
+                    fps=req.fps,
+                )
+            except video.VideoError as exc:
+                raise BackendError(str(exc), ErrorKind.INTERNAL) from exc
+            still = out_dir / f"{req.basename}_{index}.png"
+            first.save(still)
+            ctx.emit(
+                ImageDone(
+                    id=req.id,
+                    index=index,
+                    seed=seed,
+                    path=str(still),
+                    width=size[0],
+                    height=size[1],
+                    seconds=time.perf_counter() - started,
+                    video=str(path),
+                    frames=count,
+                    fps=req.fps,
+                )
+            )
+
+    @staticmethod
+    def _frames(first: Image.Image, scene: Image.Image, last: Image.Image | None, still: int, count: int):
+        """``count`` frames: ``first`` held for ``still`` of them, then moving into ``scene`` (and on to ``last``)."""
+        width, height = scene.size
+        side = max(8, min(width, height) // 6)
+        moving = max(1, count - still)
+        for number in range(count):
+            if number < still or count == 1:
+                yield first
+                continue
+            along = (number - still) / max(1, moving - 1)
+            if last is not None and number == count - 1:
+                frame = last.copy()
+            else:
+                frame = Image.blend(first, scene, min(1.0, 0.25 + 0.75 * along)) if number else first.copy()
+            # A square that crosses the picture, so that no two frames are alike.
+            left = round(along * (width - side))
+            ImageDraw.Draw(frame).rectangle((left, height - side, left + side, height), fill=(255, 255, 255))
+            yield frame
 
     def _render(self, req: GenerateRequest, seed: int) -> Image.Image:
         if req.op is Op.UPSCALE:
@@ -160,6 +241,12 @@ class FakeBackend:
                 "texture: placeholder texture",
                 "mood: placeholder mood",
             ][: req.count]
+        if req.instruction and "video" in req.instruction:
+            # A request for direction: what happens in each video that starts (or goes on) from this picture.
+            return [
+                f"Placeholder movement {i + 1}: something in the {width}x{height} picture is slowly turning"
+                for i in range(req.count)
+            ]
         return [f"a placeholder description #{i + 1} of a {width}x{height} image" for i in range(req.count)]
 
     def text(self, req: TextRequest, ctx: JobContext) -> list[str]:

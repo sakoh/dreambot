@@ -534,7 +534,8 @@ main {
 }
 
 .ref-chip.role-style .ref-role,
-.ref-chip.role-look .ref-role {
+.ref-chip.role-look .ref-role,
+.ref-chip.role-end .ref-role {
   color: var(--accent);
 }
 
@@ -558,9 +559,11 @@ main {
   padding: 12px;
 }
 
+/* A box for each thing a picture can be to the prompt: three for a picture, two for a video. */
 .tray-zones {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   gap: 10px;
   margin-bottom: 12px;
 }
@@ -691,6 +694,11 @@ main {
 .field {
   grid-template-columns: 1fr 72px;
   align-items: center;
+}
+
+/* A choice between a few values, as chips, takes the room it needs. */
+.field:has(.ratios) {
+  grid-template-columns: 1fr auto;
 }
 
 .slider b {
@@ -988,8 +996,27 @@ main {
   white-space: nowrap;
 }
 
-.menu-list button:hover {
+.menu-list button:hover,
+.menu-list a:hover {
   background: var(--hover);
+}
+
+/* A link in a menu (a download) looks like the buttons beside it. */
+.menu-list a {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+
+/* A menu where the pointer was when it was asked for (a right-click). */
+.menu-list.is-floating {
+  position: fixed;
+  right: auto;
+  z-index: 60;
+  cursor: default;
 }
 
 .menu-list hr {
@@ -1104,7 +1131,8 @@ main {
   min-width: 0;
 }
 
-.lightbox-stage img {
+.lightbox-stage img,
+.lightbox-stage video {
   max-width: 100%;
   max-height: calc(100vh - 56px);
   object-fit: contain;
@@ -1200,6 +1228,20 @@ main {
   font-size: 13px;
 }
 
+/* Buttons of one kind within a group, with what they share said once on the left ("Auto", "Loop"). */
+.action-line {
+  flex: 1 1 100%;
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.action-label {
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
 .inline {
   display: grid;
   gap: 8px;
@@ -1264,7 +1306,8 @@ main {
     border-top: 1px solid var(--line);
   }
 
-  .lightbox-stage img {
+  .lightbox-stage img,
+  .lightbox-stage video {
     max-height: calc(54vh - 40px);
   }
 }
@@ -1294,7 +1337,7 @@ main {
   }
 
   .tray-zones {
-    grid-template-columns: 1fr;
+    grid-auto-flow: row;
   }
 }
 
@@ -1940,6 +1983,106 @@ main {
   .style-detail {
     grid-template-columns: minmax(0, 1fr);
   }
+}
+
+/* ------------------------------------------------------------------------------ video */
+
+/* The prompt bar's Video button: a sign and a word, lit while the prompt makes a video. */
+.video-button {
+  height: 30px;
+  gap: 5px;
+  padding: 0 9px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.video-button.is-on {
+  border-color: var(--accent);
+}
+
+/* What kind of video it makes, under the prompt while the button is lit. */
+.video-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 0 12px 10px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.video-what {
+  margin-right: 2px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.video-row .segmented button {
+  padding: 4px 10px;
+  font-size: 12.5px;
+}
+
+/* What the video starts on, where the words alone were: the lit choice reads as the label did. */
+.video-row .video-from button.is-on {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.video-row .chip {
+  gap: 5px;
+  padding: 3px 10px;
+}
+
+.video-row .chip:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.video-length {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.video-length select {
+  padding: 3px 6px;
+}
+
+/* A video among the pictures: the frame it starts on, a mark that says what it is, and the
+   video itself over the frame while the pointer is on it. */
+.clip-preview {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  pointer-events: none;
+}
+
+.clip-badge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px 2px 6px;
+  border-radius: 999px;
+  background: rgb(0 0 0 / 62%);
+  color: #fff;
+  font-size: 11.5px;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+/* In the gallery the corners at the top are for selecting and the one at the bottom right for the heart. */
+.gallery-tile .clip-badge {
+  inset: auto auto 6px 6px;
 }
 
 /* An icon in the middle of a sentence sits on the line like a letter. */

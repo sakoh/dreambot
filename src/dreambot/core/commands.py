@@ -24,7 +24,13 @@ from dreambot.core.actions import Action, ActionKind, parse_action
 from dreambot.core.jobs import Job, JobImage, JobStatus
 from dreambot.core.params import PromptError, find_param, parse_ratio
 from dreambot.core.service import Dreambot, DreambotError
-from dreambot.core.settings import MAX_OPTION_SETS, STYLIZE_PRESETS, VARIATION_MODES, UserSettings
+from dreambot.core.settings import (
+    MAX_OPTION_SETS,
+    STYLIZE_PRESETS,
+    VARIATION_MODES,
+    VIDEO_BATCHES,
+    UserSettings,
+)
 from dreambot.core.store import MessageLink
 
 BLEND_SHAPES = {"portrait": (2, 3), "square": (1, 1), "landscape": (3, 2)}
@@ -45,7 +51,7 @@ class Reply:
     """Something to send back. Frontends turn it into a message in their own idiom."""
 
     text: str = ""
-    #: Image files to send with the text.
+    #: Files to send with the text: pictures, or a video.
     images: list[str] = field(default_factory=list)
     #: The job (and image) this reply shows — lets a frontend attach the matching buttons.
     job: Job | None = None
@@ -136,7 +142,9 @@ class Commands:
         if action is not None:
             if target is not None:
                 action = action.on(target.job, target.image if action.index is None else None)
-            return await self._act(user=user, channel=channel, action=action, allow_paths=allow_paths)
+            return await self._act(
+                user=user, channel=channel, action=action, allow_paths=allow_paths, attachments=attachments
+            )
 
         if text.startswith("/"):
             raise DreambotError(f"I don't know that command. Send {slash}help to see what I can do.")
@@ -164,14 +172,21 @@ class Commands:
     # ------------------------------------------------------------------ actions ----
 
     async def _act(
-        self, *, user: str, channel: str, action: Action, allow_paths: bool = False
+        self,
+        *,
+        user: str,
+        channel: str,
+        action: Action,
+        allow_paths: bool = False,
+        attachments: Sequence[str | Path] = (),
     ) -> list[Reply]:
-        result = await self.service.act(user=user, channel=channel, action=action, allow_paths=allow_paths)
+        result = await self.service.act(
+            user=user, channel=channel, action=action, allow_paths=allow_paths, attachments=attachments
+        )
         if result.jobs:
             return [Reply(queued=result.jobs)]
         if action.kind is ActionKind.SELECT and result.job and result.image:
-            caption = f"Image {result.image.index} of #{result.job.id} — {render.job_title(result.job, 160)}"
-            return [Reply(text=caption, images=[result.image.path], job=result.job, image=result.image)]
+            return [picked_reply(result.job, result.image)]
         return [Reply(text=result.message or "Done.", job=result.job, image=result.image)]
 
     async def _show_cells(self, *, channel: str, target: MessageLink | None) -> list[Reply]:
@@ -397,6 +412,14 @@ class Commands:
             settings.variation = lowered
         elif key in ("remix", "raw", "hd", "enhance", "personalize"):
             setattr(settings, key, _on_off(lowered, key))
+        elif key in ("videos", "bs"):
+            if not lowered.isdigit() or int(lowered) not in VIDEO_BATCHES:
+                raise DreambotError("Videos per prompt is 1, 2 or 4.")
+            settings.videos = int(lowered)
+        elif key in ("video-hd", "videohd"):
+            settings.video_hd = _on_off(lowered, key)
+        elif key in ("picture-first", "picturefirst"):
+            settings.picture_first = _on_off(lowered, key)
         elif key in ("count", "images"):
             if not lowered.isdigit() or not 1 <= int(lowered) <= 16:
                 raise DreambotError("Images per job is a number from 1 to 16.")
@@ -430,6 +453,9 @@ class Commands:
             f"  enhance     {self._enhance_state(resolved)}",
             f"  personalize {self._personalize_state(resolved)}",
             f"  count       {resolved.count} images per job",
+            f"  videos      {resolved.videos or service.config.video.count} per prompt",
+            f"  video-hd    {on(service.config.video.hd if resolved.video_hd is None else resolved.video_hd)}",
+            f"  picture-first {on(self._picture_first(resolved))} (a video from words starts on a picture of them)",
         ]
         if resolved.suffix:
             lines.append(f"  suffix      {resolved.suffix}")
@@ -442,6 +468,12 @@ class Commands:
             f"`{slash}settings reset` restores the defaults."
         )
         return "\n".join(lines)
+
+    def _picture_first(self, resolved) -> bool:
+        """Whether this person's videos from words alone start on a picture made from the words."""
+        if resolved.picture_first is not None:
+            return resolved.picture_first
+        return self.service.config.video.picture_first
 
     def _personalize_state(self, resolved) -> str:
         """`on`/`off`, and which Lookbooks every prompt is then given."""
@@ -602,10 +634,25 @@ def job_reply(job: Job) -> Reply:
         notes = "".join(f"\nⓘ {note}" for note in job.notes)
         return Reply(text=f"{numbered}\n\nSend any of these back to me to imagine it.{notes}", job=job)
     caption = render.job_caption(job)
+    if job.is_video:
+        # Videos have no grid: each is sent as itself (see `ChatFrontend.deliver`).
+        return Reply(
+            text=caption,
+            images=[job.media(image.index) for image in job.images],
+            job=job,
+            image=job.images[0] if len(job.images) == 1 else None,
+        )
     if job.grid and len(job.images) > 1:
         return Reply(text=caption, images=[job.grid], job=job)
     image = job.images[0] if job.images else None
     return Reply(text=caption, images=[image.path] if image else [], job=job, image=image)
+
+
+def picked_reply(job: Job, image: JobImage) -> Reply:
+    """One result pulled out of a job (``U2``): the picture or the video, with its own buttons."""
+    what = "Video" if job.clip(image.index) else "Image"
+    caption = f"{what} {image.index} of #{job.id} — {render.job_title(job, 160)}"
+    return Reply(text=caption, images=[job.media(image.index)], job=job, image=image)
 
 
 def split_command(text: str) -> list[str]:

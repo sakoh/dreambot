@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "A free, open-source, fully local Midjourney alternative for the Mac — powered by MLX, driven from iMessage, Discord, and Telegram."
 readme = "README.md"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY.md"]
 requires-python = ">=3.11"
 authors = [{ name = "Sako Hartounian" }]
 keywords = ["mlx", "image-generation", "apple-silicon", "discord-bot", "telegram-bot", "imessage", "midjourney"]
@@ -37,6 +37,18 @@ dependencies = [
     "starlette>=1.0",
     "uvicorn>=0.40",
     "python-multipart>=0.0.20",
+    # The video engine is Dreambot's own (src/dreambot/engine/wan): Wan 2.2 written against MLX
+    # and NumPy, with the prompt's tokens from `tokenizers`. mflux already depends on all three,
+    # so these add nothing to an install; they are named because Dreambot imports them itself.
+    # MLX is held to the release line the engine was checked on: it multiplies 8-bit weights
+    # as they are, and its numbers are compared with the reference's digit for digit.
+    "mlx>=0.32.0,<0.33",
+    "numpy>=2.0.1,<3",
+    "tokenizers>=0.20.3",
+    # An ffmpeg program, carried in the wheel: videos are written with it and read back with
+    # it (the frame a video starts on, the end of one that is continued), and nothing has to
+    # be installed on the Mac for that.
+    "imageio-ffmpeg>=0.6.0",
 ]
 
 [project.scripts]
@@ -59,6 +71,10 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# The video engine is installed from its repository (see the dependencies above).
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dreambot"]

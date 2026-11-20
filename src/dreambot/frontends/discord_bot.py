@@ -33,17 +33,20 @@ import discord
 from discord import app_commands, ui
 from PIL import Image
 
+from dreambot.core import video
 from dreambot.core.actions import Action, ActionKind, decode_action
 from dreambot.core.imaging import flatten
 from dreambot.core.service import Dreambot, DreambotError
 from dreambot.core.settings import STYLIZE_PRESETS, UserSettings
 from dreambot.engine.protocol import Op
-from dreambot.frontends.base import Buttons, ChatFrontend, Incoming
+from dreambot.frontends.base import Buttons, ChatFrontend, Incoming, is_video
 
 log = logging.getLogger(__name__)
 
 #: Discord's default upload limit for bots.
 UPLOAD_LIMIT = 9_500_000
+#: Rows of buttons one message can show, and buttons one row can.
+BUTTON_ROWS, ROW_BUTTONS = 5, 5
 SETTINGS_PREFIX = "set"
 MESSAGE_LIMIT = 1900
 #: An interaction's reply can be edited through the interaction for 15 minutes. After that
@@ -65,6 +68,21 @@ PERMISSIONS = discord.Permissions(
     read_message_history=True,
     add_reactions=True,
 )
+
+
+def _packed(buttons: Buttons) -> Buttons:
+    """``buttons`` in as many rows as Discord shows.
+
+    Under an image there is one row more than that. The last rows then share one, so that the
+    first rows stay as they are on every platform.
+    """
+    rows = [list(row[:ROW_BUTTONS]) for row in buttons if row]
+    while len(rows) > BUTTON_ROWS:
+        tail = rows.pop()
+        if len(rows[-1]) + len(tail) > ROW_BUTTONS:
+            break  # no room to share: the last row is left out, as before
+        rows[-1].extend(tail)
+    return rows[:BUTTON_ROWS]
 
 
 class _Client(discord.Client):
@@ -185,8 +203,8 @@ class DiscordFrontend(ChatFrontend):
         if not buttons:
             return None
         view = ui.View(timeout=None)
-        for row_number, row in enumerate(buttons[:5]):
-            for label, payload in row[:5]:
+        for row_number, row in enumerate(_packed(buttons)):
+            for label, payload in row:
                 view.add_item(
                     ui.Button(
                         label=label[:80],
@@ -197,12 +215,28 @@ class DiscordFrontend(ChatFrontend):
                 )
         return view
 
+    async def _sendable(self, path: str) -> str:
+        """``path``, or for a video too large to upload, a smaller copy of it.
+
+        The copy is made at a lower bit rate (the video itself stays on the Mac), and away from
+        the event loop: encoding takes seconds, and Discord expects to hear from the bot meanwhile.
+        """
+        source = Path(path)
+        if not is_video(source) or source.stat().st_size <= UPLOAD_LIMIT:
+            return path
+        self._downloads.mkdir(parents=True, exist_ok=True)
+        smaller = self._downloads / f"{source.stem}-{uuid.uuid4().hex[:6]}.mp4"
+        try:
+            return str(await asyncio.to_thread(video.fit, source, smaller, limit=UPLOAD_LIMIT))
+        except video.VideoError as exc:
+            raise DreambotError(str(exc)) from exc
+
     def _file(self, path: str) -> discord.File:
         source = Path(path)
-        if source.stat().st_size <= UPLOAD_LIMIT:
+        if source.stat().st_size <= UPLOAD_LIMIT or is_video(source):
             return discord.File(source, filename=source.name)
-        # Too large to upload as a PNG: send a high-quality JPEG instead (the PNG stays on the Mac).
         self._downloads.mkdir(parents=True, exist_ok=True)
+        # Too large to upload as a PNG: send a high-quality JPEG instead (the PNG stays on the Mac).
         target = self._downloads / f"{source.stem}-{uuid.uuid4().hex[:6]}.jpg"
         with Image.open(source) as image:
             flatten(image).save(target, quality=93)
@@ -224,12 +258,13 @@ class DiscordFrontend(ChatFrontend):
     ) -> list[str]:
         content = text[:MESSAGE_LIMIT] if text else None
         view = self._view(buttons)
+        ready = [await self._sendable(path) for path in images[:10]]
 
         def extras() -> dict[str, Any]:
             # Built afresh for each attempt: a file that has been sent once is closed.
             built: dict[str, Any] = {}
-            if images:
-                built["files"] = [self._file(path) for path in images[:10]]
+            if ready:
+                built["files"] = [self._file(path) for path in ready]
             if view is not None:
                 built["view"] = view
             return built

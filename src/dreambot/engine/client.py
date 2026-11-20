@@ -67,12 +67,19 @@ class EngineCancelled(Exception):
 
 @dataclass(frozen=True)
 class EngineImage:
+    """One result of a request: a picture, or a video with the picture it starts on."""
+
     index: int
     seed: int
     path: str
     width: int
     height: int
     seconds: float
+    #: Set by the video operations: the video file, of which ``path`` is the first frame.
+    video: str | None = None
+    frames: int | None = None
+    fps: float | None = None
+    sound: bool = False
 
 
 @dataclass
@@ -439,7 +446,7 @@ class Engine:
         """Run a generation request to completion.
 
         ``on_event`` (sync or async) receives every event — loading, progress, previews and
-        each finished image — as it happens.
+        each finished image or video — as it happens.
 
         Raises :class:`EngineError` on failure and :class:`EngineCancelled` if cancelled.
         """
@@ -459,6 +466,10 @@ class Engine:
                             width=event.width,
                             height=event.height,
                             seconds=event.seconds,
+                            video=event.video,
+                            frames=event.frames,
+                            fps=event.fps,
+                            sound=event.sound,
                         )
                     )
                 elif isinstance(event, Loaded):

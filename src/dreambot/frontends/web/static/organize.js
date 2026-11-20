@@ -1,10 +1,10 @@
-// The Organize page: every image ever made, to search, filter, sort into folders, like, trash
-// and download — one at a time or many at once.
+// The Organize page: every image and video ever made, to search, filter, sort into folders, like,
+// trash and download — one at a time or many at once.
 
 import { html, useEffect, useRef, useState } from "./vendor/preact-htm.js";
 import { api, thumb } from "./api.js";
 import { attempt, openLightbox, refreshFolders, store, toast, useStore } from "./store.js";
-import { Ask, Empty, Icon, IconButton, Menu, dayKey, dayLabel } from "./ui.js";
+import { Ask, ClipBadge, ContextMenu, Empty, Icon, IconButton, Menu, dayKey, dayLabel } from "./ui.js";
 
 const SIZES = { small: 132, medium: 196, large: 290 };
 const keyOf = (image) => `${image.job}:${image.index}`;
@@ -39,6 +39,7 @@ export function OrganizePage() {
   const [selected, setSelected] = useState(new Set());
   const [size, setSize] = useState(localStorage.getItem("dreambot-grid") || "medium");
   const [asking, setAsking] = useState(null); // { kind: "new" } | { kind: "rename", folder }
+  const [menu, setMenu] = useState(null); // a right-click on a video: { x, y, image }
   const anchor = useRef(null);
   const sentinel = useRef(null);
   const state = useRef({});
@@ -271,8 +272,14 @@ export function OrganizePage() {
                   class=${`gallery-tile ${picked ? "is-picked" : ""} ${selected.size ? "is-selecting" : ""}`}
                   title=${image.prompt}
                   onClick=${(event) => click(image, event)}
+                  onContextMenu=${(event) => {
+                    if (!image.video) return;
+                    event.preventDefault();
+                    setMenu({ x: event.clientX, y: event.clientY, image });
+                  }}
                 >
-                  <img src=${thumb(image.url, size === "large" ? 512 : 256)} alt=${image.prompt} loading="lazy" />
+                  <img src=${thumb(image.poster || image.url, size === "large" ? 512 : 256)} alt=${image.prompt} loading="lazy" />
+                  <${ClipBadge} image=${image} />
                   <button
                     type="button"
                     class="tick"
@@ -321,6 +328,15 @@ export function OrganizePage() {
       <span class="grow"></span>
       <button type="button" class="button" onClick=${() => setSelected(new Set())}>Clear</button>
     </div>`}
+    ${menu &&
+    html`<${ContextMenu}
+      at=${menu}
+      onClose=${() => setMenu(null)}
+      items=${[
+        { label: "Download video", icon: "download", href: `${menu.image.video}?download=1` },
+        { label: "Download GIF", icon: "download", href: `${menu.image.video}?as=gif` },
+      ]}
+    />`}
     ${asking &&
     html`<${Ask}
       title=${asking.kind === "new" ? "New folder" : "Rename folder"}

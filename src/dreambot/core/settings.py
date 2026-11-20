@@ -12,6 +12,8 @@ from dreambot.engine.weights import physical_memory_gb
 #: Midjourney's stylize presets, as shown in its settings panel.
 STYLIZE_PRESETS = {"low": 50, "med": 100, "high": 250, "very high": 750}
 VARIATION_MODES = ("strong", "subtle")
+#: How many videos a prompt can be set to make (Midjourney's batch sizes).
+VIDEO_BATCHES = (1, 2, 4)
 MAX_OPTION_SETS = 40
 #: The prompt enhancer keeps a language model loaded next to the image model. With less memory
 #: than this the two take turns, every job pays for a reload, and it is off unless asked for.
@@ -35,6 +37,13 @@ class UserSettings:
     #: When on, variations ask for an edited prompt first.
     remix: bool | None = None
     hd: bool | None = None
+    #: Videos per prompt (Midjourney's Video Batch Size): 1, 2 or 4. ``None`` follows the config.
+    videos: int | None = None
+    #: Whether videos are made one size up (Midjourney's Video Resolution). ``None`` follows the config.
+    video_hd: bool | None = None
+    #: Whether a video asked for in words alone starts on a picture made from them first.
+    #: ``None`` follows the config.
+    picture_first: bool | None = None
     #: Whether a local language model adds art direction to prompts.
     enhance: bool | None = None
     #: Whether every prompt uses the default Lookbooks, as if it ended in ``--p``.
@@ -72,6 +81,9 @@ class UserSettings:
             variation=pick(self.variation, defaults.variation),
             remix=pick(self.remix, defaults.remix),
             hd=pick(self.hd, defaults.hd),
+            videos=self.videos,
+            video_hd=self.video_hd,
+            picture_first=self.picture_first,
             enhance=pick(self.enhance, auto_enhance() if defaults.enhance is None else defaults.enhance),
             personalize=bool(self.personalize),
             looks=tuple(self.looks),
@@ -91,6 +103,10 @@ class ResolvedSettings:
     remix: bool
     hd: bool
     enhance: bool = False
+    #: Videos per prompt and their size, when the person has said; else the config's ``[video]``.
+    videos: int | None = None
+    video_hd: bool | None = None
+    picture_first: bool | None = None
     personalize: bool = False
     looks: tuple[str, ...] = ()
     loras: tuple[str, ...] = ()
