@@ -182,6 +182,34 @@ def test_a_discord_token_is_checked_and_the_invite_link_shown(home: Path, monkey
     assert "three runs of letters and digits" in said(result) and rejected == []
 
 
+def test_what_telegram_and_discord_answer_is_shown_as_it_is(home: Path, monkeypatch: pytest.MonkeyPatch):
+    # A bot's name and the reason a token is refused are Telegram's and Discord's words, not
+    # Dreambot's. Square brackets in them were read as the console's markup and left out: a
+    # Discord bot called Dreambot [dev] was greeted as "Dreambot ".
+    discord_answers(
+        monkeypatch, 200, {"id": "1234567890123456789", "username": "Dreambot [dev]", "bot": True}
+    )
+    result = runner.invoke(cli.app, ["setup", "discord"], input=f"{DISCORD_TOKEN}\n")
+    assert result.exit_code == 0, result.output
+    assert "That is Dreambot [dev]. Token saved to your Keychain" in said(result)
+
+    cli._stored_for_test.clear()
+    discord_answers(monkeypatch, 401, {"message": "401: Unauthorized [token was reset]", "code": 0})
+    result = runner.invoke(cli.app, ["setup", "discord"], input=f"{DISCORD_TOKEN}\n")
+    assert "did not accept that token: 401: Unauthorized [token was reset]. Nothing" in said(result)
+    assert cli._stored_for_test == {}
+
+    telegram_answers(monkeypatch, 401, {"ok": False, "description": "Unauthorized [bot was deleted]"})
+    result = runner.invoke(cli.app, ["setup", "telegram"], input=f"{TOKEN}\n")
+    assert "did not accept that token: Unauthorized [bot was deleted]. Nothing" in said(result)
+
+    telegram_answers(monkeypatch, 200, {"ok": True, "result": {"username": "my_[dream]_bot"}})
+    result = runner.invoke(cli.app, ["setup", "telegram"], input=f"{TOKEN}\n")
+    assert result.exit_code == 0, result.output
+    assert "That is @my_[dream]_bot. Token saved" in said(result)
+    assert "Your bot: https://t.me/my_[dream]_bot" in said(result)
+
+
 def test_setup_restarts_a_running_service_only_when_something_changed(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ):
