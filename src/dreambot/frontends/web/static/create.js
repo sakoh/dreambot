@@ -875,7 +875,9 @@ function PendingTile({ job, preview = null }) {
  * being made. With Command or Control held, moving over one video holds every video of the job
  * at that point of its length, to compare them moment by moment.
  */
-function Tiles({ job, shown, live = null, pending = 0 }) {
+// `shown` are the tiles to draw and `pending` how many more are to come. `made` is how many of
+// the job's pictures exist, shown or not: one that was put in the trash still has its place.
+function Tiles({ job, shown, live = null, pending = 0, made = shown.length }) {
   const [scrub, setScrub] = useState(null);
   const filmed = shown.some((image) => image.video);
   const move = (event) => {
@@ -895,7 +897,7 @@ function Tiles({ job, shown, live = null, pending = 0 }) {
     ${Array.from({ length: Math.max(0, count - shown.length) }, (_, slot) => {
       // A video that is still to come is shown by the picture it is going to start on, once
       // that is drawn. Videos are made in order, so this place is the next one's but `slot`.
-      const start = live && live.starts ? live.starts[shown.length + slot + 1] : null;
+      const start = live && live.starts ? live.starts[made + slot + 1] : null;
       const preview = start || (slot === 0 && live ? live.preview : null);
       return html`<${PendingTile} key=${`pending-${slot}`} job=${job} preview=${preview} />`;
     })}
@@ -950,8 +952,13 @@ function JobCard({ job }) {
   if (running) {
     const say = WAITING[(state && state.type) || job.status] || (() => "Working…");
     const wanted = Math.max(1, job.count || 1);
+    // A job's videos are shown one by one, as each is made. Its pictures are shown when it is
+    // done: until then they are not kept where they are served from (so a tile for one would be
+    // a broken picture), and a finishing pass may still draw them again.
+    const made = job.images.filter((image) => image.video);
+    const watchable = made.filter((image) => !image.trashed);
     body = html`<div class="job-media">
-      <${Tiles} job=${job} shown=${shown} live=${state} pending=${Math.max(0, wanted - job.images.length)} />
+      <${Tiles} job=${job} shown=${watchable} live=${state} made=${made.length} pending=${Math.max(0, wanted - made.length)} />
       <div class="progress">
         <div class="progress-bar"><span style=${{ width: `${Math.round(((state && state.fraction) || 0) * 100)}%` }}></span></div>
         <span class="small">${say(state || { position: 0, fraction: 0 })}</span>
