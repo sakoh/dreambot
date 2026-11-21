@@ -320,6 +320,54 @@ async def test_other_installed_models_generate(mlx_engine: Engine, tmp_path: Pat
     print(f"\n[{model}] 768px in {result.seconds:.1f}s (load {result.load_seconds or 0:.1f}s)")
 
 
+async def test_moss_image_draws_the_words_it_is_given(mlx_engine: Engine, tmp_path: Path):
+    """MOSS-Image, text-to-image only: its own steps and guidance, a negative prompt, legible lettering.
+
+    Lettering is what MOSS is for, so the local vision model, when installed, reads the poster back.
+    """
+    req = request(
+        tmp_path,
+        "moss-image-sft",
+        prompt='a vintage travel poster of a lighthouse at dusk, the word "DREAMBOT" in bold letters at the top',
+        negative_prompt="blurry, watermark",
+        steps=50,
+        guidance=3.0,
+        seeds=[7],
+        width=1024,
+        height=1024,
+        basename="moss",
+    )
+    result = await mlx_engine.generate(req)
+    (image,) = result.images
+    assert (image.width, image.height) == (1024, 1024)
+    assert looks_like_a_picture(image.path)
+    with Image.open(image.path) as picture:
+        meta = json.loads(picture.info["dreambot"])
+    assert meta["model"] == "moss-image-sft" and meta["steps"] == 50
+    print(f"\n[moss-image-sft] 1024px in {result.seconds:.1f}s (load {result.load_seconds or 0:.1f}s)")
+
+    from dreambot.engine.protocol import DescribeRequest
+
+    vision = weights.find_vision_model()
+    if vision is None:
+        return
+    (reading,) = await mlx_engine.describe(
+        DescribeRequest(
+            id=new_request_id(),
+            image=image.path,
+            weights=str(vision),
+            count=1,
+            seed=1,
+            instruction=(
+                "Read the large lettering on this poster. Answer with one numbered line: "
+                "1. The lettering reads: <the exact letters>"
+            ),
+        )
+    )
+    print(f"[moss-image-sft] the vision model read: {reading}")
+    assert "DREAMBOT" in reading.upper().replace(" ", "")
+
+
 async def test_seedvr2_upscales_faithfully(mlx_engine: Engine, tmp_path: Path, photo: str):
     """The dedicated upscaler doubles the size and keeps the picture: Upscale (Subtle) and --hd."""
     found = installed("seedvr2-3b")
