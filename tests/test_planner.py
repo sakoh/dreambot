@@ -329,6 +329,60 @@ def test_variation_falls_back_when_the_job_model_cannot_do_it(tmp_path: Path, pi
         planner(tmp_path, "ming-image-design").variation(model="ming-image-design", mode="strong", **common)
 
 
+def test_a_text_only_model_only_ever_draws_from_text(tmp_path: Path, picture: str):
+    """MOSS-Image can only draw from a prompt. Asked for by name for anything else it is refused;
+    as the default model, or as the model a picture was made with, another model does that work."""
+    installed = ("moss-image-sft", "z-image-turbo", "flux2-klein-4b", "seedvr2-3b")
+    p = planner(tmp_path, *installed)
+    moss = Params(model="moss-image-sft")
+    assert p.catalog.registry.find("moss").ops == (Op.TXT2IMG,)
+
+    plan = imagine(p, "a poster that says HELLO --model moss")
+    assert plan.op is Op.TXT2IMG and plan.model == "moss-image-sft"
+    # A style reference it cannot be shown is put into words; the picture is still drawn from text.
+    styled = imagine(p, "a fox --model moss", ResolvedRefs(style=[picture]))
+    assert styled.op is Op.TXT2IMG and "applied in words" in styled.notes[0]
+
+    for refs in (
+        ResolvedRefs(image_prompts=[picture]),
+        ResolvedRefs(subject=[picture]),
+        ResolvedRefs(edit=[picture]),
+    ):
+        with pytest.raises(PlanError, match="MOSS-Image SFT can't do this"):
+            imagine(p, "a fox --model moss", refs)
+    common = {"source": picture, "text": "a fox", "width": 1024, "height": 1024, "count": 4}
+    with pytest.raises(PlanError, match="can't do this"):
+        p.variation(model="z-image-turbo", mode="strong", params=moss, **common)
+    with pytest.raises(PlanError, match="can't do this"):
+        p.edit(sources=[picture], instruction="make it night", count=1, params=moss)
+    canvas = imaging.zoom_canvas(picture, 2.0, tmp_path / "canvas")
+    with pytest.raises(PlanError, match="can't do this"):
+        p.outpaint(source=picture, canvas=canvas, text="a fox", count=4, params=moss)
+    with pytest.raises(PlanError, match="can't retexture"):
+        p.retexture(source=picture, text="a fox", count=4, settings=SETTINGS, params=moss)
+
+    # Chosen as the default model, it draws plain prompts and nothing else.
+    default = UserSettings(enhance=False, model="moss-image-sft").resolved(Config().defaults)
+    assert p.imagine(parse_prompt("a fox"), default).model == "moss-image-sft"
+    blended = p.imagine(parse_prompt("a fox"), default, ResolvedRefs(image_prompts=[picture]))
+    assert blended.model == "flux2-klein-4b"
+    # Work on a picture MOSS made goes to a model that can do it.
+    varied = p.variation(model="moss-image-sft", mode="subtle", **common)
+    assert varied.model == "z-image-turbo" and "can't make variations" in varied.notes[0]
+    enlarged = imaging.enlarge(picture, 2.0, tmp_path / "big.png")
+    tiles = imaging.cut_tiles(enlarged, tmp_path / "tiles")
+    for creative in (False, True):
+        upscaled = p.upscale(
+            source=picture,
+            text="a fox",
+            model="moss-image-sft",
+            creative=creative,
+            enlarged=str(enlarged),
+            tiles=tiles,
+        )
+        assert upscaled.model != "moss-image-sft"
+
+
 def test_upscale_paths(tmp_path: Path, picture: str):
     enlarged = imaging.enlarge(picture, 2.0, tmp_path / "big.png")
     tiles = imaging.cut_tiles(enlarged, tmp_path / "tiles")

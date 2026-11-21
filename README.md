@@ -578,7 +578,7 @@ port = 7373
 | | How it was checked |
 | --- | --- |
 | Engine, queue, cancellation, crash recovery, offline loading | automated tests, including real MLX runs |
-| Z-Image Turbo, FLUX.2 klein 4B, Qwen-Image 2512, Qwen-Image 2.1, Ming-Image, SeedVR2 3B | real weights, in `tests/test_mlx_engine.py` |
+| Z-Image Turbo, FLUX.2 klein 4B, Qwen-Image 2512, Qwen-Image 2.1, Ming-Image, MOSS-Image SFT, SeedVR2 3B | real weights, in `tests/test_mlx_engine.py`; MOSS-Image's lettering is read back by the local vision model |
 | Variations, upscales (SeedVR2 and tiled), `--hd`, edits, references, zoom/pan/square, region edits, describe | real weights, results inspected by eye |
 | The prompt enhancer | real language model (Qwen2.5-VL 7B) and real images, compared with and without |
 | Style references (`--sref`) | real weights (Z-Image Turbo, FLUX.2 klein 4B; Qwen-Image 2.1 for one comparison) and the real vision model, results inspected by eye. Three prompts across the three style versions with one reference: shown the picture whole (`--sv 1`), none of the three took its style and one had the reference's hand and gun in it; with words and a swatch board (`--sv 2`) and with words alone (`--sv 3`), all three took the style and none took its content. **Two reference pictures in all**, both generated images: photographs and pictures with a lot of text in them have not been tried |
@@ -589,7 +589,7 @@ port = 7373
 | Lookbooks | real weights: a four-picture book gave each image of a grid a different lead and a visibly different look; a one-picture book at `--stylize` 0, 20, 100 and 400 gave no look, a touch, the look, and more of it. With a book whose lead was photograph-like the three strengths looked alike, because the look was already close to the model's own. Larger books, several books at once, the `liked` book: automated tests only |
 | Web app | every route against the real service on the stand-in backend (automated, including who is let in); the pages driven end to end in WebKit, the engine Safari uses, on the stand-in backend, and one real job with a Lookbook. **Not tried** in Safari itself, Chrome or Firefox, nor on a phone |
 | `/looks` and `look: <name>` from the chat apps | automated tests through the shared command layer; **not run on the live services** |
-| The other 46 models | class paths, arguments and defaults checked against mflux; **not run** (weights not installed during development) |
+| The other 45 models | class paths, arguments and defaults checked against mflux; **not run** (weights not installed during development) |
 | Telegram | **live**: pairing, prompts with the enhancer, grids with buttons, variations, `/describe` with a photo. The other actions: real library objects against a simulated API |
 | Discord | **live**: adding the bot to a server, `/pair`, `/imagine` with the enhancer, variation buttons. The other commands and buttons: the real command tree and views, with stand-ins for Discord's interactions and channels |
 | iMessage | **live** (macOS 27, a dedicated Apple Account): reading the Messages database, pairing, prompts with the enhancer, typed shortcuts, `/describe` with a photo from an iPhone, sending pictures. Replies to a picture and tapbacks: a synthetic Messages database only (the first live run found and fixed a bug there) |
